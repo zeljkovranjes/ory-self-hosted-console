@@ -1,0 +1,51 @@
+# config/oathkeeper/config.yaml
+#
+# Minimal Oathkeeper (access proxy) configuration to reach healthy on first boot.
+# Mounted read-only into the container at /etc/config/oathkeeper/ (RESEARCH Pattern 3).
+# Verified minimal key set: ory/oathkeeper .docker_compose/config.yaml (RESEARCH).
+#
+# Oathkeeper is stateless (no DB, no migrate container) — rules + JWKS come from files.
+# Real access-rule authoring is Phase 9; this ships an empty-but-valid rules array.
+
+serve:
+  proxy:
+    port: 4455
+  api:
+    port: 4456
+
+access_rules:
+  repositories:
+    - file:///etc/config/oathkeeper/rules.json
+
+authenticators:
+  # at least one enabled authenticator required
+  anonymous:
+    enabled: true
+    config:
+      subject: guest
+  noop:
+    enabled: true
+
+authorizers:
+  # at least one enabled authorizer required
+  allow:
+    enabled: true
+
+mutators:
+  # at least one enabled mutator required
+  noop:
+    enabled: true
+  id_token:
+    enabled: true
+    config:
+      issuer_url: http://oathkeeper:4455/
+      jwks_url: file:///etc/config/oathkeeper/jwks.json
+
+errors:
+  fallback:
+    - json
+  handlers:
+    json:
+      enabled: true
+      config:
+        verbose: true

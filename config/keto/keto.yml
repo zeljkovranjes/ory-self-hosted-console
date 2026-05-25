@@ -1,0 +1,24 @@
+# config/keto/keto.yml
+#
+# Minimal Keto (permissions / Zanzibar) configuration to reach healthy on first boot.
+# Mounted read-only into the container at /etc/config/keto/ (RESEARCH Pattern 3).
+# Verified minimal key set: ory/keto contrib/cat-videos-example keto.yml (RESEARCH).
+#
+# NOTE (RESEARCH Migration Commands): Keto's migrate subcommand is `migrate up`
+# (NOT `migrate sql`) and reads DSN from the DSN env var or this `dsn:` key — it
+# does NOT accept the `-e` flag. DSN here uses internal compose hostname `postgres`.
+#
+# Self-hosted Keto has NO live config API — namespaces/OPL live in files, applied via restart.
+
+dsn: postgres://keto:changeme_keto@postgres:5432/keto?sslmode=disable
+
+namespaces:
+  # OPL namespaces definitions file Keto loads at start (Pitfall 6: must be valid).
+  location: file:///etc/config/keto/namespaces.ts
+
+serve:
+  read:
+    port: 4466
+  write:
+    port: 4467
+  # metadata defaults to 4469 (health endpoint lives here)
