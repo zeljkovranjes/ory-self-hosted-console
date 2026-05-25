@@ -18,13 +18,17 @@ use salvo::prelude::*;
 use crate::error::AppError;
 use crate::ory::clients::OryClients;
 use crate::ory::error::map_keto_err;
+use crate::ory::DEFAULT_LIST_PAGE_SIZE;
 
 /// `GET /api/keto/relationships` — list relation tuples (proof read).
 ///
 /// Calls `relationship_api::get_relationships` against `keto_read` (:4466) for
-/// the first page of 50 with all filters unset, maps any crate `Error<T>` to
-/// `AppError::Upstream` (502), and re-serialises the typed `Relationships` to
-/// JSON.
+/// the first page (size [`DEFAULT_LIST_PAGE_SIZE`]) with all filters unset, maps
+/// any crate `Error<T>` to `AppError::Upstream` (502), and re-serialises the
+/// typed `Relationships` to JSON. WR-02: returns ONLY the first page. The Keto
+/// `Relationships` shape DOES carry `next_page_token`, so unlike the other
+/// wrappers a future consumer can page from the serialised body; full cursor
+/// plumbing is still deferred (see TODO below).
 #[handler]
 pub async fn list_relationships(
     depot: &mut Depot,
@@ -37,9 +41,11 @@ pub async fn list_relationships(
     // get_relationships(configuration, page_size, page_token, namespace, object,
     //   relation, subject_id, subject_set_namespace, subject_set_object,
     //   subject_set_relation) — READ path uses keto_read (:4466).
+    // TODO(P9): expose the pagination cursor (page_token) and stop truncating at
+    // DEFAULT_LIST_PAGE_SIZE — this proof slice returns the FIRST page only.
     let relationships = relationship_api::get_relationships(
         &clients.keto_read,
-        Some(50), // page_size
+        Some(DEFAULT_LIST_PAGE_SIZE), // page_size
         None, None, None, None, None, None, None, None,
     )
     .await

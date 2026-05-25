@@ -17,12 +17,14 @@ use salvo::prelude::*;
 use crate::error::AppError;
 use crate::ory::clients::OryClients;
 use crate::ory::error::map_hydra_err;
+use crate::ory::DEFAULT_LIST_PAGE_SIZE;
 
 /// `GET /api/hydra/clients` — list OAuth2 clients (proof read).
 ///
-/// Calls `o_auth2_api::list_o_auth2_clients` for the first page of 50, maps any
-/// crate `Error<T>` to `AppError::Upstream` (502), and re-serialises the typed
-/// `Vec<OAuth2Client>` to JSON.
+/// Calls `o_auth2_api::list_o_auth2_clients` for the first page (size
+/// [`DEFAULT_LIST_PAGE_SIZE`]), maps any crate `Error<T>` to
+/// `AppError::Upstream` (502), and re-serialises the typed `Vec<OAuth2Client>`
+/// to JSON. WR-02: returns ONLY the first page; full cursor pagination deferred.
 #[handler]
 pub async fn list_clients(
     depot: &mut Depot,
@@ -33,10 +35,17 @@ pub async fn list_clients(
         .clone();
 
     // list_o_auth2_clients(configuration, page_size, page_token, client_name, owner)
-    let oauth2_clients =
-        o_auth2_api::list_o_auth2_clients(&clients.hydra, Some(50), None, None, None)
-            .await
-            .map_err(map_hydra_err)?;
+    // TODO(P8): expose the pagination cursor (page_token) and stop truncating at
+    // DEFAULT_LIST_PAGE_SIZE — this proof slice returns the FIRST page only.
+    let oauth2_clients = o_auth2_api::list_o_auth2_clients(
+        &clients.hydra,
+        Some(DEFAULT_LIST_PAGE_SIZE),
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(map_hydra_err)?;
 
     Ok(Json(serde_json::to_value(oauth2_clients).map_err(|e| {
         AppError::Internal(format!("serialize ory response: {e}"))

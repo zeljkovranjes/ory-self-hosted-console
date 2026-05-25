@@ -20,12 +20,15 @@ use salvo::prelude::*;
 use crate::error::AppError;
 use crate::ory::clients::OryClients;
 use crate::ory::error::map_oathkeeper_err;
+use crate::ory::DEFAULT_LIST_PAGE_SIZE;
 
 /// `GET /api/oathkeeper/rules` — list loaded access rules (proof read, bonus).
 ///
-/// Calls `api_api::list_rules` for the first 50 rules, maps any crate `Error<T>`
-/// to `AppError::Upstream` (502), and re-serialises the typed `Vec<Rule>` to
-/// JSON. An empty array is a valid live response on a stack with no rules loaded.
+/// Calls `api_api::list_rules` for the first page (size
+/// [`DEFAULT_LIST_PAGE_SIZE`]), maps any crate `Error<T>` to
+/// `AppError::Upstream` (502), and re-serialises the typed `Vec<Rule>` to JSON.
+/// An empty array is a valid live response on a stack with no rules loaded.
+/// WR-02: returns ONLY the first page; full cursor pagination deferred.
 #[handler]
 pub async fn list_rules(
     depot: &mut Depot,
@@ -36,7 +39,9 @@ pub async fn list_rules(
         .clone();
 
     // list_rules(configuration, limit, offset)
-    let rules = api_api::list_rules(&clients.oathkeeper, Some(50), Some(0))
+    // TODO(P9): expose the pagination cursor (offset) and stop truncating at
+    // DEFAULT_LIST_PAGE_SIZE — this proof slice returns the FIRST page only.
+    let rules = api_api::list_rules(&clients.oathkeeper, Some(DEFAULT_LIST_PAGE_SIZE), Some(0))
         .await
         .map_err(map_oathkeeper_err)?;
 

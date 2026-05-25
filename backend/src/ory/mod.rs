@@ -31,3 +31,14 @@ pub mod hydra;
 pub mod keto;
 pub mod kratos;
 pub mod oathkeeper;
+
+/// WR-02: the default page size every proof-read list wrapper requests from its
+/// upstream Ory service. These wrappers return ONLY the first page and do not
+/// yet surface the upstream pagination cursor (`Link` header / `next_page_token`)
+/// — full cursor pagination is deferred to the feature phases (P6 identities,
+/// P8 OAuth2 clients, P9 Keto/Oathkeeper). Naming the cap here removes the magic
+/// `50` from each handler and documents the proof-slice limit in ONE place.
+///
+/// TODO(P6/P8/P9): expose the upstream pagination cursor (page_token/offset) and
+/// stop truncating silently at `DEFAULT_LIST_PAGE_SIZE`.
+pub const DEFAULT_LIST_PAGE_SIZE: i64 = 50;
