@@ -90,13 +90,28 @@ async fn authed_cookie(service: &Service, pool: &PgPool) -> String {
     common::obtain_session_cookie(&resp).expect("session cookie after login")
 }
 
-/// Assert the response body contains NONE of the admin host:port markers — the
-/// wrapper must surface Ory RESOURCE data, never the internal admin URLs.
+/// Assert the response body contains NONE of the admin host:port URLs — the
+/// wrapper must surface Ory RESOURCE data, never the internal ADMIN URLs.
+///
+/// We match the admin URL `host:port` shape (e.g. `kratos:4434`, `:4445`), NOT a
+/// bare port-number substring: a legitimately-returned resource UUID can contain
+/// digits like `4434` by chance (e.g. a recovery-address id), which is not a URL
+/// leak. The defense is against an internal ADMIN endpoint URL escaping into the
+/// client-facing body — that always carries the service host and `:port`.
 fn assert_no_admin_url_leak(body: &str) {
-    for marker in ["4434", "4445", "4466", "4467", "4456"] {
+    // The admin URLs the backend holds are `http://<svc>:<adminport>`. Kratos's
+    // PUBLIC base (`:4433`) legitimately appears in `schema_url`; only the ADMIN
+    // host:port pairs below must never leak.
+    for marker in [
+        "kratos:4434",
+        "hydra:4445",
+        "keto:4466",
+        "keto:4467",
+        "oathkeeper:4456",
+    ] {
         assert!(
             !body.contains(marker),
-            "wrapper response body leaked an admin port marker `{marker}`: {body}"
+            "wrapper response body leaked an admin URL `{marker}`: {body}"
         );
     }
 }

@@ -522,6 +522,95 @@ assert_rate_limited() {
   return 1
 }
 
+# --- assert_json_ok <method> <url> [shape] -----------------------------------
+# Positive data-path assertion (Phase 3 BACK-02, anti-false-green T-03): issue
+# <method> <url> capturing BOTH the HTTP status and the body in one request, and
+# PASS ONLY when ALL of:
+#   - the HTTP status is exactly 200, AND
+#   - the body is NON-empty, AND
+#   - the body PARSES as JSON (via node, jq fallback), AND
+#   - the optional <shape> holds: "array" (top-level JSON array),
+#     "nonempty-array" (a JSON array with >=1 element), or "has:<key>" (a JSON
+#     object carrying <key>). Omit <shape> to require only valid JSON.
+# A 200 with an empty/non-JSON body, or a 200 that fails the shape, FAILs — a
+# reachable-but-empty endpoint can never false-green this gate.
+# Optional request body via $REQ_DATA and extra header via $REQ_HEADER (e.g. the
+# authenticated `Cookie:` header), mirroring assert_status.
+assert_json_ok() {
+  local method="$1" url="$2" shape="${3:-}" body code
+  local -a curlargs=(-s -w '\n%{http_code}' --max-time 10 -X "$method")
+  if [ -n "${REQ_DATA:-}" ]; then
+    curlargs+=(-H 'Content-Type: application/json' --data "$REQ_DATA")
+  fi
+  if [ -n "${REQ_HEADER:-}" ]; then
+    curlargs+=(-H "$REQ_HEADER")
+  fi
+  # Append the status on its own trailing line, then split it back off.
+  local raw
+  raw="$(curl "${curlargs[@]}" "$url" 2>/dev/null)"
+  code="$(printf '%s' "$raw" | tail -n1)"
+  body="$(printf '%s' "$raw" | sed '$d')"
+
+  if [ -z "$code" ]; then
+    _fail "assert_json_ok $method $url: no response (connection error; want 200+JSON)"
+    return 1
+  fi
+  if [ "$code" != "200" ]; then
+    _fail "assert_json_ok $method $url: status '$code' (want 200)"
+    return 1
+  fi
+  if [ -z "$body" ]; then
+    _fail "assert_json_ok $method $url: 200 but EMPTY body (anti-false-green: empty is not proof)"
+    return 1
+  fi
+
+  # Validate JSON (and the optional shape) via node; fall back to jq.
+  local verdict
+  if _have_node; then
+    verdict="$(printf '%s' "$body" | SHAPE="$shape" node -e '
+      const shape = process.env.SHAPE || "";
+      let input = require("fs").readFileSync(0, "utf8");
+      let data;
+      try { data = JSON.parse(input); } catch (e) { process.stdout.write("BADJSON"); process.exit(0); }
+      if (shape === "array" && !Array.isArray(data)) { process.stdout.write("NOTARRAY"); process.exit(0); }
+      if (shape === "nonempty-array") {
+        if (!Array.isArray(data)) { process.stdout.write("NOTARRAY"); process.exit(0); }
+        if (data.length === 0) { process.stdout.write("EMPTYARRAY"); process.exit(0); }
+      }
+      if (shape.startsWith("has:")) {
+        const key = shape.slice(4);
+        if (data === null || typeof data !== "object" || Array.isArray(data) || !(key in data)) {
+          process.stdout.write("MISSINGKEY"); process.exit(0);
+        }
+      }
+      process.stdout.write("OK");
+    ')"
+  elif _have_jq; then
+    # jq fallback: validate JSON, then the shape.
+    if ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+      verdict="BADJSON"
+    elif [ "$shape" = "array" ] && ! printf '%s' "$body" | jq -e 'type=="array"' >/dev/null 2>&1; then
+      verdict="NOTARRAY"
+    elif [ "$shape" = "nonempty-array" ] && ! printf '%s' "$body" | jq -e 'type=="array" and length>0' >/dev/null 2>&1; then
+      verdict="EMPTYARRAY"
+    elif [ "${shape#has:}" != "$shape" ] && ! printf '%s' "$body" | jq -e --arg k "${shape#has:}" 'type=="object" and has($k)' >/dev/null 2>&1; then
+      verdict="MISSINGKEY"
+    else
+      verdict="OK"
+    fi
+  else
+    _fail "assert_json_ok $method $url: no node/jq to parse JSON"
+    return 2
+  fi
+
+  if [ "$verdict" = "OK" ]; then
+    _pass "assert_json_ok $method $url: 200 + valid JSON${shape:+ ($shape)}"
+    return 0
+  fi
+  _fail "assert_json_ok $method $url: 200 but body failed JSON/shape check ($verdict, shape='${shape:-any}')"
+  return 1
+}
+
 # --- summary -----------------------------------------------------------------
 # Print totals and set the conventional exit code. The sourcing script should
 # call `summary; exit $?` (or `exit $(summary >/dev/null; echo $?)`).

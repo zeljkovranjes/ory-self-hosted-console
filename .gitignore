@@ -12,6 +12,9 @@
 
 # --- Rust (backend) ---
 /backend/target/
+# Linux build cache used by the documented ORY_LIVE_TESTS container run
+# (phase acceptance) when invoking cargo test inside the internal Docker network.
+/backend/.cargo-linux-target/
 **/*.rs.bk
 
 # --- Node / Next.js (frontend) ---

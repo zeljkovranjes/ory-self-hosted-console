@@ -35,10 +35,16 @@ pub async fn list_identities(
     // list_identities(configuration, per_page, page, page_size, page_token,
     //   consistency, ids, credentials_identifier,
     //   preview_credentials_identifier_similar, include_credential, organization_id)
+    //
+    // Kratos `page` is ZERO-BASED (token-style pagination): passing `page=1`
+    // requests the SECOND page, which is EMPTY whenever the store holds fewer
+    // than `per_page+1` identities — i.e. a non-empty store would wrongly return
+    // `[]`. We therefore OMIT `page` (let Kratos serve the first page) and only
+    // bound the size with `per_page=50`; the first page is what a list view wants.
     let identities = identity_api::list_identities(
         &clients.kratos,
-        Some(50), // per_page
-        Some(1),  // page
+        Some(50), // per_page (first page; `page` omitted — see note above)
+        None,     // page: omitted (0-based; `Some(1)` would skip to an empty 2nd page)
         None, None, None, None, None, None, None, None,
     )
     .await
