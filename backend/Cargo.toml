@@ -2,7 +2,7 @@
 name = "ory-console-backend"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.92"
+rust-version = "1.94"
 description = "Ory Self-Hosted Console backend — single API layer the frontend talks to (structured Salvo app + console-DB persistence; Phase 2)."
 license = "Apache-2.0"
 publish = false

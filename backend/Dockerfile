@@ -9,9 +9,10 @@
 # the bind address (and future config) come from env at runtime.
 
 # ---- Stage 1: builder ----
-# salvo 0.93 (and its time/* transitive deps) require rustc >= 1.92, so the
-# builder toolchain is pinned to 1.92 (rust:1.85 fails to compile salvo_core).
-FROM rust:1.92-slim-bookworm AS builder
+# Toolchain floor is set by the deps: salvo 0.93 needs rustc >= 1.92, and
+# sqlx 0.9.0 (Phase 2 persistence) raises that to rustc >= 1.94. Pin the builder
+# to 1.95 (matches the host toolchain) so the --locked build resolves cleanly.
+FROM rust:1.95-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -26,8 +27,12 @@ ENV SQLX_OFFLINE=true
 # --locked: resolve EXACTLY the versions pinned in Cargo.lock (CR-04). Without the
 # lockfile + --locked the build resolves transitive versions fresh from the
 # Cargo.toml ranges, defeating supply-chain reproducibility (INFRA-04).
+# The crate now has BOTH a lib and a bin target, so the dep-cache stub must
+# provide a placeholder for each (an empty lib.rs + a dummy main.rs) or cargo
+# fails target resolution before any dependency is built.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
+    && echo '// dependency cache build' > src/lib.rs \
     && echo 'fn main() { println!("dependency cache build"); }' > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
@@ -40,8 +45,9 @@ COPY migrations ./migrations
 
 # Now copy real sources and build the actual binary (still --locked, offline).
 COPY src ./src
-# Bust the cached dummy-main artifact so the real main.rs is compiled.
-RUN touch src/main.rs \
+# Bust the cached dummy artifacts so BOTH the real lib and bin are recompiled
+# (the bin depends on the lib crate, so a stale stub lib.rs would break it).
+RUN touch src/lib.rs src/main.rs \
     && cargo build --release --locked
 
 # ---- curl stage ----
