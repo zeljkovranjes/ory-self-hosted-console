@@ -361,6 +361,138 @@ leave the stack up for debugging.
 
 ---
 
+## User Management (Phase 6)
+
+Phase 6 delivers the **Users** feature against live Kratos — the first full
+vertical slice (typed Rust backend wrappers + Next.js pages) on top of the
+Phase-5 shell and primitives. Everything goes through the backend; the frontend
+never talks to Kratos directly.
+
+### The Users pages
+
+Open the console (http://localhost:3000) and pick **Users** in the sidebar:
+
+- **List (`/users`)** — a TanStack DataTable of identities with **cursor
+  pagination** (keyset, driven by the Kratos `Link` header), search by
+  identifier, per-row actions (View / Edit / Delete), and header actions for
+  Create / Import / Schema.
+- **Detail (`/users/[id]`)** — a read-only view of one identity: traits,
+  verifiable/recovery addresses, public + **admin-labeled** metadata, and the
+  **credential TYPE names only** (e.g. `password`, `oidc`) — never any secret
+  value.
+- **Create / Edit (`/users/new`, `/users/[id]/edit`)** — a **schema-driven**
+  form generated from the active identity schema's `properties.traits` (text /
+  email / boolean / enum / number, with a raw-JSON fallback for exotic types),
+  plus public/admin metadata Monaco editors (blank → key omitted). Edit
+  **requires** a `state` (active/inactive). Backend `422` field errors surface
+  inline.
+- **Delete** — a destructive confirm dialog (`DELETE` + cache invalidation).
+- **Schema editor (`/users/schema`)** — a Monaco JSON editor with draft-07
+  presets; **saving rewrites the identity schema file and restarts Kratos** (see
+  below).
+- **Bulk import / export (`/users/import`)** — paste or upload a CLI-compatible
+  **bare array** of identities; the page validates shape + limits before calling
+  the backend, then shows a per-record result table. Export pages the whole list
+  to a bare-array JSON download.
+
+### CLI-compatible import/export (the `ory` CLI interchange)
+
+The import/export format is the same **bare array of identity objects** that the
+official `ory` CLI's `ory import identities <file>` consumes — each record is a
+top-level `{ "schema_id": ..., "traits": { ... }, "credentials"?: { ... } }`
+object, **not** wrapped in a `create` envelope. Internally the backend wraps each
+record into Kratos' `batch_patch_identities` `{identities:[{create}]}` shape and
+unwraps on export, so the console and the CLI can manage the same self-hosted
+stack without a format conflict. Export emits only `schema_id` + `traits` (no
+credential secrets).
+
+**Import limits (authoritative, server-side).** A batch of **more than 1000**
+records is always rejected; a batch of **more than 200** records is rejected when
+**any** record carries a **cleartext** password (hashing 200+ passwords inline is
+a DoS vector). The frontend mirrors these limits for fast UX feedback, but the
+**backend is the source of truth** and re-rejects an over-limit batch with `422`
+regardless of what the client allowed.
+
+You can verify real CLI interchange manually (the acceptance gate proves the
+shape structurally; the binary round-trip is operator-run):
+
+```bash
+# 1. Export from the console: Users -> Import/Export -> Export (a bare-array JSON).
+# 2. Install the ory CLI: https://www.ory.sh/docs/guides/cli/installation
+# 3. Round-trip it back through the CLI:
+ory import identities exported.json    # must accept the file with no format error
+```
+
+### Identity-schema editor — restart & rollback
+
+Self-hosted Kratos has **no live schema API**; the identity schema lives in a
+mounted file (`config/kratos/identity.schema.json`) and takes effect only on
+restart. Saving in the schema editor `PUT`s the whole document to a **dedicated**
+backend route that: validates it as a **draft-07** schema **and** requires a
+`properties.traits` object; on a valid schema, backs up the current file,
+atomically writes the new one, **restarts only the `ory-kratos` container** via
+the scoped restart broker, and polls health. If Kratos fails to come back
+healthy, the engine **rolls back to the last-known-good** backup and restarts
+again. An **invalid** schema is rejected `422` with **no disk write**. Because
+this is a dedicated route (not the generic `{service}/{section}` config
+allowlist), the editor can only ever touch the schema file — it cannot write an
+arbitrary `kratos.yml` key.
+
+### Security posture
+
+- **Credential secrets are never exposed.** Every identity response is shaped to
+  strip `credentials.*.config` (password hashes, recovery codes) and
+  `credentials.*.identifiers`; only credential **type** names survive. The detail
+  page renders type names only, never values.
+- **Admin metadata is labeled.** `metadata_admin` is rendered distinctly from
+  `metadata_public` so an operator never confuses internal data for
+  user-visible data.
+- **All routes are auth- and CSRF-gated.** The identity, import, and schema
+  routes live on the protected subtree (`401` unauthenticated); every mutation
+  (`POST`/`PUT`/`DELETE`) requires the per-session `X-CSRF-Token` (`403`
+  without). The frontend's `lib/api.ts` attaches it automatically.
+- **No config injection via the schema editor.** The schema PUT cannot write
+  arbitrary `kratos.yml` keys — it targets only the fixed schema file, behind
+  draft-07 + `properties.traits` validation.
+- **Egress invariant holds (FE-05).** All identity/schema/import calls go through
+  the same-origin `/backend` rewrite; no Ory host/port/SDK or CDN literal ships
+  in the client bundle (`bundle-egress.sh`).
+
+### Verifying Phase 6
+
+Offline (no stack) — backend + frontend gates:
+
+```bash
+cd backend && SQLX_OFFLINE=true cargo build --locked && cargo test
+cd frontend && npm run typecheck && npm run test
+```
+
+Live — a single fail-closed gate proves IDENT-01..04 end-to-end against the real
+stack and tears it down cleanly afterward (a `trap` restores the identity schema
+and runs `docker compose down -v`):
+
+```bash
+docker compose down -v
+MSYS_NO_PATHCONV=1 docker compose build backend frontend
+MSYS_NO_PATHCONV=1 docker compose up -d --wait
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase6-acceptance.sh   # Git Bash on Windows
+# (the gate runs `docker compose down -v` itself on exit; pass KEEP_STACK=1 to keep it up)
+bash scripts/verify/bundle-egress.sh   # FE-05 egress (also run inside the gate)
+```
+
+The gate exits `0` only when: the **CRUD round-trip** (create → list → get →
+update → delete → `404`) holds with **no credential secret** in any detail body;
+a small **bulk import** appears in the list and an over-limit batch is rejected
+`422`; an exported record matches the **`ory` CLI bare-array shape** (top-level
+`schema_id` + `traits`, no `create` wrapper); a **valid schema** edit writes the
+file, restarts Kratos, and recovers healthy while an **invalid** schema is
+rejected `422` with no disk write; and the **bundle-egress** gate stays clean.
+Every negative assertion passes ONLY on the explicit refusal (a `2xx` where a
+`4xx` is due is a hard fail). It also echoes the optional manual `ory` CLI
+round-trip note above.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
