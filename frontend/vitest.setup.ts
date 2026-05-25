@@ -20,3 +20,23 @@ if (typeof window !== "undefined" && !window.matchMedia) {
     dispatchEvent: vi.fn(),
   }));
 }
+
+// jsdom does not implement the PointerEvent capture API or `scrollIntoView`,
+// which Radix UI primitives (e.g. the shadcn Select used in the schema editor)
+// call on open. Provide no-op shims so component tests can drive a Radix Select
+// without an "is not a function" crash. Real pointer-capture behavior is not
+// under test here — only the menu open/select interaction.
+if (typeof Element !== "undefined") {
+  if (!Element.prototype.hasPointerCapture) {
+    Element.prototype.hasPointerCapture = vi.fn(() => false);
+  }
+  if (!Element.prototype.setPointerCapture) {
+    Element.prototype.setPointerCapture = vi.fn();
+  }
+  if (!Element.prototype.releasePointerCapture) {
+    Element.prototype.releasePointerCapture = vi.fn();
+  }
+  if (!Element.prototype.scrollIntoView) {
+    Element.prototype.scrollIntoView = vi.fn();
+  }
+}

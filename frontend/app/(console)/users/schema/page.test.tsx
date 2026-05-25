@@ -77,9 +77,12 @@ describe("Identity schema editor (/users/schema)", () => {
       /schema-editor/i,
     )) as HTMLTextAreaElement;
 
-    // The preset chooser is a native <select> for test-friendliness.
-    const presetSelect = screen.getByLabelText(/preset/i);
-    await userEvent.selectOptions(presetSelect, "username");
+    // The preset chooser is the shadcn (Radix) Select (UI-REVIEW Top-3 #1):
+    // open the trigger, then pick the "Username" option from the listbox.
+    const trigger = screen.getByLabelText(/preset/i);
+    await userEvent.click(trigger);
+    const option = await screen.findByRole("option", { name: /username/i });
+    await userEvent.click(option);
     await waitFor(() => expect(editor.value).toContain('"username"'));
   });
 

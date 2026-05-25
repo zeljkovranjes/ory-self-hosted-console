@@ -255,7 +255,7 @@ export default function ImportPage() {
               {validation.violations.length > 0 ? (
                 <CircleAlertIcon />
               ) : (
-                <CheckCircle2Icon className="text-green-600 dark:text-green-500" />
+                <CheckCircle2Icon className="text-success" />
               )}
               <AlertTitle>
                 {validation.records.length} records
@@ -316,37 +316,47 @@ export default function ImportPage() {
           {results ? (
             <div className="space-y-2">
               <h2 className="text-sm font-medium">Import results</h2>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-12">#</TableHead>
-                    <TableHead>Outcome</TableHead>
-                    <TableHead>Detail</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {results.map((r, i) => {
-                    const isError = !!r.error;
-                    return (
-                      <TableRow key={i}>
-                        <TableCell className="font-mono text-xs">
-                          {i + 1}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant={isError ? "destructive" : "default"}>
-                            {isError ? "error" : (r.action ?? "ok")}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="text-sm">
-                          {isError
-                            ? (r.error?.message ?? "Failed")
-                            : (r.identity?.id ?? "Created")}
-                        </TableCell>
+              {results.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No records processed.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-12">#</TableHead>
+                        <TableHead>Outcome</TableHead>
+                        <TableHead>Detail</TableHead>
                       </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
+                    </TableHeader>
+                    <TableBody>
+                      {results.map((r, i) => {
+                        const isError = !!r.error;
+                        return (
+                          <TableRow key={i}>
+                            <TableCell className="font-mono text-xs">
+                              {i + 1}
+                            </TableCell>
+                            <TableCell>
+                              <Badge
+                                variant={isError ? "destructive" : "default"}
+                              >
+                                {isError ? "error" : (r.action ?? "ok")}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="text-sm break-words">
+                              {isError
+                                ? (r.error?.message ?? "Failed")
+                                : (r.identity?.id ?? "Created")}
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
             </div>
           ) : null}
         </CardContent>

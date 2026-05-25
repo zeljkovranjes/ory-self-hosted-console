@@ -35,6 +35,13 @@ import {
 } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   CheckCircle2Icon,
   CircleAlertIcon,
   InfoIcon,
@@ -83,7 +90,7 @@ const BANNERS: Record<
   healthy: {
     role: "status",
     variant: "default",
-    icon: <CheckCircle2Icon className="text-green-600 dark:text-green-500" />,
+    icon: <CheckCircle2Icon className="text-success" />,
     title: "Configuration healthy",
     description: "Kratos restarted cleanly with the new identity schema.",
   },
@@ -204,20 +211,22 @@ export default function SchemaEditorPage() {
         <CardContent className="space-y-4 pt-4">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="schema-preset">Preset</Label>
-            <select
-              id="schema-preset"
-              aria-label="Preset"
-              value={presetId}
-              onChange={(e) => onSelectPreset(e.target.value)}
-              className="border-input bg-transparent h-9 w-fit rounded-md border px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-            >
-              <option value="">Choose a starter schema…</option>
-              {SCHEMA_PRESETS.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
+            <Select value={presetId} onValueChange={onSelectPreset}>
+              <SelectTrigger
+                id="schema-preset"
+                aria-label="Preset"
+                className="w-fit"
+              >
+                <SelectValue placeholder="Choose a starter schema…" />
+              </SelectTrigger>
+              <SelectContent>
+                {SCHEMA_PRESETS.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
           {loadError ? (

@@ -25,6 +25,10 @@
   --accent: oklch(0.97 0 0);
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
+  /* Semantic success token (green ~145deg hue) for positive-state icons/text,
+     keeping success color inside the OKLCH design-token system instead of an
+     ad-hoc text-green-600 utility (UI-REVIEW Top-3 #3). */
+  --success: oklch(0.627 0.17 145);
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.508 0.205 277);
@@ -59,6 +63,8 @@
   --accent: oklch(0.269 0 0);
   --accent-foreground: oklch(0.985 0 0);
   --destructive: oklch(0.704 0.191 22.216);
+  /* Brighter success in dark mode for adequate contrast on the dark surface. */
+  --success: oklch(0.72 0.17 145);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.62 0.19 277);
@@ -104,6 +110,7 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
+  --color-success: var(--success);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
