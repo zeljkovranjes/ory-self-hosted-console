@@ -156,18 +156,35 @@ assert_db_exists() {
 }
 
 # --- assert_port_refused <port> ----------------------------------------------
-# Negative security assertion (INFRA-05). From the HOST, the admin port MUST
-# NOT be reachable. PASS only when the curl FAILS (connection refused / no
-# route / timeout). A 200/anything-reachable is a FAIL. PASS is never granted
-# merely because output is empty — curl's non-zero exit is the explicit signal.
+# Negative security assertion (INFRA-05). From the HOST, the admin port MUST be
+# unreachable at the CONNECTION level. We must distinguish a true connection
+# failure (refused / no route / timeout) from a reachable port that merely
+# returns a non-2xx HTTP status (CR-03): an exposed admin port whose `/` returns
+# 404 would, under `curl -f`, exit non-zero and FALSE-GREEN this gate. So we DROP
+# `-f` and inspect curl's exit code:
+#   7  = connection refused / could not connect   -> PASS (genuinely unreachable)
+#   28 = operation timed out                       -> PASS (no host route)
+#   6  = could not resolve host                    -> PASS (no route)
+#   0 (or any HTTP status received, e.g. 404/200)  -> FAIL (TCP connect SUCCEEDED
+#                                                     => the admin port IS exposed)
+# Any successful TCP connect — regardless of HTTP status — is a FAIL. PASS is
+# never granted merely because output is empty; it requires an explicit
+# connection-level failure exit code (threat T-03-false-green).
 assert_port_refused() {
-  local port="$1"
-  if curl --max-time 3 -sf "http://localhost:${port}/" >/dev/null 2>&1; then
-    _fail "assert_port_refused $port: host could REACH localhost:$port (admin port exposed!)"
-    return 1
-  fi
-  _pass "assert_port_refused $port: refused/unreachable from host"
-  return 0
+  local port="$1" rc
+  # `|| true` so a non-zero curl exit does not trip the caller's `set -e`; we
+  # capture the real exit code from PIPESTATUS-free direct invocation below.
+  curl --max-time 3 -s -o /dev/null "http://localhost:${port}/" >/dev/null 2>&1 && rc=0 || rc=$?
+  case "$rc" in
+    7|28|6)
+      _pass "assert_port_refused $port: refused/unreachable from host (curl rc=$rc)"
+      return 0
+      ;;
+    *)
+      _fail "assert_port_refused $port: host REACHED localhost:$port (curl rc=$rc — admin port exposed!)"
+      return 1
+      ;;
+  esac
 }
 
 # --- assert_internal_reachable <fromsvc> <url> -------------------------------
