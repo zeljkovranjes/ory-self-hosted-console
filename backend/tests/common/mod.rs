@@ -23,18 +23,40 @@ use sqlx::PgPool;
 /// the binary serves. Plans 02-02..04 extend `routes::build`; this helper rides
 /// along automatically.
 pub fn build_test_router(pool: PgPool) -> Router {
-    // Minimal hardened-default config for the router's affix_state. `console_
-    // database_url` is unused by handlers (they obtain the pool), but kept
-    // non-empty so the struct is valid.
-    let cfg = ory_console_backend::config::Config {
+    build_test_router_cfg(pool, default_test_cfg())
+}
+
+/// Hardened-default test config. `insecure_cookies = true` because the
+/// in-process `TestClient` speaks plain HTTP (the `__Host-`/Secure cookie would
+/// otherwise be a production-only flag the test transport cannot model).
+pub fn default_test_cfg() -> ory_console_backend::config::Config {
+    ory_console_backend::config::Config {
         console_database_url: String::new(),
         bind_addr: "0.0.0.0:8080".to_string(),
         session_idle_secs: 604_800,
         session_absolute_secs: 2_592_000,
-        insecure_cookies: true, // tests run over plain HTTP TestClient
+        insecure_cookies: true,
         github: None,
-    };
-    ory_console_backend::routes::build(pool, cfg)
+    }
+}
+
+/// Build the test router with an explicit config, mounting the public auth
+/// routes (`/setup`, `/login`, `/logout`) onto the real `routes::build`
+/// skeleton. Plan 02-03 assembles the production public/protected router with
+/// the auth + CSRF + rate-limit hoops; until then the integration tests mount
+/// the handlers here so the Task-2 behaviors are exercisable now (per PLAN
+/// "mount them in the test router").
+pub fn build_test_router_cfg(pool: PgPool, cfg: ory_console_backend::config::Config) -> Router {
+    use ory_console_backend::auth::{login, setup};
+
+    let base = ory_console_backend::routes::build(pool, cfg);
+    base.push(
+        Router::with_path("setup")
+            .hoop(setup::require_uninitialized)
+            .post(setup::setup),
+    )
+    .push(Router::with_path("login").post(login::login))
+    .push(Router::with_path("logout").post(login::logout))
 }
 
 /// Run the embedded console migrations against a test pool.

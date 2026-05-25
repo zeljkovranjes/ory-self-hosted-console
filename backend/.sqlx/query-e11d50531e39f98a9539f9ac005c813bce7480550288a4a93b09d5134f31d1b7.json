@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT password_hash FROM admins WHERE email = 'owner@example.com'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "password_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admins",
+            "name": "password_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "e11d50531e39f98a9539f9ac005c813bce7480550288a4a93b09d5134f31d1b7"
+}

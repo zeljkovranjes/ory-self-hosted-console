@@ -12,6 +12,7 @@
 
 use salvo::prelude::*;
 
+use ory_console_backend::auth::setup::ensure_bootstrap_token;
 use ory_console_backend::config::Config;
 use ory_console_backend::error::AppError;
 use ory_console_backend::{db, routes};
@@ -41,6 +42,12 @@ async fn main() -> Result<(), AppError> {
     // exit with a generic message (no connection string leaked).
     sqlx::migrate!("./migrations").run(&pool).await?;
     tracing::info!("console DB migrations applied");
+
+    // First-run bootstrap token (CAUTH-02): on an uninitialized console, this
+    // regenerates + persists (hash only) a one-time setup token and prints the
+    // raw value to stdout exactly once. No-op on an initialized console. Runs
+    // AFTER migrate, BEFORE serve (RESEARCH "Bootstrap order").
+    ensure_bootstrap_token(&pool).await?;
 
     // Owned bind address: TcpListener::new requires a 'static address, and `cfg`
     // is moved into the router below.
