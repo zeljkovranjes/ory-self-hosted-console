@@ -220,7 +220,27 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
         // auto-exempts them; they inherit `auth_guard` (401 when unauthenticated)
         // by sitting on this protected subtree. Thin pass-throughs to the typed
         // per-service crates — full CRUD is deferred to phases 6/8/9.
-        .push(Router::with_path("api/kratos/identities").get(crate::ory::kratos::list_identities))
+        // Phase 6 (IDENT-01/02/04) Kratos identity data path. All inherit
+        // `auth_guard` (401 unauth); GET is csrf-exempt, while POST/PUT/DELETE
+        // require `X-CSRF-Token` via `csrf_guard` (Pitfall 7 — `lib/api.ts`
+        // echoes it, no new wiring). List replaces the Phase-3 first-page proof
+        // with the Link-header keyset cursor; import is the CLI-compatible
+        // bulk-import endpoint (bare-array -> batch wrapper, 1000/200 limits).
+        .push(
+            Router::with_path("api/kratos/identities")
+                .get(crate::ory::kratos::list_identities) // IDENT-01 list (cursor)
+                .post(crate::ory::kratos::create_identity), // IDENT-02 create
+        )
+        .push(
+            Router::with_path("api/kratos/identities/import")
+                .post(crate::ory::kratos::batch_import), // IDENT-04 bulk import
+        )
+        .push(
+            Router::with_path("api/kratos/identities/{id}")
+                .get(crate::ory::kratos::get_identity) // IDENT-01 detail
+                .put(crate::ory::kratos::update_identity) // IDENT-02 update (state required)
+                .delete(crate::ory::kratos::delete_identity), // IDENT-02 delete
+        )
         .push(Router::with_path("api/hydra/clients").get(crate::ory::hydra::list_clients))
         .push(
             Router::with_path("api/keto/relationships")
