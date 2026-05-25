@@ -215,7 +215,19 @@ pub fn build(pool: PgPool, cfg: Config) -> Router {
         .hoop(auth_guard)
         .hoop(csrf_guard)
         .push(Router::with_path("logout").post(login::logout))
-        .push(Router::with_path("api/console/me").get(state::me));
+        .push(Router::with_path("api/console/me").get(state::me))
+        // Phase 3 (BACK-02) Ory Admin proof wrappers. GET-only, so `csrf_guard`
+        // auto-exempts them; they inherit `auth_guard` (401 when unauthenticated)
+        // by sitting on this protected subtree. Thin pass-throughs to the typed
+        // per-service crates — full CRUD is deferred to phases 6/8/9.
+        .push(Router::with_path("api/kratos/identities").get(crate::ory::kratos::list_identities))
+        .push(Router::with_path("api/hydra/clients").get(crate::ory::hydra::list_clients))
+        .push(
+            Router::with_path("api/keto/relationships")
+                .get(crate::ory::keto::list_relationships),
+        )
+        // Optional bonus (CONTEXT): exercises the 4th crate end-to-end.
+        .push(Router::with_path("api/oathkeeper/rules").get(crate::ory::oathkeeper::list_rules));
 
     // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is
     // moved into the affix_state hoop, then inject them into every Depot

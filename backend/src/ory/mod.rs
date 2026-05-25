@@ -16,10 +16,17 @@
 //!   `apis::Error<T>` to `AppError::Upstream` (HTTP 502), never leaking the raw
 //!   upstream body or the admin base URL to the client (BACK-07).
 //!
-//! Arriving in Plan 02 (do NOT add here): the thin proof handler submodules
-//! (`kratos`/`hydra`/`keto`/`oathkeeper`) mounted on the Phase-2 protected
-//! subtree, and the isolated `fallback` module (reqwest 0.13 + hand-mirrored
-//! serde) for endpoints no crate covers.
+//! Added in Plan 02: the thin proof handler submodules
+//! (`kratos`/`hydra`/`keto`/`oathkeeper`) — one authenticated GET wrapper per
+//! service mounted on the Phase-2 protected subtree — and the isolated
+//! [`fallback`] module (reqwest 0.13 + hand-mirrored serde) for endpoints no
+//! crate covers. `fallback` is deliberately ISOLATED from the typed-client path:
+//! it never imports the Ory crates' `apis`, and the typed handlers never import
+//! it (auditability + containment of the reqwest 0.12/0.13 split, RESEARCH).
 
 pub mod clients;
 pub mod error;
+pub mod hydra;
+pub mod keto;
+pub mod kratos;
+pub mod oathkeeper;
