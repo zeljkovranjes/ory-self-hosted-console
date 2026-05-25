@@ -31,6 +31,18 @@ const DEFAULT_KETO_READ_URL: &str = "http://keto:4466";
 const DEFAULT_KETO_WRITE_URL: &str = "http://keto:4467";
 const DEFAULT_OATHKEEPER_API_URL: &str = "http://oathkeeper:4456";
 
+/// Internal-network default for the Phase-1 restart broker (`wollomatic`
+/// socket-proxy). Phase 4 (BACK-05): the backend holds NO docker socket — it
+/// triggers a single-container restart by POSTing to this scoped broker over the
+/// internal network. NON-SECRET (carries no credential) — cleartext in `Debug`.
+const DEFAULT_RESTART_BROKER_URL: &str = "http://restart-broker:2375";
+
+/// Default base directory of the mounted service-config tree. Phase 1 INFRA-07
+/// bind-mounts `./config` into the backend at `/etc/config` (`:rw`). The
+/// per-service YAML lives at `<config_dir>/<service>/<file>`. NON-SECRET — it is
+/// a fixed internal filesystem path, never client-supplied.
+const DEFAULT_CONFIG_DIR: &str = "/etc/config";
+
 /// Optional GitHub OAuth configuration. Present ONLY when both the client id
 /// and secret are set in the environment (CAUTH-04 env-gating).
 #[derive(Clone)]
@@ -92,6 +104,17 @@ pub struct Config {
     pub keto_write_url: String,
     /// Oathkeeper API base URL (env `OATHKEEPER_API_URL`, default `http://oathkeeper:4456`).
     pub oathkeeper_api_url: String,
+
+    // --- Phase 4 (BACK-04 / BACK-05): config-edit subsystem -----------------
+    /// Restart broker base URL (env `RESTART_BROKER_URL`, default
+    /// `http://restart-broker:2375`). The scoped Phase-1 socket-proxy the backend
+    /// POSTs a single-container restart to (BACK-05 — backend holds no socket).
+    /// NON-SECRET: cleartext in the redacting `Debug`.
+    pub restart_broker_url: String,
+    /// Base directory of the mounted service-config tree (env `CONFIG_DIR`,
+    /// default `/etc/config`). The per-service YAML resolves to
+    /// `<config_dir>/<service>/<file>`. NON-SECRET fixed path; never client input.
+    pub config_dir: String,
 }
 
 impl fmt::Debug for Config {
@@ -111,6 +134,9 @@ impl fmt::Debug for Config {
             .field("keto_read_url", &self.keto_read_url)
             .field("keto_write_url", &self.keto_write_url)
             .field("oathkeeper_api_url", &self.oathkeeper_api_url)
+            // Config-edit subsystem URLs/paths are non-secret: print in cleartext.
+            .field("restart_broker_url", &self.restart_broker_url)
+            .field("config_dir", &self.config_dir)
             .finish()
     }
 }
@@ -197,6 +223,14 @@ impl Config {
         let oathkeeper_api_url = env::var("OATHKEEPER_API_URL")
             .unwrap_or_else(|_| DEFAULT_OATHKEEPER_API_URL.to_string());
 
+        // Phase 4 (BACK-04 / BACK-05): the restart broker base URL + the mounted
+        // config-tree directory. Both fall back to their internal-network /
+        // bind-mount defaults; neither is a secret and neither is client-derived.
+        let restart_broker_url = env::var("RESTART_BROKER_URL")
+            .unwrap_or_else(|_| DEFAULT_RESTART_BROKER_URL.to_string());
+        let config_dir =
+            env::var("CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string());
+
         Ok(Config {
             console_database_url,
             bind_addr,
@@ -210,6 +244,8 @@ impl Config {
             keto_read_url,
             keto_write_url,
             oathkeeper_api_url,
+            restart_broker_url,
+            config_dir,
         })
     }
 

@@ -49,6 +49,10 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
         keto_read_url: "http://keto:4466".to_string(),
         keto_write_url: "http://keto:4467".to_string(),
         oathkeeper_api_url: "http://oathkeeper:4456".to_string(),
+        // Phase 4 (BACK-04 / BACK-05): config-edit subsystem — same defaults as
+        // `Config::from_env`.
+        restart_broker_url: "http://restart-broker:2375".to_string(),
+        config_dir: "/etc/config".to_string(),
     }
 }
 

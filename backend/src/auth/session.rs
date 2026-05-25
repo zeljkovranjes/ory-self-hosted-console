@@ -182,6 +182,8 @@ mod tests {
             keto_read_url: "http://keto:4466".into(),
             keto_write_url: "http://keto:4467".into(),
             oathkeeper_api_url: "http://oathkeeper:4456".into(),
+            restart_broker_url: "http://restart-broker:2375".into(),
+            config_dir: "/etc/config".into(),
         }
     }
 

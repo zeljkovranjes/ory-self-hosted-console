@@ -109,6 +109,9 @@ tempfile = "3"
 [dev-dependencies]
 # Salvo `test` feature exposes TestClient for in-process handler/middleware tests.
 salvo = { version = "0.93.0", features = ["test"] }
+# In-process mock HTTP server for the restart-broker (204 / non-204) + the
+# /health/ready 503-then-200 poll tests, so unit tests need no live Ory stack.
+mockito = "1"
 # `#[sqlx::test]` provisions an isolated temp database per test (Validation Architecture).
 sqlx = { version = "0.9.0", features = [
     "runtime-tokio",

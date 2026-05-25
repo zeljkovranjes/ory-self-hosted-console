@@ -26,5 +26,6 @@
 
 pub mod allowlist;
 pub mod locks;
+pub mod restart;
 pub mod schema;
 pub mod yaml;
