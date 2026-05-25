@@ -25,4 +25,6 @@
 //! later plans in this phase.
 
 pub mod allowlist;
+pub mod locks;
 pub mod schema;
+pub mod yaml;
