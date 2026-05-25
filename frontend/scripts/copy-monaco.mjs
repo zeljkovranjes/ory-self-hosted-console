@@ -20,8 +20,10 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +33,75 @@ const frontendDir = join(here, "..");
 
 const src = join(frontendDir, "node_modules", "monaco-editor", "min", "vs");
 const dest = join(frontendDir, "public", "monaco", "vs");
+
+// -----------------------------------------------------------------------------
+// FE-05 / threat T-05-11 — eliminate the CDN literal at its source.
+//
+// @monaco-editor/loader ships a hard-coded default config whose `paths.vs`
+// points at `https://cdn.jsdelivr.net/npm/monaco-editor@<ver>/min/vs`. Even
+// though setupMonaco() overrides this at runtime via loader.config({ paths }),
+// the DEFAULT string is a module-level literal that Next inlines into the built
+// client bundle — so `cdn.jsdelivr.net` shows up in `.next` and trips the
+// air-gap bundle-egress gate. We rewrite the loader's bundled default to our
+// own same-origin `/monaco/vs` so the CDN host NEVER reaches the build.
+//
+// This runs as part of the existing postinstall/prebuild step, so it is applied
+// after every `npm ci` (the literal is reintroduced by a fresh install and
+// patched out again here — fully reproducible in the Docker builder stage). The
+// rewrite is idempotent: a file already pointing at `/monaco/vs` is left alone.
+// The runtime override in lib/monaco-setup.ts is kept too (defense in depth).
+// -----------------------------------------------------------------------------
+const LOCAL_VS = "/monaco/vs";
+// Match the loader's default jsDelivr base for ANY monaco-editor version
+// (`@x.y.z`), capturing only the host+package+path so we swap it wholesale.
+const CDN_VS_RE =
+  /https:\/\/cdn\.jsdelivr\.net\/npm\/monaco-editor@[^/'"]+\/min\/vs/g;
+
+function patchLoaderDefaultCdn() {
+  const loaderDir = join(frontendDir, "node_modules", "@monaco-editor", "loader");
+  if (!existsSync(loaderDir)) {
+    console.warn(
+      `[copy-monaco] @monaco-editor/loader not found at ${loaderDir}; ` +
+        `skipping CDN-default patch.`,
+    );
+    return;
+  }
+
+  // Rewrite every shipped loader variant a bundler could resolve (es is what
+  // Next/Turbopack picks via `module`; cjs is the `main` fallback; the umd
+  // builds round it out so a repo-wide grep is clean too).
+  const targets = [
+    join(loaderDir, "lib", "es", "config", "index.js"),
+    join(loaderDir, "lib", "cjs", "config", "index.js"),
+    join(loaderDir, "lib", "umd", "monaco-loader.js"),
+    join(loaderDir, "lib", "umd", "monaco-loader.min.js"),
+  ];
+
+  let patched = 0;
+  for (const file of targets) {
+    if (!existsSync(file)) continue;
+    const before = readFileSync(file, "utf8");
+    if (!CDN_VS_RE.test(before)) continue; // already clean — idempotent no-op
+    CDN_VS_RE.lastIndex = 0; // reset after .test()
+    const after = before.replace(CDN_VS_RE, LOCAL_VS);
+    if (after !== before) {
+      writeFileSync(file, after);
+      patched += 1;
+    }
+  }
+
+  console.log(
+    patched > 0
+      ? `[copy-monaco] patched @monaco-editor/loader default CDN -> ${LOCAL_VS} ` +
+          `(${patched} file${patched === 1 ? "" : "s"}); no jsDelivr literal ships.`
+      : `[copy-monaco] @monaco-editor/loader default already local (${LOCAL_VS}); nothing to patch.`,
+  );
+}
+
+// Patch the loader's default CDN base FIRST — independent of the editor asset
+// copy below, and required even on a lint-only CI so the built bundle never
+// inlines `cdn.jsdelivr.net`.
+patchLoaderDefaultCdn();
 
 if (!existsSync(src)) {
   // Not fatal: in some environments (e.g. a lint-only CI without deps) the

@@ -31,15 +31,32 @@ squiggles, formatting) load entirely first-party — no `?worker` transform, no
 
 ## Implementation
 
-- **`scripts/copy-monaco.mjs`** — copies `node_modules/monaco-editor/min/vs` →
-  `frontend/public/monaco/vs` (idempotent; asserts the load-bearing files
-  exist). Wired as npm **`prebuild`**, **`predev`**, and **`postinstall`** so the
-  assets are primed for `next build`, `next dev`, and a fresh `npm ci` (the
-  Docker builder stage). The `vs/` tree is also committed under
-  `public/monaco/vs` so the editor works even without re-running the copy.
+- **`scripts/copy-monaco.mjs`** — does two things, both idempotent and wired as
+  npm **`prebuild`**, **`predev`**, and **`postinstall`** (so they run for
+  `next build`, `next dev`, and every fresh `npm ci` in the Docker builder
+  stage):
+  1. **Copies** `node_modules/monaco-editor/min/vs` → `frontend/public/monaco/vs`
+     (asserts the load-bearing files exist). The `vs/` tree is also committed
+     under `public/monaco/vs` so the editor works even without re-running the
+     copy.
+  2. **Eliminates the CDN literal at its source.** `@monaco-editor/loader`
+     ships a module-level default config whose `paths.vs` is
+     `https://cdn.jsdelivr.net/npm/monaco-editor@<ver>/min/vs`. Even with the
+     runtime override below, that DEFAULT string is inlined by Next into the
+     built client bundle, tripping the air-gap bundle-egress gate. The script
+     rewrites the loader's bundled default (`lib/es`, `lib/cjs`, and both
+     `lib/umd` variants) to the same-origin `/monaco/vs` so `cdn.jsdelivr.net`
+     **never reaches the build**. The rewrite is version-agnostic
+     (`monaco-editor@*`) and idempotent (a file already pointing at
+     `/monaco/vs` is left alone), and because it runs at `postinstall` it is
+     re-applied after every `npm ci` — verified to survive a clean
+     `rm -rf node_modules && npm ci && npm run build`.
 - **`lib/monaco-setup.ts`** — `setupMonaco()` calls
   `loader.config({ paths: { vs: "/monaco/vs" } })` exactly once (idempotent,
   client-only). The MonacoEditor wrapper invokes it before the first mount.
+  This is now **defense in depth**: the source rewrite already removes the CDN
+  default, and this guarantees the running loader points at our origin even if
+  the rewrite were ever skipped.
 - **`next.config.ts`** — **no change required.** Next serves `public/` at the
   origin root, so `/monaco/vs/*` is same-origin automatically; the existing
   `/backend` rewrite + `output:"standalone"` are untouched. The Dockerfile
@@ -47,9 +64,12 @@ squiggles, formatting) load entirely first-party — no `?worker` transform, no
 
 ## Offline proof (no jsDelivr request)
 
-1. **Build gate** — `bash scripts/verify/bundle-egress.sh` now also forbids
-   `cdn.jsdelivr.net|cdnjs.cloudflare.com|unpkg.com` in the built bundle; it
-   passes (no CDN host, no Ory host/port/SDK in `.next`).
+1. **Build gate** — `bash scripts/verify/bundle-egress.sh` forbids
+   `cdn.jsdelivr.net|cdnjs.cloudflare.com|unpkg.com` (and every Ory
+   host/port/SDK) in the built bundle. It passes **with no CDN exception
+   clause** — because the loader's CDN default is rewritten at its source
+   (above), the literal is simply absent from `.next`, so the gate stays
+   maximally strict (the FE-05 invariant is enforced verbatim).
 2. **Static-asset scan** — `grep -rIE 'cdn\.jsdelivr\.net|...'` over
    `public/monaco` finds nothing; the only `https://` in `loader.js` is a
    `github.com` license comment, not a runtime fetch.

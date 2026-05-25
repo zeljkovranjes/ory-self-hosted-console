@@ -29,16 +29,21 @@ FRONTEND_DIR="${FRONTEND_DIR:-${REPO_ROOT}/frontend}"
 # substring-matches React/TanStack `dehydrated`/`hydrateRoot`, and `4445`
 # substring-matches Turbopack module IDs like `34457`. So each forbidden token is
 # anchored to a URL/host CONTEXT:
-#   * Service hostnames (kratos/hydra/keto/oathkeeper) only when preceded by a
-#     URL host delimiter (`/`, `:`, `@`, `"`, `'`, or `//`) — i.e. an actual host
-#     position, never as an internal substring of a longer identifier.
+#   * Service hostnames (kratos/hydra/keto/oathkeeper) only in a TRUE host
+#     position: immediately after a scheme-authority `//` or a userinfo `@`
+#     (`http://kratos`, `user@hydra`), OR as `name:<port>` (`kratos:4434`). This
+#     deliberately does NOT match a same-origin BACKEND path segment like
+#     `/backend/api/kratos/identities` — that is the legitimate, host-less route
+#     namespace the browser calls through lib/api.ts, not an Ory host. (An older
+#     `[/:@"']/?name` form also matched `/kratos/`, a false positive on the
+#     backend route path; tightened to real host context only.)
 #   * The Ory SDK package strings `ory-client` and `@ory/` (no Ory crate/SDK may
 #     ship to the browser at all).
 #   * The `oryd/` image-namespace string (config/host leak).
 #   * Admin ports only as a real URL port `:<port>` with a non-digit trailing
 #     boundary (catches `kratos:4434/...`, not `34457`).
 # Admin ports: kratos 4434/4445, hydra 4445, keto 4466/4467, oathkeeper 4456/4457.
-FORBIDDEN_HOSTNAMES='[/:@"'"'"']/?(kratos|hydra|keto|oathkeeper)([/:."'"'"']|$)'
+FORBIDDEN_HOSTNAMES='(//|@)(kratos|hydra|keto|oathkeeper)([/:."'"'"']|$)|(kratos|hydra|keto|oathkeeper):(4434|4445|4466|4456|4467|4457)([^0-9]|$)'
 FORBIDDEN_SDK='ory-client|@ory/|oryd/'
 FORBIDDEN_PORTS=':(4434|4445|4466|4456|4467|4457)([^0-9]|$)'
 # FE-04 / threat T-05-11: Monaco must load from our OWN origin (public/monaco/vs
