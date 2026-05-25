@@ -15,7 +15,14 @@
 // `npm ci` in the Docker builder stage primes public/ before `next build`).
 // Node-only, cross-platform (the operator develops on Windows, builds on Linux).
 
-import { cpSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -46,12 +53,27 @@ cpSync(src, dest, { recursive: true });
 // Sanity assertions — the load-bearing files must be present, otherwise the
 // editor would silently fall back / fail. Fail hard here rather than ship a
 // broken editor.
-const required = [
-  "loader.js",
-  join("editor", "editor.main.js"),
-  join("assets", "editor.worker-Be8ye1pW.js"),
-];
-const missing = required.filter((rel) => !existsSync(join(dest, rel)));
+//
+// loader.js and editor/editor.main.js are stable, UNHASHED entrypoint names —
+// assert them exactly. The editor Web Worker, however, ships with a
+// content-hash in its filename (e.g. `editor.worker-Be8ye1pW.js`) that changes
+// on virtually every monaco-editor version bump. Asserting the exact hash made
+// a routine patch bump fail `npm ci` (this script runs as postinstall) with a
+// misleading "Monaco files missing" error even though the editor works. So the
+// worker is matched by a version-AGNOSTIC pattern instead (WR-04).
+const requiredExact = ["loader.js", join("editor", "editor.main.js")];
+const missing = requiredExact.filter((rel) => !existsSync(join(dest, rel)));
+
+// The editor worker lives under assets/ with a hashed name: assert at least one
+// `editor.worker-*.js` exists rather than pinning the exact hash.
+const assetsDir = join(dest, "assets");
+const hasEditorWorker =
+  existsSync(assetsDir) &&
+  readdirSync(assetsDir).some((f) => /^editor\.worker-.*\.js$/.test(f));
+if (!hasEditorWorker) {
+  missing.push(join("assets", "editor.worker-*.js"));
+}
+
 if (missing.length) {
   console.error(
     `[copy-monaco] expected Monaco files missing after copy: ${missing.join(", ")}`,
