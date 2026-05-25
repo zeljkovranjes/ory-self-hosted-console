@@ -410,6 +410,38 @@ else
   _fail "imported identities did NOT all appear in the list (import incomplete)"
 fi
 
+# WR-01: the Users-list search filter (credentials_identifier) is threaded
+# end-to-end. Searching for IMP1's exact email must return a list that CONTAINS
+# IMP1 but EXCLUDES the unrelated IMP2 — proving the filter is applied by Kratos
+# rather than silently dropped (the pre-fix behavior returned the full page).
+echo
+echo "--- [IDENT-01/WR-01] Users-list search filter (credentials_identifier) ---"
+search_resp="$(_auth_get "${IDENTITIES_URL}?page_size=500&credentials_identifier=${IMP1}")"
+search_code="$(_code_of "$search_resp")"; search_body="$(_body_of "$search_resp")"
+if [ "$search_code" = "200" ]; then
+  search_verdict="$(printf '%s' "$search_body" | E1="$IMP1" E2="$IMP2" node -e '
+    const e1 = process.env.E1, e2 = process.env.E2;
+    let d; try { d = JSON.parse(require("fs").readFileSync(0,"utf8")); } catch(e){ process.stdout.write("BADJSON"); process.exit(0); }
+    const rows = (d && d.rows) || [];
+    const emails = rows.map(r => r && r.traits && r.traits.email);
+    const hasE1 = emails.includes(e1);
+    const hasE2 = emails.includes(e2);
+    // Filter applied: E1 present, E2 (a different identifier) excluded.
+    if (hasE1 && !hasE2) { process.stdout.write("FILTERED"); process.exit(0); }
+    if (hasE1 && hasE2) { process.stdout.write("UNFILTERED"); process.exit(0); }
+    process.stdout.write(hasE1 ? "ONLY_E1" : "MISSING_E1");
+  ' 2>/dev/null)"
+  if [ "$search_verdict" = "FILTERED" ] || [ "$search_verdict" = "ONLY_E1" ]; then
+    _pass "search by credentials_identifier returns the matching identity and excludes unrelated ones (WR-01: filter threaded to Kratos)"
+  elif [ "$search_verdict" = "UNFILTERED" ]; then
+    _fail "search returned BOTH the matched and an unrelated identity — the credentials_identifier filter was NOT applied (WR-01 regression)"
+  else
+    _fail "search by credentials_identifier did not return the matched identity ($search_verdict)"
+  fi
+else
+  _fail "search list returned '$search_code' (want 200; body: $search_body)"
+fi
+
 # Over-limit reject: 201 records each carrying a CLEARTEXT password -> 422
 # (>200-cleartext authoritative limit). Negative assertion: a 2xx is a hard FAIL.
 # The body is ~30KB, which exceeds the Git-Bash/MSYS command-line argument limit
