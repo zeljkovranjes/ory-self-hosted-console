@@ -53,12 +53,21 @@ CREATE ROLE console WITH LOGIN PASSWORD 'changeme_console';
 -- No role for the oathkeeper database: it is unused (stateless service, A4).
 
 -- ---------------------------------------------------------------------------
--- 3. Grants — each role gets full privileges on ONLY its own database
+-- 3. Grants — least privilege scoped to each role's OWN database (WR-02).
+--    We grant CONNECT + CREATE instead of the broad `ALL PRIVILEGES ON
+--    DATABASE`. The dropped bit is TEMP (temporary-object creation), which no
+--    Ory migrate needs. CREATE (database-level) is REQUIRED and must NOT be
+--    dropped: Kratos's migrations run `CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+--    which a non-superuser can only do with database-level CREATE (pg_trgm is a
+--    PG13+ "trusted" extension). `public`-schema ownership (section 4) alone is
+--    NOT sufficient for extension creation — that is a database-level right.
+--    So CONNECT + CREATE is the tightest grant that still lets every service
+--    migrate cleanly, narrower than the original `ALL` (which also gave TEMP).
 -- ---------------------------------------------------------------------------
-GRANT ALL PRIVILEGES ON DATABASE kratos  TO kratos;
-GRANT ALL PRIVILEGES ON DATABASE hydra   TO hydra;
-GRANT ALL PRIVILEGES ON DATABASE keto    TO keto;
-GRANT ALL PRIVILEGES ON DATABASE console TO console;
+GRANT CONNECT, CREATE ON DATABASE kratos  TO kratos;
+GRANT CONNECT, CREATE ON DATABASE hydra   TO hydra;
+GRANT CONNECT, CREATE ON DATABASE keto    TO keto;
+GRANT CONNECT, CREATE ON DATABASE console TO console;
 
 -- ---------------------------------------------------------------------------
 -- 4. Per-database `public` schema ownership (REQUIRED on Postgres 15+).
