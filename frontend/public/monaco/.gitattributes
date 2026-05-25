@@ -1,0 +1,6 @@
+# Vendored Monaco editor distribution (copied from monaco-editor/min/vs by
+# frontend/scripts/copy-monaco.mjs). Treat as binary so git performs NO EOL
+# conversion on any platform — these are upstream Microsoft build artifacts
+# (editor + Web Workers) and must stay byte-identical to what `next build`
+# would emit from node_modules. Marking them `-text` also keeps diffs quiet.
+* -text -diff linguist-vendored

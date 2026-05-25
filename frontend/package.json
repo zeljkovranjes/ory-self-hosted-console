@@ -5,6 +5,9 @@
   "description": "Ory Self-Hosted Console frontend (Phase 1 skeleton — proves the compose slot + healthcheck; real admin shell lands in Phase 5).",
   "scripts": {
     "dev": "next dev",
+    "prebuild": "node scripts/copy-monaco.mjs",
+    "predev": "node scripts/copy-monaco.mjs",
+    "postinstall": "node scripts/copy-monaco.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",

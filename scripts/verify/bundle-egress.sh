@@ -41,7 +41,13 @@ FRONTEND_DIR="${FRONTEND_DIR:-${REPO_ROOT}/frontend}"
 FORBIDDEN_HOSTNAMES='[/:@"'"'"']/?(kratos|hydra|keto|oathkeeper)([/:."'"'"']|$)'
 FORBIDDEN_SDK='ory-client|@ory/|oryd/'
 FORBIDDEN_PORTS=':(4434|4445|4466|4456|4467|4457)([^0-9]|$)'
-FORBIDDEN="${FORBIDDEN_HOSTNAMES}|${FORBIDDEN_SDK}|${FORBIDDEN_PORTS}"
+# FE-04 / threat T-05-11: Monaco must load from our OWN origin (public/monaco/vs
+# via loader.config paths), NEVER from the @monaco-editor/react default CDN. Any
+# jsDelivr / unpkg / cdnjs host in the built bundle is a supply-chain + air-gap
+# violation — fail the gate. (Same-origin "/monaco/vs" is a bare path with no
+# host, so it never matches these host patterns.)
+FORBIDDEN_CDN='cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|unpkg\.com'
+FORBIDDEN="${FORBIDDEN_HOSTNAMES}|${FORBIDDEN_SDK}|${FORBIDDEN_PORTS}|${FORBIDDEN_CDN}"
 
 # Search roots: the client static chunks and the standalone server's compiled
 # .next (the server bundle would also carry a leaked literal). We do NOT grep
