@@ -109,10 +109,19 @@ export async function api<T = unknown>(
   }
 
   if (res.status === 422) {
+    // The backend (AppError::Validation, backend/src/error.rs:149-151) renders
+    // 422 as `{"error":"validation_failed","fields":[{path,message}]}` — the
+    // field errors live under `fields`, NOT `errors`. Read the real key and
+    // keep a tolerant `errors` fallback for forward/backward compatibility.
     const body = (await res.json().catch(() => ({}))) as {
+      fields?: FieldError[];
       errors?: FieldError[];
     };
-    const fieldErrors = Array.isArray(body.errors) ? body.errors : [];
+    const fieldErrors = Array.isArray(body.fields)
+      ? body.fields
+      : Array.isArray(body.errors)
+        ? body.errors
+        : [];
     throw new ApiError(422, fieldErrors);
   }
 

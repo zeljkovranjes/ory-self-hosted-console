@@ -16,8 +16,17 @@ import { Input } from "@/components/ui/input";
 
 const apiMock = vi.fn();
 const toastSuccess = vi.fn();
+// Capture the REAL `api()` so one test can exercise the genuine 422 parse path
+// (the `{fields:[...]}` backend shape) through the actual lib/api.ts code rather
+// than a hand-built ApiError — this is what would catch a contract regression.
+// `vi.hoisted` makes the holder available inside the hoisted vi.mock factory
+// without a TDZ error.
+const apiHolder = vi.hoisted(() => ({
+  real: undefined as undefined | ((...a: unknown[]) => unknown),
+}));
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
+  apiHolder.real = actual.api as (...a: unknown[]) => unknown;
   return { ...actual, api: (...args: unknown[]) => apiMock(...args) };
 });
 vi.mock("sonner", () => ({
@@ -131,6 +140,38 @@ describe("SettingsForm (FE-03)", () => {
     await userEvent.click(screen.getByRole("button", { name: /save/i }));
 
     expect(await screen.findByText("Host unreachable")).toBeInTheDocument();
+  });
+
+  it("maps inline errors from the REAL backend 422 {fields:[...]} body (end-to-end parse path)", async () => {
+    // Regression guard for CR-01: drive SettingsForm through the genuine
+    // lib/api.ts parse path against a stubbed fetch returning the backend's
+    // ACTUAL shape — `{error:"validation_failed", fields:[{path,message}]}`
+    // (backend/src/error.rs:149-151). If api.ts read the wrong key, fieldErrors
+    // would be [] and this inline message would never render — failing the test.
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 422,
+      ok: false,
+      json: async () => ({
+        error: "validation_failed",
+        fields: [{ path: "smtp_host", message: "Host unreachable (real 422)" }],
+      }),
+    } as unknown as Response);
+    vi.stubGlobal("fetch", fetchMock);
+    // Route the component's `api()` through the real implementation for this test.
+    apiMock.mockImplementation((...args: unknown[]) => apiHolder.real!(...args));
+    try {
+      render(<Harness />);
+      await userEvent.type(screen.getByLabelText("From name"), "Z");
+      await userEvent.click(screen.getByRole("button", { name: /save/i }));
+
+      expect(
+        await screen.findByText("Host unreachable (real 422)"),
+      ).toBeInTheDocument();
+      // The 422 must hit the backend exactly once via the real wrapper.
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("shows a healthy success banner and toasts on a successful save", async () => {

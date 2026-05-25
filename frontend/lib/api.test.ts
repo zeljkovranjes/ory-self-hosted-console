@@ -152,13 +152,20 @@ describe("401 centralized redirect", () => {
 });
 
 describe("422 typed field errors", () => {
-  it("throws ApiError(422) carrying fieldErrors {path,message}[]", async () => {
+  it("parses the backend's `fields` key (real {error,fields:[{path,message}]} shape)", async () => {
+    // Mirrors AppError::Validation in backend/src/error.rs:149-151, which
+    // renders `{"error":"validation_failed","fields":[{path,message}]}`. The
+    // wrapper MUST read `fields` (not `errors`) or inline validation is dead.
     const fieldErrors = [
       { path: "smtp.host", message: "required" },
       { path: "smtp.port", message: "must be a number" },
     ];
     fetchMock.mockResolvedValue(
-      mockResponse(422, { errors: fieldErrors }, { ok: false }),
+      mockResponse(
+        422,
+        { error: "validation_failed", fields: fieldErrors },
+        { ok: false },
+      ),
     );
     setCsrfToken("t");
     const err = await api("/api/config/kratos/smtp", {
@@ -170,7 +177,28 @@ describe("422 typed field errors", () => {
     expect((err as ApiError).fieldErrors).toEqual(fieldErrors);
   });
 
-  it("tolerates a 422 body without an errors array", async () => {
+  it("ignores the legacy `errors` key when the real `fields` shape is present", async () => {
+    // Pins the contract: a body using the backend's real `fields` shape must
+    // surface those errors (regressing to the old `errors`-only read would
+    // break this).
+    const fieldErrors = [{ path: "email", message: "invalid" }];
+    fetchMock.mockResolvedValue(
+      mockResponse(422, { fields: fieldErrors }, { ok: false }),
+    );
+    const err = await api("/x", { method: "POST" }).catch((e) => e);
+    expect((err as ApiError).fieldErrors).toEqual(fieldErrors);
+  });
+
+  it("tolerates a legacy `errors` key as a fallback (forward/backward compat)", async () => {
+    const fieldErrors = [{ path: "email", message: "invalid" }];
+    fetchMock.mockResolvedValue(
+      mockResponse(422, { errors: fieldErrors }, { ok: false }),
+    );
+    const err = await api("/x", { method: "POST" }).catch((e) => e);
+    expect((err as ApiError).fieldErrors).toEqual(fieldErrors);
+  });
+
+  it("tolerates a 422 body without a fields array", async () => {
     fetchMock.mockResolvedValue(mockResponse(422, {}, { ok: false }));
     const err = await api("/x", { method: "POST" }).catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);
