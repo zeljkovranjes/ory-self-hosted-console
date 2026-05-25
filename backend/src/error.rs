@@ -48,6 +48,15 @@ pub enum AppError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// Resource is locked / busy — e.g. a config write is already in progress
+    /// for the affected service (the per-service write lock is held). CONTEXT/
+    /// RESEARCH Open Question 3: a save-in-progress returns busy as 409 Conflict
+    /// (the semantically correct status for a locked resource), NOT 400. The
+    /// String carries a stable machine reason (e.g. `config_busy`) for the log;
+    /// the client receives only the generic `{"error":"conflict"}` body. -> 409
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Upstream Ory service failure (transport, decode, or non-2xx response).
     /// CONTEXT/BACK-02 require 502 (NOT 500) for upstream failures. The detail
     /// string is for SERVER-SIDE LOGS ONLY — it carries a sanitised summary
@@ -66,6 +75,7 @@ impl AppError {
             AppError::Forbidden => StatusCode::FORBIDDEN,
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Db(_)
             | AppError::Migrate(_)
@@ -85,6 +95,7 @@ impl AppError {
             AppError::Forbidden => "forbidden",
             AppError::NotFound => "not_found",
             AppError::BadRequest(_) => "bad_request",
+            AppError::Conflict(_) => "conflict",
             AppError::Upstream(_) => "upstream_error",
         }
     }

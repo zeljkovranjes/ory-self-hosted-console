@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod config_edit;
 pub mod db;
 pub mod error;
 pub mod ory;
