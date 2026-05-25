@@ -109,11 +109,160 @@ pub async fn fetch_version(
     resp.json::<FallbackVersion>().await.map_err(map_fallback_err)
 }
 
+/// Parse the `page_token` query value of the `rel="next"` entry from a Kratos
+/// `Link` response header (RFC 8288 web-linking), returning `None` when there is
+/// no next page.
+///
+/// Kratos paginates the Admin identity list with KEYSET cursors (RESEARCH
+/// Pitfall 3): the typed `identity_api::list_identities` returns only the body
+/// `Vec<Identity>` and DROPS the response headers, so the forward cursor is
+/// unreachable through the crate. This isolated reqwest-0.13 wrapper exists to
+/// read that header for the list endpoint ONLY (RESEARCH Open Q1 / the one
+/// justified fallback use). The header looks like:
+///
+/// ```text
+/// Link: </admin/identities?page_size=50&page_token=abc>; rel="next",
+///       </admin/identities?page_size=50&page_token=def>; rel="first"
+/// ```
+///
+/// We extract the `page_token` query param of the `rel="next"` URL. A token-free
+/// or absent `next` link yields `None` (the operator is on the last page —
+/// "fewer items than the page size" is the other last-page signal).
+pub fn parse_next_page_token(link_header: &str) -> Option<String> {
+    // Each comma-separated section is `<url>; rel="name"` (params may carry their
+    // own commas inside the URL query, but Kratos uses `&` there, so a simple
+    // split on `,` between sections is safe for this upstream).
+    for section in link_header.split(',') {
+        let section = section.trim();
+        // Must be the forward cursor.
+        if !section.contains("rel=\"next\"") && !section.contains("rel=next") {
+            continue;
+        }
+        // Pull the `<...>` URL-reference and read its `page_token` query value.
+        let start = section.find('<')?;
+        let end = section[start + 1..].find('>')? + start + 1;
+        let url_ref = &section[start + 1..end];
+        // The URL-reference is relative (`/admin/identities?...`); a query parse
+        // only needs the part after `?`.
+        let query = url_ref.split_once('?').map(|(_, q)| q).unwrap_or("");
+        for pair in query.split('&') {
+            if let Some(tok) = pair.strip_prefix("page_token=") {
+                if !tok.is_empty() {
+                    return Some(tok.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// List Kratos identities for ONE keyset page, returning the raw identity JSON
+/// objects plus the `page_token` cursor for the NEXT page (`None` on the last
+/// page).
+///
+/// This is the single justified reqwest-0.13 fallback (RESEARCH Open Q1): the
+/// typed `list_identities` drops the `Link` header that carries the keyset
+/// cursor. We GET `{base_url}/admin/identities?page_size=&page_token=` and parse
+/// the header. The identities are returned as `serde_json::Value` (NOT the Ory
+/// `Identity` type) to preserve this module's isolation invariant — the typed
+/// handler in `kratos.rs` shapes them (stripping credential secrets) before they
+/// reach the client.
+///
+/// `base_url` is the FIXED internal Kratos Admin URL from `Config` (never user
+/// input — no SSRF surface, RESEARCH Security Domain). On any non-2xx or
+/// transport/decode failure the shared [`AppError::Upstream`] (502) envelope is
+/// returned with NO upstream body/host leaked (BACK-07).
+pub async fn list_identities_paged(
+    client: &reqwest::Client,
+    base_url: &str,
+    page_size: i64,
+    page_token: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, Option<String>), AppError> {
+    let mut url = format!(
+        "{}/admin/identities?page_size={}",
+        base_url.trim_end_matches('/'),
+        page_size
+    );
+    if let Some(tok) = page_token {
+        // page_token is an opaque Kratos cursor; percent-encode to be safe.
+        url.push_str("&page_token=");
+        url.push_str(&urlencode(tok));
+    }
+
+    let resp = client.get(url).send().await.map_err(map_fallback_err)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(map_fallback_status(status));
+    }
+
+    // Read the next-page cursor from the Link header BEFORE consuming the body.
+    let next_token = resp
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_next_page_token);
+
+    // Decode the body as a generic JSON array of identity objects. A decode
+    // failure is still an upstream problem -> 502, never a body leak.
+    let body: serde_json::Value = resp.json().await.map_err(map_fallback_err)?;
+    let rows = body
+        .as_array()
+        .cloned()
+        .ok_or_else(|| AppError::Upstream("ory upstream returned a non-array list".into()))?;
+
+    Ok((rows, next_token))
+}
+
+/// Minimal percent-encoding for an opaque page-token cursor placed in a query
+/// string. Encodes the characters that are unsafe in a query value; the Kratos
+/// token alphabet is URL-safe in practice, this is belt-and-suspenders.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::AppError;
     use salvo::http::StatusCode as SalvoStatus;
+
+    /// The `rel="next"` `page_token` is extracted from a realistic Link header.
+    #[test]
+    fn next_token_extracted_from_link_header() {
+        let header = "</admin/identities?page_token=abc&page_size=50>; rel=\"next\"";
+        assert_eq!(parse_next_page_token(header), Some("abc".to_string()));
+    }
+
+    /// A multi-rel header still picks the `next` token (not first/prev).
+    #[test]
+    fn next_token_picks_next_among_many_rels() {
+        let header = "</admin/identities?page_token=first0&page_size=50>; rel=\"first\", \
+                      </admin/identities?page_token=nexttok&page_size=50>; rel=\"next\", \
+                      </admin/identities?page_token=prev0&page_size=50>; rel=\"prev\"";
+        assert_eq!(parse_next_page_token(header), Some("nexttok".to_string()));
+    }
+
+    /// No `rel="next"` => no further page => None (last-page signal).
+    #[test]
+    fn no_next_rel_is_none() {
+        let header = "</admin/identities?page_size=50>; rel=\"first\"";
+        assert_eq!(parse_next_page_token(header), None);
+    }
+
+    /// An empty header string yields None (absent cursor).
+    #[test]
+    fn empty_header_is_none() {
+        assert_eq!(parse_next_page_token(""), None);
+    }
 
     /// A transport-level reqwest error maps to the SAME `Upstream` (502) envelope
     /// the typed path produces, with no body/URL leak — proving the fallback
