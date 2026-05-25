@@ -24,4 +24,5 @@
 //! submodules (allowlist / yaml / restart / locks / routes) are added by
 //! later plans in this phase.
 
+pub mod allowlist;
 pub mod schema;
