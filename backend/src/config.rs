@@ -99,6 +99,24 @@ impl Config {
         let session_absolute_secs =
             parse_secs("SESSION_ABSOLUTE_SECS", DEFAULT_SESSION_ABSOLUTE_SECS)?;
 
+        // CR-02: validate the session-lifespan relationship at startup so a
+        // degenerate config can never silently produce an instant-expiry auth
+        // outage or an idle window with no protective value. `parse_secs` already
+        // rejects negatives; here we reject zero and a contradictory idle>absolute.
+        if session_absolute_secs == 0 {
+            return Err(AppError::Config(
+                "SESSION_ABSOLUTE_SECS must be > 0".into(),
+            ));
+        }
+        if session_idle_secs == 0 {
+            return Err(AppError::Config("SESSION_IDLE_SECS must be > 0".into()));
+        }
+        if session_idle_secs > session_absolute_secs {
+            return Err(AppError::Config(
+                "SESSION_IDLE_SECS must be <= SESSION_ABSOLUTE_SECS".into(),
+            ));
+        }
+
         let insecure_cookies = parse_bool("CONSOLE_INSECURE_COOKIES", false);
 
         // Pre-session Origin allowlist (Plan-checker Warning 2). Comma-separated;
@@ -144,14 +162,32 @@ impl Config {
     }
 
     /// Whether `origin` (already normalized: lowercase, no trailing slash) is in
-    /// the configured allowlist. An EMPTY allowlist returns `true` for any origin
-    /// (the pre-session check is disabled — documented dev posture).
+    /// the configured allowlist.
+    ///
+    /// IN-04 (secure-by-default): an empty allowlist no longer blanket-allows.
+    /// In the production posture (`insecure_cookies == false`) an empty allowlist
+    /// rejects EVERY presented cross-site `Origin` — the operator must set
+    /// `CONSOLE_ALLOWED_ORIGINS` to permit a browser origin. Only the explicit dev
+    /// escape hatch (`CONSOLE_INSECURE_COOKIES=1`) relaxes this to allow-any so
+    /// plain-HTTP localhost development is not blocked. The `origin_guard` hoop
+    /// still treats an ABSENT Origin (API client / same-origin post that omits it)
+    /// as allowed; this method only judges a PRESENT origin value.
     pub fn origin_allowed(&self, origin: &str) -> bool {
         if self.allowed_origins.is_empty() {
-            return true;
+            // Dev escape hatch: allow any origin only when cookies are insecure.
+            // Otherwise fail closed — a present cross-site Origin is rejected.
+            return self.insecure_cookies;
         }
         let norm = origin.trim().trim_end_matches('/').to_ascii_lowercase();
         self.allowed_origins.iter().any(|o| o == &norm)
+    }
+
+    /// Whether the pre-session Origin check is fully disabled (dev posture):
+    /// only when the allowlist is empty AND the dev insecure-cookie escape hatch
+    /// is on. In the secure-by-default production posture this is `false`, so the
+    /// `origin_guard` enforces a present Origin against the allowlist.
+    pub fn origin_check_disabled(&self) -> bool {
+        self.allowed_origins.is_empty() && self.insecure_cookies
     }
 
     /// Whether GitHub OAuth is enabled (for `GET /api/console/state`).
@@ -182,5 +218,85 @@ fn parse_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
         Err(_) => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `from_env` reads process-global env; serialize the env-mutating tests so
+    // they cannot interleave and observe each other's vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with the given session-lifespan env vars set, restoring prior
+    /// state afterward. `DATABASE_URL` is set so `from_env` reaches the
+    /// validation block (the DSN is the only other required var).
+    fn with_session_env(idle: Option<&str>, absolute: Option<&str>) -> Result<Config, AppError> {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Snapshot + clear the vars we touch.
+        let prev_dsn = env::var("DATABASE_URL").ok();
+        let prev_idle = env::var("SESSION_IDLE_SECS").ok();
+        let prev_abs = env::var("SESSION_ABSOLUTE_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgres://u:p@localhost/console");
+        match idle {
+            Some(v) => env::set_var("SESSION_IDLE_SECS", v),
+            None => env::remove_var("SESSION_IDLE_SECS"),
+        }
+        match absolute {
+            Some(v) => env::set_var("SESSION_ABSOLUTE_SECS", v),
+            None => env::remove_var("SESSION_ABSOLUTE_SECS"),
+        }
+
+        let result = Config::from_env();
+
+        // Restore.
+        match prev_dsn {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match prev_idle {
+            Some(v) => env::set_var("SESSION_IDLE_SECS", v),
+            None => env::remove_var("SESSION_IDLE_SECS"),
+        }
+        match prev_abs {
+            Some(v) => env::set_var("SESSION_ABSOLUTE_SECS", v),
+            None => env::remove_var("SESSION_ABSOLUTE_SECS"),
+        }
+        result
+    }
+
+    #[test]
+    fn rejects_zero_absolute_session() {
+        let err = with_session_env(Some("60"), Some("0")).unwrap_err();
+        assert!(matches!(err, AppError::Config(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_zero_idle_session() {
+        let err = with_session_env(Some("0"), Some("60")).unwrap_err();
+        assert!(matches!(err, AppError::Config(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_idle_greater_than_absolute() {
+        let err = with_session_env(Some("120"), Some("60")).unwrap_err();
+        assert!(matches!(err, AppError::Config(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn accepts_idle_equal_to_absolute() {
+        let cfg = with_session_env(Some("60"), Some("60")).expect("equal idle/absolute is valid");
+        assert_eq!(cfg.session_idle_secs, 60);
+        assert_eq!(cfg.session_absolute_secs, 60);
+    }
+
+    #[test]
+    fn accepts_default_lifespans() {
+        let cfg = with_session_env(None, None).expect("defaults are valid");
+        assert_eq!(cfg.session_idle_secs, DEFAULT_SESSION_IDLE_SECS);
+        assert_eq!(cfg.session_absolute_secs, DEFAULT_SESSION_ABSOLUTE_SECS);
     }
 }

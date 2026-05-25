@@ -154,10 +154,35 @@ not transport-enforced.)
 ### Pre-session origin allowlist (`CONSOLE_ALLOWED_ORIGINS`)
 
 `POST /setup` and `/login` happen before a per-session CSRF token can exist, so
-they are additionally guarded by an optional `Origin`/`Referer` allowlist
-(comma-separated `CONSOLE_ALLOWED_ORIGINS`). An empty/unset list disables the
-check (dev posture). Set it to your console origin(s) in production for
-defense-in-depth against cross-site form posts.
+they are additionally guarded by an `Origin`/`Referer` allowlist (comma-separated
+`CONSOLE_ALLOWED_ORIGINS`).
+
+**Secure-by-default (IN-04).** The origin check is fully disabled ONLY under the
+dev escape hatch — i.e. an empty allowlist *together with* `CONSOLE_INSECURE_COOKIES=1`.
+In the production posture (`CONSOLE_INSECURE_COOKIES` unset), an empty allowlist
+no longer means "allow any": any **present** cross-site `Origin` is rejected, and
+you must set `CONSOLE_ALLOWED_ORIGINS` to your console origin(s) to permit a
+browser origin. Requests that carry **no** `Origin` (API clients / server-side
+`curl` / same-origin posts that omit it) are still allowed — browser cross-site
+CSRF always carries an `Origin`, which is what this guard blocks. Set the
+allowlist to your console origin(s) in production for full defense-in-depth.
+
+### Rate-limit residual risk under Docker NAT (WR-01)
+
+The pre-auth rate limiter on `/setup`, `/login`, `/auth/github/callback`, and
+`/api/console/state` keys on the **direct connection IP** and deliberately does
+**not** trust `X-Forwarded-For` (a forgeable header would let an attacker mint
+unlimited buckets and defeat the limit). Under the shipped docker-compose
+topology the backend often observes the Docker bridge **gateway IP** as the peer
+for all externally originated traffic (published-port NAT / userland proxy), so
+the per-IP limiter degrades to a **single global bucket**: it still throttles
+total pre-auth request volume but does not isolate per-attacker, and unrelated
+legitimate traffic shares the same quota. This is **documented and accepted** for
+this milestone (`T-natratelimit`); the correct fix is a vetted reverse proxy that
+sets a TRUSTED forwarded header, keyed off ONLY when the immediate peer is the
+known proxy — revisit when such a proxy + XFF-trust policy is configured. Until
+then the limiter is complemented by the one-time setup token and constant-time
+credential checks.
 
 ### Verifying Phase 2
 

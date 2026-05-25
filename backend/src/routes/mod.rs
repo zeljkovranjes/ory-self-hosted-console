@@ -94,18 +94,24 @@ pub async fn origin_guard(
         }
     };
 
-    // No allowlist configured -> check disabled (dev). Document the residual in
-    // the README (SameSite=Lax + one-time token + rate-limit posture).
-    if cfg.allowed_origins.is_empty() {
+    // IN-04 (secure-by-default): the check is fully disabled ONLY under the dev
+    // escape hatch (empty allowlist AND CONSOLE_INSECURE_COOKIES). In the
+    // production posture an empty allowlist no longer means "allow any" — a
+    // present cross-site Origin is rejected by `origin_allowed`.
+    if cfg.origin_check_disabled() {
         return;
     }
 
     let allowed = match request_origin(req) {
-        // A same-origin form post or an API client may omit Origin entirely; a
-        // cross-site browser form post always sends one. With an allowlist set
-        // we require a present, allowed origin (fail-closed for browser CSRF).
+        // A cross-site browser form post always sends an Origin; with the check
+        // enabled it must be in the allowlist (fail-closed for browser CSRF).
         Some(origin) => cfg.origin_allowed(&origin),
-        None => false,
+        // An ABSENT Origin is an API client or a same-origin post that omits it
+        // (browsers do not send Origin for same-origin GET/navigations, and many
+        // omit it for same-origin POSTs). Allowing it preserves first-run /setup
+        // from a server-side client / curl; cross-site browser CSRF is what
+        // always carries an Origin and is what we block.
+        None => true,
     };
 
     if !allowed {
@@ -118,6 +124,21 @@ pub async fn origin_guard(
 /// Construct a fresh rate limiter for one pre-auth route. Keyed by the direct
 /// connection IP (XFF NOT trusted); falls back to a single bucket when the IP is
 /// unknown so the limiter still functions under the test transport.
+///
+/// WR-01 (KNOWN LIMITATION — documented, NOT silently mitigated): under the
+/// shipped docker-compose topology the backend observes the connecting peer's
+/// IP, which behind Docker's published-port NAT / userland proxy is commonly the
+/// bridge GATEWAY IP rather than the real external client. When that happens this
+/// per-IP limiter collapses toward a SINGLE shared bucket for all externally
+/// originated traffic — so it bounds total pre-auth request volume but does not
+/// isolate per-attacker. We deliberately do NOT trust `X-Forwarded-For` to
+/// compensate (a forgeable header would let an attacker mint unlimited buckets
+/// and defeat the limit entirely). The correct fix is a vetted reverse proxy
+/// that sets a TRUSTED forwarded header, keyed off ONLY when the immediate peer
+/// is the known proxy — revisit when such a proxy + XFF trust policy is
+/// configured (documented in the README threat model). Until then the limiter is
+/// a global brute-force throttle, complemented by the one-time setup token and
+/// constant-time credential checks.
 fn pre_auth_limiter() -> impl Handler {
     let store: MokaStore<IpAddr, FixedGuard> = MokaStore::default();
     RateLimiter::new(
@@ -161,7 +182,16 @@ pub fn build(pool: PgPool, cfg: Config) -> Router {
     // PUBLIC subtree — no auth hoop (CAUTH-06 public set).
     let mut public = Router::new()
         .push(Router::with_path("health").get(health))
-        .push(Router::with_path("api/console/state").get(state::console_state))
+        .push(
+            // WR-06: the first-run `initialized` signal is needed by the frontend
+            // redirect, so the endpoint stays public and the body stays minimal
+            // (`{initialized, github_oauth_enabled}` — no token/secret). To keep
+            // the uninitialized-window signal from being cheaply polled, the same
+            // pre-auth rate limiter as /setup,/login is applied.
+            Router::with_path("api/console/state")
+                .hoop(pre_auth_limiter())
+                .get(state::console_state),
+        )
         .push(
             // POST /setup: rate-limit -> uninitialized 404 guard -> origin -> handler.
             Router::with_path("setup")
