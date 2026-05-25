@@ -227,7 +227,18 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
                 .get(crate::ory::keto::list_relationships),
         )
         // Optional bonus (CONTEXT): exercises the 4th crate end-to-end.
-        .push(Router::with_path("api/oathkeeper/rules").get(crate::ory::oathkeeper::list_rules));
+        .push(Router::with_path("api/oathkeeper/rules").get(crate::ory::oathkeeper::list_rules))
+        // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
+        // allowlisted values; PUT runs the full transactional flow. Both inherit
+        // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`
+        // enforces `X-CSRF-Token` (403) — deliberately NOT exempted (T-04-11). The
+        // `<service>`/`<section>` segments are parsed through the closed allowlist
+        // + `Service` enum inside the handlers (SSRF guard, T-04-12).
+        .push(
+            Router::with_path("api/config/{service}/{section}")
+                .get(crate::config_edit::routes::get_config)
+                .put(crate::config_edit::routes::put_config),
+        );
 
     // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is
     // moved into the affix_state hoop, then inject them into every Depot

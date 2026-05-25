@@ -57,6 +57,22 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// Config-edit schema validation failed. Carries the per-field errors
+    /// (JSON-Pointer path + value-free message) collected by
+    /// `config_edit::schema::validate_full`. Renders as 422 with
+    /// `{"error":"validation_failed","fields":[{path,message}…]}` — the field
+    /// errors are schema-derived and value-free (BACK-07 / T-04-15), so they are
+    /// safe to return. -> 422
+    #[error("validation failed ({} field error(s))", .0.len())]
+    Validation(Vec<crate::config_edit::schema::FieldError>),
+
+    /// A restarted service did not pass `/health/ready` within the timeout, so the
+    /// config-edit flow rolled back to the last-known-good. Renders as 502
+    /// `{"error":"health_failed","status":"failed"}` — no service name, file path,
+    /// or value is leaked. -> 502
+    #[error("health check failed (rolled back)")]
+    HealthFailed,
+
     /// Upstream Ory service failure (transport, decode, or non-2xx response).
     /// CONTEXT/BACK-02 require 502 (NOT 500) for upstream failures. The detail
     /// string is for SERVER-SIDE LOGS ONLY — it carries a sanitised summary
@@ -76,7 +92,8 @@ impl AppError {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Conflict(_) => StatusCode::CONFLICT,
-            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
+            AppError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            AppError::Upstream(_) | AppError::HealthFailed => StatusCode::BAD_GATEWAY,
             AppError::Db(_)
             | AppError::Migrate(_)
             | AppError::Config(_)
@@ -96,6 +113,8 @@ impl AppError {
             AppError::NotFound => "not_found",
             AppError::BadRequest(_) => "bad_request",
             AppError::Conflict(_) => "conflict",
+            AppError::Validation(_) => "validation_failed",
+            AppError::HealthFailed => "health_failed",
             AppError::Upstream(_) => "upstream_error",
         }
     }
@@ -124,6 +143,15 @@ impl Writer for AppError {
             // 4xx BadRequest: the message is validation feedback, safe to send.
             AppError::BadRequest(msg) => {
                 serde_json::json!({ "error": self.machine_code(), "message": msg })
+            }
+            // 422: the field errors are schema-derived + value-free (T-04-15),
+            // so the array of {path, message} is safe to return to the client.
+            AppError::Validation(fields) => {
+                serde_json::json!({ "error": self.machine_code(), "fields": fields })
+            }
+            // 502 health rollback: report the failed status without any detail.
+            AppError::HealthFailed => {
+                serde_json::json!({ "error": self.machine_code(), "status": "failed" })
             }
             // Everything else: machine code only — no detail, no secrets.
             _ => serde_json::json!({ "error": self.machine_code() }),
