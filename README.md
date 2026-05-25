@@ -117,8 +117,12 @@ Per-service strategy:
   `/health/ready` can be revisited.
 
 The **backend** image vendors a single static `curl` binary copied from
-`curlimages/curl` into the distroless runtime so it can self-healthcheck its own
-`/health` and act as the internal probe source for the acceptance harness.
+`ghcr.io/tarampampam/curl:8.11.1` (a `scratch` image whose `/bin/curl` is fully
+statically linked, so it runs unmodified on glibc distroless — `curlimages/curl`
+is dynamically linked against musl and cannot) into the distroless runtime so it
+can self-healthcheck its own `/health` and act as the internal probe source for
+the acceptance harness. This is the same static curl the Hydra/Keto/Oathkeeper
+healthcheck wrapper (`docker/ory-healthcheck/Dockerfile`) vendors.
 
 ---
 
@@ -142,16 +146,32 @@ This is a security-foundations phase; the controls below are the deliverable.
   config.
 - **Supply-chain pinning (INFRA-04).** All images are pinned to exact tags
   (`oryd/*:v26.2.0-distroless`, `postgres:17-alpine`,
-  `wollomatic/socket-proxy:1.12.1`, `curlimages/curl:8.11.1`); no floating tags.
+  `wollomatic/socket-proxy:1.12.1`). The static curl vendored into the long-lived
+  service images is `ghcr.io/tarampampam/curl:8.11.1`, pinned additionally by
+  `@sha256:` digest in both `backend/Dockerfile` and
+  `docker/ory-healthcheck/Dockerfile` (it injects a binary into every long-lived
+  service, so its provenance is digest-pinned). No floating tags are used.
   `>= v26.2.0` fixes CVE-2026-33503/33504/33505. For stricter reproducibility you
-  may additionally pin each image to its `@sha256:` digest
+  may additionally pin each remaining image to its `@sha256:` digest
   (`docker buildx imagetools inspect <image>` returns it).
 - **Container hardening.** `restart-broker` runs `read_only: true` +
   `no-new-privileges:true`; the backend runs `no-new-privileges:true`; all
-  runtime images are non-root.
+  runtime images are non-root. NOTE: the broker process runs in the root GROUP
+  (`gid 0`, `user: "65534:0"`) ONLY to group-read the Docker socket, which is
+  `root:root` mode `srw-rw----` on Docker Desktop/WSL2. This `gid` is
+  HOST-SPECIFIC: on a host whose socket is owned by a `docker` group with a
+  different gid, re-pin the broker `user:` gid to match that group.
 - **Secrets handling.** Secrets come from `.env` / runtime env only, never baked
   into image layers or committed. `.gitignore` blocks `.env`; only `.env.example`
-  (placeholders) is committed.
+  (placeholders) is committed. The per-service DB password lives in exactly ONE
+  authoritative place — the `*_DB_PASSWORD` in `.env`, injected as each service's
+  `DSN` env var (the committed config YAMLs carry NO `dsn:` key). The Oathkeeper
+  `id_token` signing JWKS is **generated at first boot** by the
+  `oathkeeper-jwks-init` one-shot into the `oathkeeper-secrets` volume — **no
+  private signing key is committed to the repo**. To rotate the JWKS, destroy the
+  volume and re-up (`docker compose down -v && docker compose up -d --wait`); a
+  fresh key is generated automatically. Only `config/oathkeeper/jwks.json.example`
+  (an empty placeholder) is tracked in git.
 
 ### Residual risks (accepted, documented per the production-grade mandate)
 
