@@ -12,6 +12,7 @@
 //! - `middleware` — the single `auth_guard` chokepoint (401 JSON) + the
 //!   per-session `csrf_guard` (403 on state-changing methods) (CAUTH-06, BACK-01).
 
+pub mod github;
 pub mod login;
 pub mod middleware;
 pub mod password;

@@ -27,6 +27,7 @@ use salvo::rate_limiter::{BasicQuota, FixedGuard, MokaStore, RateLimiter};
 use salvo::Handler;
 use sqlx::PgPool;
 
+use crate::auth::github;
 use crate::auth::login;
 use crate::auth::middleware::{auth_guard, csrf_guard};
 use crate::auth::setup;
@@ -129,13 +130,30 @@ fn pre_auth_limiter() -> impl Handler {
     )
 }
 
-/// GitHub OAuth route extension point. No-op in this plan; Plan 02-04 fills it
-/// in, conditionally pushing `/auth/github/login` + `/auth/github/callback` onto
-/// the public subtree when `cfg.github.is_some()` (the callback also gets the
-/// rate-limit + origin hoops). Kept here so 04 extends one well-marked seam.
-pub fn attach_github(public: Router, _cfg: &Config) -> Router {
-    // Intentionally a no-op until Plan 02-04.
-    public
+/// GitHub OAuth route extension point (CAUTH-04). Conditionally pushes
+/// `GET /auth/github/login` + `GET /auth/github/callback` onto the public
+/// subtree ONLY when `cfg.github.is_some()`. When GitHub is unconfigured the
+/// router is returned UNCHANGED, so the routes do not exist and a request 404s
+/// (and `GET /api/console/state` reports `github_oauth_enabled:false`).
+///
+/// The callback carries a rate-limit hoop (Pitfall 7 — pre-auth, attacker-
+/// reachable). It does NOT carry the pre-session `origin_guard`: the request is
+/// a top-level GET navigation arriving FROM github.com (no same-origin Origin
+/// header), and OAuth CSRF is instead defended by the constant-time `state`
+/// nonce verified inside the handler (T-02-30). Adding the origin guard here
+/// would reject every legitimate GitHub redirect.
+pub fn attach_github(public: Router, cfg: &Config) -> Router {
+    if cfg.github.is_some() {
+        public
+            .push(Router::with_path("auth/github/login").get(github::github_login))
+            .push(
+                Router::with_path("auth/github/callback")
+                    .hoop(pre_auth_limiter())
+                    .get(github::github_callback),
+            )
+    } else {
+        public
+    }
 }
 
 /// Build the application router (RESEARCH Pattern 5).

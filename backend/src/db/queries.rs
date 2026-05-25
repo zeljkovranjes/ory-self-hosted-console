@@ -144,6 +144,56 @@ pub async fn get_admin_by_id(pool: &PgPool, admin_id: Uuid) -> Result<Option<Adm
     Ok(admin)
 }
 
+/// Fetch an admin by their linked GitHub user id, if present. The PRIMARY
+/// GitHub-link lookup (CAUTH-04): a returning GitHub user is matched by the
+/// numeric id persisted on first link, independent of email changes.
+pub async fn find_admin_by_github_id(
+    pool: &PgPool,
+    github_user_id: i64,
+) -> Result<Option<Admin>, AppError> {
+    let admin = sqlx::query_as!(
+        Admin,
+        r#"
+        SELECT id, email::text AS "email!", name,
+               password_hash, github_user_id,
+               created_at, updated_at, last_login_at
+        FROM admins
+        WHERE github_user_id = $1
+        "#,
+        github_user_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(admin)
+}
+
+/// Fetch an admin by (case-insensitive) email. Alias of `get_admin_by_email`
+/// used by the GitHub callback's verified-primary-email fallback link
+/// (CAUTH-04). Kept as a distinct name so the call-site intent is explicit.
+pub async fn find_admin_by_email(pool: &PgPool, email: &str) -> Result<Option<Admin>, AppError> {
+    get_admin_by_email(pool, email).await
+}
+
+/// Persist the GitHub user id on an existing admin (CAUTH-04 link-by-email-
+/// then-persist). Idempotent: re-linking the same id is a no-op UPDATE. The
+/// `github_user_id` column is UNIQUE, so linking an id already owned by another
+/// admin surfaces a DB unique-violation (mapped to a generic 500 / denied at
+/// the call site) rather than silently moving the link.
+pub async fn link_github(
+    pool: &PgPool,
+    admin_id: Uuid,
+    github_user_id: i64,
+) -> Result<(), AppError> {
+    sqlx::query!(
+        "UPDATE admins SET github_user_id = $1, updated_at = now() WHERE id = $2",
+        github_user_id,
+        admin_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Record a successful login timestamp for the admin.
 pub async fn update_last_login(pool: &PgPool, admin_id: Uuid) -> Result<(), AppError> {
     sqlx::query!(
