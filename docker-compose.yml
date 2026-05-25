@@ -6,7 +6,7 @@
 #   - postgres (creates 5 DBs on first boot via db/init)
 #   - kratos / hydra / keto migrate one-shots (gated on postgres healthy)
 #   - kratos / hydra / keto / oathkeeper long-lived Ory services (distroless)
-#   - restart-broker (wollomatic/socket-proxy — sole docker.sock holder)
+#   - restart-broker (wollomatic/socket-proxy — sole Docker-socket holder)
 #   - backend (Rust/Salvo skeleton) + frontend (Next.js skeleton)
 #
 # Security topology (Phase 1 deliverable):
@@ -16,7 +16,7 @@
 #   - NO Ory admin OR public port is published to the host (INFRA-05).
 #   - config/ mounted :ro into every Ory container, :rw into the backend only
 #     (INFRA-07) — tamper-resistance for the Phase 4 YAML-edit subsystem.
-#   - The backend holds NO docker.sock; it reaches the engine ONLY through the
+#   - The backend holds NO Docker socket; it reaches the engine ONLY through the
 #     scoped restart-broker (BACK-05).
 #
 # Compose v2: the obsolete top-level `version:` key is intentionally OMITTED.
@@ -167,7 +167,6 @@ services:
     depends_on:
       hydra-migrate:
         condition: service_completed_successfully
-    # Healthcheck gating is provided by the hydra-health curl sidecar (Task 2).
     networks: [internal]
 
   keto:
@@ -181,7 +180,6 @@ services:
     depends_on:
       keto-migrate:
         condition: service_completed_successfully
-    # Healthcheck gating is provided by the keto-health curl sidecar (Task 2).
     networks: [internal]
 
   oathkeeper:
@@ -191,12 +189,97 @@ services:
     command: ["serve", "--config", "/etc/config/oathkeeper/config.yaml"]
     volumes:
       - ./config/oathkeeper:/etc/config/oathkeeper:ro
-    # Healthcheck gating is provided by the oathkeeper-health curl sidecar (Task 2).
     networks: [internal]
 
   # ===========================================================================
+  # SECURITY-CRITICAL LAYER (Task 2)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Healthcheck SIDECARS (Pitfall 1 — distroless has no curl/shell).
+  # Hydra/Keto/Oathkeeper have NO in-image `remote status` (only Kratos does),
+  # so each gets a tiny curl sidecar sharing its service's network namespace
+  # (network_mode: service:<svc>) that curls the service's /health/ready admin
+  # endpoint over loopback. `docker compose up --wait` gates on the sidecar's
+  # service_healthy, which genuinely proves the underlying Ory service is ready.
+  # The sidecar idles (sleep) and exists only to carry the healthcheck.
+  # ---------------------------------------------------------------------------
+  hydra-health:
+    image: curlimages/curl:8.11.1
+    container_name: hydra-health
+    # Share hydra's netns so 127.0.0.1:4445 is hydra's admin port.
+    network_mode: "service:hydra"
+    command: ["sleep", "infinity"]
+    depends_on:
+      hydra:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4445/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  keto-health:
+    image: curlimages/curl:8.11.1
+    container_name: keto-health
+    network_mode: "service:keto"
+    command: ["sleep", "infinity"]
+    depends_on:
+      keto:
+        condition: service_started
+    healthcheck:
+      # Keto metadata/health port is 4469.
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4469/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  oathkeeper-health:
+    image: curlimages/curl:8.11.1
+    container_name: oathkeeper-health
+    network_mode: "service:oathkeeper"
+    command: ["sleep", "infinity"]
+    depends_on:
+      oathkeeper:
+        condition: service_started
+    healthcheck:
+      # Oathkeeper api/health port is 4456.
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4456/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Restart broker (Pattern 2 — wollomatic/socket-proxy, BACK-05).
+  # The SOLE container mounting the Docker socket (read-only). Secure-by-default:
+  # only the explicitly-allowed verb+path passes. Allowlist is scoped to a
+  # POST .../restart of exactly the four ory-* containers, callable only from
+  # the backend container. Listens on 0.0.0.0 (internal net only) because the
+  # backend is a separate container (Pitfall 5); no host port is published.
+  # ---------------------------------------------------------------------------
+  restart-broker:
+    image: wollomatic/socket-proxy:1.12.1
+    container_name: restart-broker
+    command:
+      - "-loglevel=info"
+      - "-listenip=0.0.0.0"
+      - "-allowfrom=backend"
+      - '-allowPOST=/v1\..{1,2}/containers/(ory-kratos|ory-hydra|ory-keto|ory-oathkeeper)/restart'
+    volumes:
+      # ONLY container with the socket — mounted read-only.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    networks: [internal]
+    # NO host ports — reachable only from the backend over the internal network.
+
+  # ===========================================================================
   # Backend (Rust/Salvo skeleton). Dual-homed: `internal` to reach Ory + broker,
-  # `edge` to publish to host. config/ mounted :rw (INFRA-07). NO docker.sock
+  # `edge` to publish to host. config/ mounted :rw (INFRA-07). NO Docker socket
   # (BACK-05) — it talks to the engine only via restart-broker. (Task 2 adds the
   # no-new-privileges hardening.)
   # ===========================================================================
@@ -217,6 +300,20 @@ services:
     volumes:
       # Read-WRITE config mount (the ONLY rw config mount) — Phase 4 edit subsystem.
       - ./config:/etc/config:rw
+    depends_on:
+      # Gate the backend (and therefore `--wait`) on Kratos's own healthcheck and
+      # on the three curl sidecars proving Hydra/Keto/Oathkeeper are ready, so a
+      # successful `up -d --wait` genuinely means all four Ory services are up.
+      kratos:
+        condition: service_healthy
+      hydra-health:
+        condition: service_healthy
+      keto-health:
+        condition: service_healthy
+      oathkeeper-health:
+        condition: service_healthy
+      restart-broker:
+        condition: service_started
     healthcheck:
       # Backend image vendors a static curl (see backend/Dockerfile) so it can
       # both self-healthcheck and serve as the harness's internal probe source.
@@ -225,6 +322,10 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+    # Container hardening (BACK-05 / V14): no privilege escalation. The backend
+    # mounts NO Docker socket — it reaches the engine only via restart-broker.
+    security_opt:
+      - "no-new-privileges:true"
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     networks: [internal, edge]
