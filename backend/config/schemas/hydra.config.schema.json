@@ -1,0 +1,1099 @@
+{
+  "$id": "https://github.com/ory/hydra/spec/config.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Ory Hydra Configuration",
+  "type": "object",
+  "definitions": {
+    "http_method": {
+      "type": "string",
+      "enum": [
+        "POST",
+        "GET",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "CONNECT",
+        "HEAD",
+        "OPTIONS",
+        "TRACE"
+      ]
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^(\\d+(ns|us|ms|s|m|h))+$",
+      "examples": [
+        "1h",
+        "1h5m1s"
+      ]
+    },
+    "webhook_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures a webhook.",
+      "required": ["url"],
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "The URL to send the webhook to."
+        },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "config"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "api_key"
+            },
+            "config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "value"],
+              "properties": {
+                "in": {
+                  "type": "string",
+                  "enum": ["header", "cookie"]
+                },
+                "name": {
+                  "description": "The header or cookie name.",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "The header or cookie value.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "db": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures the database connection",
+      "properties": {
+        "ignore_unknown_table_columns": {
+          "type": "boolean",
+          "description": "Ignore scan errors when columns in the SQL result have no fields in the destination struct",
+          "default": false
+        }
+      }
+    },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures the logger",
+      "properties": {
+        "level": {
+          "type": "string",
+          "description": "Sets the log level.",
+          "enum": ["panic", "fatal", "error", "warn", "info", "debug", "trace"],
+          "default": "info"
+        },
+        "leak_sensitive_values": {
+          "type": "boolean",
+          "description": "Logs sensitive values such as cookie and URL parameter.",
+          "default": false
+        },
+        "redaction_text": {
+          "type": "string",
+          "title": "Sensitive log value redaction text",
+          "description": "Text to use, when redacting sensitive log value."
+        },
+        "format": {
+          "type": "string",
+          "description": "Sets the log format.",
+          "enum": ["json", "json_pretty", "text"],
+          "default": "text"
+        }
+      }
+    },
+    "serve": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Controls the configuration for the http(s) daemon(s).",
+      "properties": {
+        "public": {
+          "allOf": [
+            {
+              "$ref": "ory://serve-config"
+            },
+            {
+              "properties": {
+                "cors": {
+                  "$ref": "ory://cors-config"
+                }
+              }
+            }
+          ]
+        },
+        "admin": {
+          "allOf": [
+            {
+              "$ref": "ory://serve-config"
+            },
+            {
+              "properties": {
+                "cors": {
+                  "$ref": "ory://cors-config"
+                }
+              }
+            }
+          ]
+        },
+        "tls": {
+          "$ref": "ory://tls-config"
+        },
+        "cookies": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "same_site_mode": {
+              "type": "string",
+              "description": "Specify the SameSite mode that cookies should be sent with.",
+              "enum": ["Strict", "Lax", "None"],
+              "default": "None"
+            },
+            "same_site_legacy_workaround": {
+              "type": "boolean",
+              "description": "Some older browser versions don’t work with SameSite=None. This option enables the workaround defined in https://web.dev/samesite-cookie-recipes/ which essentially stores a second cookie without SameSite as a fallback.",
+              "default": false,
+              "examples": [
+                true
+              ]
+            },
+            "domain": {
+              "title": "HTTP Cookie Domain",
+              "description": "Sets the cookie domain for session and CSRF cookies. Useful when dealing with subdomains. Use with care!",
+              "type": "string"
+            },
+            "secure": {
+              "title": "HTTP Cookie Secure Flag in Development Mode",
+              "description": "Sets the HTTP Cookie secure flag in development mode. HTTP Cookies always have the secure flag in production mode.",
+              "type": "boolean",
+              "default": false
+            },
+            "names": {
+              "title": "Cookie Names",
+              "description": "Sets the session cookie name. Use with care!",
+              "type": "object",
+              "properties": {
+                "device_csrf": {
+                  "type": "string",
+                  "title": "CSRF Cookie Name",
+                  "default": "ory_hydra_device_csrf"
+                },
+                "login_csrf": {
+                  "type": "string",
+                  "title": "CSRF Cookie Name",
+                  "default": "ory_hydra_login_csrf"
+                },
+                "consent_csrf": {
+                  "type": "string",
+                  "title": "CSRF Cookie Name",
+                  "default": "ory_hydra_consent_csrf"
+                },
+                "session": {
+                  "type": "string",
+                  "title": "Session Cookie Name",
+                  "default": "ory_hydra_session"
+                }
+              }
+            },
+            "paths": {
+              "title": "Cookie Paths",
+              "description": "Sets the path for which session cookie is scoped. Use with care!",
+              "type": "object",
+              "properties": {
+                "session": {
+                  "type": "string",
+                  "title": "Session Cookie Path",
+                  "default": "/"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "dsn": {
+      "type": "string",
+      "description": "Sets the data source name. This configures the backend where Ory Hydra persists data. If dsn is `memory`, data will be written to memory and is lost when you restart this instance. Ory Hydra supports popular SQL databases. For more detailed configuration information go to: https://www.ory.sh/docs/hydra/dependencies-environment#sql"
+    },
+    "clients": {
+      "title": "Global outgoing network settings",
+      "description": "Configure how outgoing network calls behave.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "http": {
+          "title": "Global HTTP client configuration",
+          "description": "Configure how outgoing HTTP calls behave.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "disallow_private_ip_ranges": {
+              "title": "Disallow private IP ranges",
+              "description": "Disallow all outgoing HTTP calls to private IP ranges. This feature can help protect against SSRF attacks.",
+              "type": "boolean",
+              "default": false
+            },
+            "private_ip_exception_urls": {
+              "title": "Add exempt URLs to private IP ranges",
+              "description": "Allows the given URLs to be called despite them being in the private IP range. URLs need to have an exact and case-sensitive match to be excempt.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uri-reference"
+              },
+              "default": []
+            }
+          }
+        }
+      }
+    },
+    "hsm": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures Hardware Security Module.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "library": {
+          "type": "string",
+          "description": "Full path (including file extension) of the HSM vendor PKCS#11 library"
+        },
+        "pin": {
+          "type": "string",
+          "description": "PIN code for token operations"
+        },
+        "slot": {
+          "type": "integer",
+          "description": "Slot ID of the token to use (if label is not specified)"
+        },
+        "token_label": {
+          "type": "string",
+          "description": "Label of the token to use (if slot is not specified). If both slot and label are set, token label takes preference over slot. In this case first slot, that contains this label is used."
+        },
+        "key_set_prefix": {
+          "type": "string",
+          "description": "Key set prefix can be used in case of multiple Ory Hydra instances need to store keys on the same HSM partition. For example if `hsm.key_set_prefix=app1.` then key set `hydra.openid.id-token` would be generated/requested/deleted on HSM with `CKA_LABEL=app1.hydra.openid.id-token`.",
+          "default": ""
+        }
+      }
+    },
+    "webfinger": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures ./well-known/ settings.",
+      "properties": {
+        "jwks": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Configures the /.well-known/jwks.json endpoint.",
+          "properties": {
+            "broadcast_keys": {
+              "type": "array",
+              "description": "A list of JSON Web Keys that should be exposed at that endpoint. This is usually the public key for verifying OpenID Connect ID Tokens. However, you might want to add additional keys here as well.",
+              "items": {
+                "type": "string"
+              },
+              "default": ["hydra.openid.id-token"],
+              "examples": ["hydra.jwt.access-token"]
+            }
+          }
+        },
+        "oidc_discovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Configures OpenID Connect Discovery (/.well-known/openid-configuration).",
+          "properties": {
+            "jwks_url": {
+              "type": "string",
+              "description": "Overwrites the JWKS URL",
+              "format": "uri-reference",
+              "examples": [
+                "https://my-service.com/.well-known/jwks.json"
+              ]
+            },
+            "token_url": {
+              "type": "string",
+              "description": "Overwrites the OAuth2 Token URL",
+              "format": "uri-reference",
+              "examples": [
+                "https://my-service.com/oauth2/token"
+              ]
+            },
+            "auth_url": {
+              "type": "string",
+              "description": "Overwrites the OAuth2 Auth URL",
+              "format": "uri-reference",
+              "examples": [
+                "https://my-service.com/oauth2/auth"
+              ]
+            },
+            "device_authorization_url": {
+              "type": "string",
+              "description": "Overwrites the OAuth2 Device Auth URL",
+              "format": "uri-reference",
+              "examples": [
+                "https://my-service.com/oauth2/device/auth"
+              ]
+            },
+            "client_registration_url": {
+              "description": "Sets the OpenID Connect Dynamic Client Registration Endpoint",
+              "type": "string",
+              "format": "uri-reference",
+              "examples": [
+                "https://my-service.com/clients"
+              ]
+            },
+            "supported_claims": {
+              "type": "array",
+              "description": "A list of supported claims to be broadcasted. Claim `sub` is always included.",
+              "items": {
+                "type": "string"
+              },
+              "examples": [["email", "username"]]
+            },
+            "supported_scope": {
+              "type": "array",
+              "description": "The scope OAuth 2.0 Clients may request. Scope `offline`, `offline_access`, and `openid` are always included.",
+              "items": {
+                "type": "string"
+              },
+              "examples": [["email", "whatever", "read.photos"]]
+            },
+            "userinfo_url": {
+              "type": "string",
+              "description": "A URL of the userinfo endpoint to be advertised at the OpenID Connect Discovery endpoint /.well-known/openid-configuration. Defaults to Ory Hydra's userinfo endpoint at /userinfo. Set this value if you want to handle this endpoint yourself.",
+              "format": "uri-reference",
+              "examples": [
+                "https://example.org/my-custom-userinfo-endpoint"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "oidc": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures OpenID Connect features.",
+      "properties": {
+        "subject_identifiers": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Configures the Subject Identifier algorithm. For more information please head over to the documentation: https://www.ory.sh/docs/hydra/advanced#subject-identifier-algorithms",
+          "properties": {
+            "supported_types": {
+              "type": "array",
+              "description": "A list of algorithms to enable.",
+              "default": ["public"],
+              "items": {
+                "type": "string",
+                "enum": ["public", "pairwise"]
+              }
+            },
+            "pairwise": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Configures the pairwise algorithm.",
+              "properties": {
+                "salt": {
+                  "type": "string"
+                }
+              },
+              "required": ["salt"]
+            }
+          },
+          "anyOf": [
+            {
+              "if": {
+                "properties": {
+                  "supported_types": {
+                    "contains": {
+                      "type": "string",
+                      "const": "pairwise"
+                    }
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "pairwise"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": ["supported_types"]
+              }
+            }
+          ],
+          "examples": [
+            {
+              "supported_types": ["public", "pairwise"],
+              "pairwise": {
+                "salt": "some-random-salt"
+              }
+            }
+          ]
+        },
+        "dynamic_client_registration": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Configures OpenID Connect Dynamic Client Registration (exposed as admin endpoints /clients/...).",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable dynamic client registration.",
+              "default": false
+            },
+            "default_scope": {
+              "type": "array",
+              "description": "The OpenID Connect Dynamic Client Registration specification has no concept of whitelisting OAuth 2.0 Scope. If you want to expose Dynamic Client Registration, you should set the default scope enabled for newly registered clients. Keep in mind that users can overwrite this default by setting the `scope` key in the registration payload, effectively disabling the concept of whitelisted scopes.",
+              "items": {
+                "type": "string"
+              },
+              "examples": [["openid", "offline", "offline_access"]]
+            }
+          }
+        }
+      }
+    },
+    "urls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "self": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "issuer": {
+              "type": "string",
+              "description": "This value will be used as the `issuer` in access and ID tokens. It must be specified and using HTTPS protocol, unless --dev is set. This should typically be equal to the public value.",
+              "format": "uri",
+              "examples": ["https://localhost:4444/"]
+            },
+            "public": {
+              "type": "string",
+              "description": "This is the base location of the public endpoints of your Ory Hydra installation. This should typically be equal to the issuer value. If left unspecified, it falls back to the issuer value.",
+              "format": "uri",
+              "examples": [
+                "https://localhost:4444/"
+              ]
+            },
+            "admin": {
+              "type": "string",
+              "description": "This is the base location of the admin endpoints of your Ory Hydra installation.",
+              "format": "uri",
+              "examples": [
+                "https://localhost:4445/"
+              ]
+            }
+          }
+        },
+        "login": {
+          "type": "string",
+          "description": "Sets the OAuth2 Login Endpoint URL of the OAuth2 User Login & Consent flow. Defaults to an internal fallback URL showing an error.",
+          "format": "uri-reference",
+          "examples": [
+            "https://my-login.app/login",
+            "/ui/login"
+          ]
+        },
+        "registration": {
+          "type": "string",
+          "description": "Sets the OAuth2 Registration Endpoint URL of the OAuth2 User Login & Consent flow. Defaults to the same value as `login`. The registration URL is used if the authorization request was started with the `prompt=registration` parameter.",
+          "format": "uri-reference",
+          "examples": [
+            "https://my-login.app/registration",
+            "/ui/registration"
+          ]
+        },
+        "consent": {
+          "type": "string",
+          "description": "Sets the consent endpoint of the User Login & Consent flow. Defaults to an internal fallback URL showing an error.",
+          "format": "uri-reference",
+          "examples": [
+            "https://my-consent.app/consent",
+            "/ui/consent"
+          ]
+        },
+        "logout": {
+          "type": "string",
+          "description": "Sets the logout endpoint. Defaults to an internal fallback URL showing an error.",
+          "format": "uri-reference",
+          "examples": [
+            "https://my-logout.app/logout",
+            "/ui/logout"
+          ]
+        },
+        "device": {
+          "type": "object",
+          "description": "Configure URLs for the OAuth 2.0 Device Code Flow.",
+          "properties": {
+            "verification": {
+              "type": "string",
+              "description": "Sets the device user code verification endpoint. Defaults to an internal fallback URL showing an error.",
+              "format": "uri-reference",
+              "examples": [
+                "https://my-logout.app/device_verification",
+                "/ui/device_verification"
+              ]
+            },
+            "success": {
+              "type": "string",
+              "description": "Sets the post device authentication endpoint. Defaults to an internal fallback URL showing an error.",
+              "format": "uri-reference",
+              "examples": [
+                "https://my-logout.app/device_done",
+                "/ui/device_done"
+              ]
+            }
+          }
+        },
+        "error": {
+          "type": "string",
+          "description": "Sets the error endpoint. The error ui will be shown when an OAuth2 error occurs that which can not be sent back to the client. Defaults to an internal fallback URL showing an error.",
+          "format": "uri-reference",
+          "examples": [
+            "https://my-error.app/error",
+            "/ui/error"
+          ]
+        },
+        "post_logout_redirect": {
+          "type": "string",
+          "description": "When a user agent requests to logout, it will be redirected to this url afterwards per default.",
+          "format": "uri-reference",
+          "examples": [
+            "https://my-example.app/logout-successful",
+            "/ui"
+          ]
+        },
+        "identity_provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {
+              "title": "The admin URL of the ORY Kratos instance.",
+              "description": "If set, ORY Hydra will use this URL to log out the user in addition to removing the Hydra session.",
+              "type": "string",
+              "format": "uri",
+              "examples": [
+                "https://kratos.example.com/admin"
+              ]
+            },
+            "publicUrl": {
+              "title": "The public URL of the ORY Kratos instance.",
+              "type": "string",
+              "format": "uri",
+              "examples": [
+                "https://kratos.example.com/public"
+              ]
+            },
+            "headers": {
+              "title": "HTTP Request Headers",
+              "description": "These headers will be passed in HTTP requests to the Identity Provider.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "examples": [
+                {
+                  "Authorization": "Bearer some-token"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "strategies": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "type": "string",
+          "description": "Defines how scopes are matched. For more details have a look at https://github.com/ory/fosite#scopes",
+          "enum": [
+            "exact",
+            "wildcard"
+          ],
+          "default": "wildcard"
+        },
+        "access_token": {
+          "type": "string",
+          "description": "Defines access token type. jwt is a bad idea, see https://www.ory.sh/docs/oauth2-oidc/jwt-access-token",
+          "enum": ["opaque", "jwt"],
+          "default": "opaque"
+        },
+        "jwt": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "scope_claim": {
+              "type": "string",
+              "description": "Defines how the scope claim is represented within a JWT access token",
+              "enum": ["list", "string", "both"],
+              "default": "list"
+            }
+          }
+        }
+      }
+    },
+    "ttl": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Configures time to live.",
+      "properties": {
+        "login_consent_request": {
+          "description": "Configures how long a user login and consent flow may take.",
+          "default": "30m",
+          "type": "string",
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration"
+            }
+          ]
+        },
+        "authentication_session": {
+          "description": "Configures how long the authentication session cookie will be valid after login has been remembered. The larger this value is, the more database storage is needed. Defaults to 30 days.",
+          "default": "720h",
+          "type": "string",
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration"
+            }
+          ]
+        },
+        "access_token": {
+          "description": "Configures how long access tokens are valid. The larger this value is, the more database storage is needed.",
+          "default": "1h",
+          "type": "string",
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration"
+            }
+          ]
+        },
+        "refresh_token": {
+          "description": "Configures how long refresh tokens are valid. The larger this value is, the more database storage is needed. Set to -1 for refresh tokens to never expire, which is not recommended as the database can not be cleaned from stale tokens.",
+          "default": "720h",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/duration"
+            },
+            {
+              "enum": [
+                "-1",
+                -1
+              ]
+            }
+          ]
+        },
+        "id_token": {
+          "description": "Configures how long id tokens are valid.",
+          "default": "1h",
+          "type": "string",
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration"
+            }
+          ]
+        },
+        "auth_code": {
+          "description": "Configures how long auth codes are valid. The larger this value is, the more database storage is needed.",
+          "default": "10m",
+          "type": "string",
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration"
+            }
+          ]
+        },
+        "device_user_code": {
+          "description": "Configures how long device & user codes are valid. The larger this value is, the more database storage is needed.",
+          "default": "10m",
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration"
+            }
+          ]
+        }
+      }
+    },
+    "oauth2": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expose_internal_errors": {
+          "type": "boolean",
+          "description": "Set this to true if you want to share error debugging information with your OAuth 2.0 clients. Keep in mind that debug information is very valuable when dealing with errors, but might also expose database error codes and similar errors.",
+          "default": false,
+          "examples": [true]
+        },
+        "session": {
+          "type": "object",
+          "properties": {
+            "encrypt_at_rest": {
+              "type": "boolean",
+              "default": true,
+              "title": "Encrypt OAuth2 Session",
+              "description": "If set to true (default) Ory Hydra encrypt OAuth2 and OpenID Connect session data using AES-GCM and the system secret before persisting it in the database."
+            }
+          }
+        },
+        "exclude_not_before_claim": {
+          "type": "boolean",
+          "description": "Set to true if you want to exclude claim `nbf (not before)` part of access token.",
+          "default": false,
+          "examples": [true]
+        },
+        "allowed_top_level_claims": {
+          "type": "array",
+          "description": "A list of custom claims which are allowed to be added top level to the Access Token. They cannot override reserved claims.",
+          "items": {
+            "type": "string"
+          },
+          "examples": [["username", "email", "user_uuid"]]
+        },
+        "mirror_top_level_claims": {
+          "type": "boolean",
+          "description": "Set to false if you don't want to mirror custom claims under 'ext'",
+          "default": true,
+          "examples": [false]
+        },
+        "hashers": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Configures hashing algorithms. Supports only BCrypt and PBKDF2 at the moment.",
+          "properties": {
+            "algorithm": {
+              "title": "Password hashing algorithm",
+              "description": "One of the values: pbkdf2, bcrypt.\n\nWarning! This value can not be changed once set as all existing OAuth 2.0 Clients will not be able to sign in any more.",
+              "type": "string",
+              "default": "pbkdf2",
+              "enum": [
+                "pbkdf2",
+                "bcrypt"
+              ]
+            },
+            "bcrypt": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Configures the BCrypt hashing algorithm used for hashing OAuth 2.0 Client Secrets.",
+              "properties": {
+                "cost": {
+                  "type": "integer",
+                  "description": "Sets the BCrypt cost. The higher the value, the more CPU time is being used to generate hashes.",
+                  "default": 10,
+                  "minimum": 4,
+                  "maximum": 31
+                }
+              }
+            },
+            "pbkdf2": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Configures the PBKDF2 hashing algorithm used for hashing OAuth 2.0 Client Secrets.",
+              "properties": {
+                "iterations": {
+                  "type": "integer",
+                  "description": "Sets the PBKDF2 iterations. The higher the value, the more CPU time is being used to generate hashes.",
+                  "default": 25000,
+                  "minimum": 1
+                }
+              }
+            }
+          }
+        },
+        "pkce": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enforced": {
+              "type": "boolean",
+              "description": "Sets whether PKCE should be enforced for all clients.",
+              "examples": [true]
+            },
+            "enforced_for_public_clients": {
+              "type": "boolean",
+              "description": "Sets whether PKCE should be enforced for public clients.",
+              "examples": [true]
+            }
+          }
+        },
+        "client_credentials": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default_grant_allowed_scope": {
+              "type": "boolean",
+              "description": "Automatically grant authorized OAuth2 Scope in OAuth2 Client Credentials Flow. Each OAuth2 Client is allowed to request a predefined OAuth2 Scope (for example `read write`). If this option is enabled, the full\nscope is automatically granted when performing the OAuth2 Client Credentials flow.\n\nIf disabled, the OAuth2 Client has to request the scope in the OAuth2 request by providing the `scope` query parameter. Setting this option to true is common if you need compatibility with MITREid.",
+              "examples": [
+                false
+              ]
+            }
+          }
+        },
+        "grant": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "refresh_token": {
+              "type": "object",
+              "properties": {
+                "rotation_grace_period": {
+                  "title": "Refresh Token Rotation Grace Period",
+                  "description": "Configures how long a Refresh Token remains valid after it has been used. The maximum value is 5 minutes, unless also a reuse count is configured, in which case the maximum is 180 days.",
+                  "default": "0s",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/duration"
+                    }
+                  ]
+                },
+                "rotation_grace_reuse_count": {
+                  "title": "Refresh Token Rotation Grace Period Reuse Count",
+                  "description": "Configures how many times a Refresh Token can be reused during the grace period. This is only effective if combined with a rotation grace period.",
+                  "default": 0,
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "jwt": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Authorization Grants using JWT configuration",
+              "properties": {
+                "jti_optional": {
+                  "type": "boolean",
+                  "description": "Configures if the JSON Web Token ID (`jti`) claim is required in the JSON Web Token (JWT) Profile for OAuth 2.0 Client Authentication and Authorization Grants (RFC7523). If set to `false`, the `jti` claim is required. Set this value to `true` only after careful consideration.",
+                  "default": false
+                },
+                "iat_optional": {
+                  "type": "boolean",
+                  "description": "Configures if the issued at (`iat`) claim is required in the JSON Web Token (JWT) Profile for OAuth 2.0 Client Authentication and Authorization Grants (RFC7523). If set to `false`, the `iat` claim is required. Set this value to `true` only after careful consideration.",
+                  "default": false
+                },
+                "max_ttl": {
+                  "description": "Configures what the maximum age of a JWT assertion used in the JSON Web Token (JWT) Profile for OAuth 2.0 Client Authentication and Authorization Grants (RFC7523) can be. This feature uses the `exp` claim and `iat` claim to calculate assertion age. Assertions exceeding the max age will be denied. Useful as a safety measure and recommended to keep below 720h. This governs the `grant.jwt.max_ttl` setting.",
+                  "default": "720h",
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/duration"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "refresh_token_hook": {
+          "description": "Sets the refresh token hook endpoint. If set it will be called during token refresh to receive updated token claims.",
+          "examples": ["https://my-example.app/token-refresh-hook"],
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "$ref": "#/definitions/webhook_config"
+            }
+          ]
+        },
+        "device_authorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "token_polling_interval": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/duration"
+                }
+              ],
+              "default": "5s",
+              "description": "Configures how often a non-interactive device should poll the device token endpoint, this is a purely informational configuration and does not enforce rate-limiting.",
+              "examples": ["5s", "15s", "1m"]
+            },
+            "user_code": {
+              "type": "object",
+              "description": "Configures the user code settings.",
+              "oneOf": [
+                {
+                  "properties": {
+                    "entropy_preset": {
+                      "type": "string",
+                      "description": "Presets for the user-code length and character set.",
+                      "enum": ["high", "medium", "low"]
+                    }
+                  },
+                  "required": ["entropy_preset"],
+                  "additionalProperties": false
+                },
+                {
+                  "properties": {
+                    "length": {
+                      "type": "integer",
+                      "description": "The length of the user code.",
+                      "minimum": 6
+                    },
+                    "character_set": {
+                      "type": "string",
+                      "description": "The character set to use for the user code. Provide the raw characters that should be used.",
+                      "examples": ["ABCDEFGHJKLMNPQRSTUVWXYZ23456789"],
+                      "minLength": 8
+                    }
+                  },
+                  "required": ["length", "character_set"],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          }
+        },
+        "token_hook": {
+          "description": "Sets the token hook endpoint for all grant types. If set it will be called while providing token to customize claims.",
+          "examples": ["https://my-example.app/token-hook"],
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "$ref": "#/definitions/webhook_config"
+            }
+          ]
+        }
+    }
+  },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The secrets section configures secrets used for encryption and signing of several systems. All secrets can be rotated, for more information on this topic go to: https://www.ory.sh/docs/hydra/advanced#rotation-of-hmac-token-signing-and-database-and-cookie-encryption-keys",
+      "properties": {
+        "system": {
+          "description": "The system secret must be at least 16 characters long. If none is provided, one will be generated. They key is used to encrypt sensitive data using AES-GCM (256 bit) and validate HMAC signatures. The first item in the list is used for signing and encryption. The whole list is used for verifying signatures and decryption.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 16
+          },
+          "examples": [
+            [
+              "this-is-the-primary-secret",
+              "this-is-an-old-secret",
+              "this-is-another-old-secret"
+            ]
+          ]
+        },
+        "cookie": {
+          "type": "array",
+          "description": "Secrets that are used for cookie session encryption. Defaults to secrets.system. It is recommended to use a separate secret in production. The first item in the list is used for signing and encryption. The whole list is used for verifying signatures and decryption.",
+          "items": {
+            "type": "string",
+            "minLength": 16
+          },
+          "examples": [
+            [
+              "this-is-the-primary-secret",
+              "this-is-an-old-secret",
+              "this-is-another-old-secret"
+            ]
+          ]
+        },
+        "pagination": {
+          "type": "array",
+          "description": "Secrets that are used for pagination token encryption. Defaults to secrets.system. It is recommended to use a separate secret in production. The first item in the list is used for signing and encryption. The whole list is used for verifying signatures and decryption.",
+          "items": {
+            "type": "string",
+            "minLength": 16
+          },
+          "examples": [
+            [
+              "this-is-the-primary-secret",
+              "this-is-an-old-secret",
+              "this-is-another-old-secret"
+            ]
+          ]
+        }
+      }
+    },
+    "profiling": {
+      "type": "string",
+      "description": "Enables profiling if set. For more details on profiling, head over to: https://blog.golang.org/profiling-go-programs",
+      "enum": ["cpu", "mem"],
+      "examples": ["cpu"]
+    },
+    "tracing": {
+      "$ref": "ory://tracing-config"
+    },
+    "sqa": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Software Quality Assurance telemetry configuration section",
+      "properties": {
+        "opt_out": {
+          "type": "boolean",
+          "description": "Disables anonymized telemetry reports - for more information please visit https://www.ory.sh/docs/ecosystem/sqa",
+          "default": false,
+          "examples": [true]
+        }
+      },
+      "examples": [
+        {
+          "opt_out": true
+        }
+      ]
+    },
+    "version": {
+      "type": "string",
+      "title": "The Hydra version this config is written for.",
+      "description": "SemVer according to https://semver.org/ prefixed with `v` as in our releases.",
+      "pattern": "^v(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+    },
+    "cgroups": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ory Hydra can respect Linux container CPU quota",
+      "properties": {
+        "v1": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Configures parameters using cgroups v1 hierarchy",
+          "properties": {
+            "auto_max_procs_enabled": {
+              "type": "boolean",
+              "description": "Set GOMAXPROCS automatically according to cgroups limits",
+              "default": false,
+              "examples": [true]
+            }
+          }
+        }
+      }
+    },
+    "dev": {
+      "type": "boolean",
+      "title": "Enable development mode",
+      "description": "If true, disables critical security measures to allow easier local development. Do not use in production.",
+      "default": false
+    },
+    "feature_flags": {
+      "title": "Feature flags",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {}
+    }
+  },
+  "additionalProperties": false
+}

@@ -94,6 +94,18 @@ reqwest_012 = { package = "reqwest", version = "0.12", default-features = false,
 # we depend on it directly for the fail-fast boot check.
 url = "2.5"
 
+# --- Phase 4: YAML config-edit subsystem (BACK-04 / BACK-06) -----------------
+# Maintained YAML fork (serde_yaml is DEPRECATED/unmaintained — NEVER use it).
+# Reads mounted service YAML into serde_json::Value via the serde data model.
+serde_yaml_ng = "0.10"
+# JSON-Schema (draft-07) validation of the FULL proposed config pre-disk, with a
+# custom `Retrieve` to resolve Ory's `ory://` $ref scheme OFFLINE from vendored
+# sub-schemas (Pitfall 1 — a naive .build() fails on those refs).
+jsonschema = "0.46"
+# Atomic write primitive (NamedTempFile in the SAME dir -> sync_all -> persist),
+# used by later plans; added now so the engine's deps are in place.
+tempfile = "3"
+
 [dev-dependencies]
 # Salvo `test` feature exposes TestClient for in-process handler/middleware tests.
 salvo = { version = "0.93.0", features = ["test"] }
