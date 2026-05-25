@@ -105,6 +105,10 @@ export type LimitCheck = { ok: boolean; violations: string[] };
 
 /**
  * Mirror the backend's authoritative import limits for UX feedback:
+ *   - an EMPTY array (zero records) is a violation — the backend
+ *     `enforce_import_limits` rejects it with 422 ("import requires at least one
+ *     identity"), so we flag it client-side (WR-04) to keep the Import button
+ *     disabled and show a clear message instead of an opaque server 422;
  *   - more than {@link HASHED_LIMIT} (1000) records is ALWAYS a violation;
  *   - more than {@link CLEARTEXT_LIMIT} (200) records is a violation when ANY
  *     record carries a cleartext password.
@@ -113,6 +117,12 @@ export type LimitCheck = { ok: boolean; violations: string[] };
 export function checkLimits(records: CliIdentity[]): LimitCheck {
   const violations: string[] = [];
   const count = records.length;
+
+  // WR-04: mirror the backend's zero-record rejection so an empty `[]` payload
+  // is caught client-side with a clear message (the button stays disabled).
+  if (count === 0) {
+    violations.push("Import requires at least one identity.");
+  }
 
   if (count > HASHED_LIMIT) {
     violations.push(

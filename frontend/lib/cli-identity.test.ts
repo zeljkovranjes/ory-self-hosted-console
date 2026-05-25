@@ -77,6 +77,17 @@ describe("parseImportArray", () => {
 });
 
 describe("checkLimits", () => {
+  it("flags an empty array as a violation (WR-04, mirrors backend 422)", () => {
+    const res = checkLimits([]);
+    expect(res.ok).toBe(false);
+    expect(res.violations.length).toBeGreaterThan(0);
+    expect(res.violations.join(" ")).toMatch(/at least one identity/i);
+  });
+
+  it("allows a single record (lower boundary ok)", () => {
+    expect(checkLimits(hashedRecords(1)).ok).toBe(true);
+  });
+
   it("allows 1000 hashed records (boundary ok)", () => {
     expect(checkLimits(hashedRecords(HASHED_LIMIT)).ok).toBe(true);
   });
