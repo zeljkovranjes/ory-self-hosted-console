@@ -217,9 +217,15 @@ pub fn build(pool: PgPool, cfg: Config) -> Router {
         .push(Router::with_path("logout").post(login::logout))
         .push(Router::with_path("api/console/me").get(state::me));
 
+    // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is
+    // moved into the affix_state hoop, then inject them into every Depot
+    // alongside the pool + config (RESEARCH Pattern 2). Handlers obtain them with
+    // `depot.obtain::<OryClients>()`. Wrapper routes mount in Plan 02.
+    let ory_clients = crate::ory::clients::OryClients::from_config(&cfg);
+
     // Root: inject shared state, then the public index + both subtrees.
     Router::new()
-        .hoop(affix_state::inject(pool).inject(cfg))
+        .hoop(affix_state::inject(pool).inject(cfg).inject(ory_clients))
         .get(index)
         .push(public)
         .push(protected)

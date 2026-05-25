@@ -47,6 +47,15 @@ pub enum AppError {
     /// Catch-all internal failure. Detail logged, never returned. -> 500
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Upstream Ory service failure (transport, decode, or non-2xx response).
+    /// CONTEXT/BACK-02 require 502 (NOT 500) for upstream failures. The detail
+    /// string is for SERVER-SIDE LOGS ONLY — it carries a sanitised summary
+    /// (e.g. "ory upstream status 404") and NEVER the raw upstream body, the
+    /// admin base URL, or any credential (BACK-07). The client receives only the
+    /// generic `{"error":"upstream_error"}` machine code. -> 502
+    #[error("upstream error: {0}")]
+    Upstream(String),
 }
 
 impl AppError {
@@ -57,6 +66,7 @@ impl AppError {
             AppError::Forbidden => StatusCode::FORBIDDEN,
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Db(_)
             | AppError::Migrate(_)
             | AppError::Config(_)
@@ -75,6 +85,7 @@ impl AppError {
             AppError::Forbidden => "forbidden",
             AppError::NotFound => "not_found",
             AppError::BadRequest(_) => "bad_request",
+            AppError::Upstream(_) => "upstream_error",
         }
     }
 }
@@ -87,9 +98,13 @@ impl Writer for AppError {
     async fn write(self, _req: &mut Request, _depot: &mut Depot, res: &mut Response) {
         let status = self.status_code();
 
-        // Server-side detail (NEVER to the client). 5xx is an error-level event.
+        // Server-side detail (NEVER to the client). 500 is an error-level event;
+        // 502 (upstream Ory failure) is logged at warn — the sanitised detail
+        // string lands in the LOGS only, never the body (BACK-07).
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!(error = %self, "request failed with internal error");
+        } else if status == StatusCode::BAD_GATEWAY {
+            tracing::warn!(error = %self, "request failed with upstream error");
         } else {
             tracing::debug!(error = %self, status = %status, "request rejected");
         }
