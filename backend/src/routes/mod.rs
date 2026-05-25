@@ -1,19 +1,48 @@
-//! Router assembly (BACK-01).
+//! Router assembly — the single auth chokepoint (BACK-01, CAUTH-06, CAUTH-05).
 //!
-//! This phase (Plan 02-01) wires only the public skeleton: the `affix_state`
-//! hoop injecting the `PgPool` + `Config` into every `Depot`, plus the
-//! preserved `GET /health` and `GET /` index. The auth subsystem (setup/login/
-//! logout/middleware/CSRF/rate-limit/github) and the protected subtree are
-//! added by Plans 02-02..04, which extend `build` — keep it forward-compatible.
+//! Two subtrees hang off a root that injects shared state into every `Depot`:
+//!
+//! - **PUBLIC** (NO auth hoop): `GET /`, `GET /health`, `GET /api/console/state`,
+//!   `POST /setup` (rate-limit + uninitialized + origin hoops), `POST /login`
+//!   (rate-limit + origin hoops). GitHub routes attach here in Plan 02-04 via
+//!   the `attach_github` extension point when `cfg.github.is_some()`.
+//! - **PROTECTED** (`auth_guard` then `csrf_guard` hoops): `POST /logout`,
+//!   `GET /api/console/me`. Phase 3+ Ory wrapper routes mount here.
+//!
+//! Pitfall 7: the rate-limit hoop is ONLY on the pre-auth endpoints; the
+//! auth+csrf hoops are ONLY on the protected subtree.
+//!
+//! Rate limit quota: **10 requests/min per connection IP** (Claude's discretion,
+//! CONTEXT 5-10/min) keyed off the DIRECT connection IP. `X-Forwarded-For` is
+//! deliberately NOT trusted (threat T-02-23 / Pitfall 7) — a future reverse
+//! proxy phase must revisit this.
+
+pub mod state;
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use salvo::affix_state;
 use salvo::prelude::*;
+use salvo::rate_limiter::{BasicQuota, FixedGuard, MokaStore, RateLimiter};
+use salvo::Handler;
 use sqlx::PgPool;
 
+use crate::auth::login;
+use crate::auth::middleware::{auth_guard, csrf_guard};
+use crate::auth::setup;
 use crate::config::Config;
 
-/// Liveness/readiness probe. Preserved from the Phase-1 skeleton: returns 200
-/// with a small JSON body. Public — no auth hoop (CAUTH-06 public set).
+/// Per-connection-IP rate quota for the pre-auth endpoints (CONTEXT 5-10/min).
+const RATE_PER_MINUTE: usize = 10;
+
+/// Sentinel key used when the direct connection IP is unavailable (e.g. the
+/// in-process `TestClient`, which leaves `remote_addr` as `Unknown`). Keying all
+/// such requests to one bucket keeps the limiter functional (and testable)
+/// instead of `RemoteIpIssuer`'s behavior of rejecting an un-keyable request
+/// with a 400. Real over-TCP requests always carry a connection IP.
+const FALLBACK_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// Liveness/readiness probe. Public — no auth hoop (CAUTH-06 public set).
 #[handler]
 async fn health(res: &mut Response) {
     res.status_code(StatusCode::OK);
@@ -26,14 +55,124 @@ async fn index() -> &'static str {
     "ory-console-backend: ok"
 }
 
-/// Build the application router.
-///
-/// The `affix_state` hoop injects the shared `PgPool` and `Config` into every
-/// request's `Depot`; downstream handlers (later plans) read them via
-/// `depot.obtain::<PgPool>()` / `depot.obtain::<Config>()`.
+/// Extract the request origin: the `Origin` header, falling back to the origin
+/// (scheme://host[:port]) parsed out of `Referer`. Returns `None` if neither is
+/// present.
+fn request_origin(req: &Request) -> Option<String> {
+    if let Some(origin) = req.header::<String>("origin") {
+        if !origin.is_empty() && origin != "null" {
+            return Some(origin);
+        }
+    }
+    // Referer fallback: keep only scheme://host[:port] (strip path/query).
+    let referer = req.header::<String>("referer")?;
+    let after_scheme = referer.find("://")? + 3;
+    let rest = &referer[after_scheme..];
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    Some(format!("{}{}", &referer[..after_scheme], &rest[..host_end]))
+}
+
+/// Pre-session Origin allowlist hoop (Plan-checker Warning 2). Mounted on the
+/// pre-auth state-changing endpoints (`/setup`, `/login`, and the GitHub
+/// callback in Plan 04) where a per-session CSRF token cannot yet exist. Rejects
+/// a request whose `Origin`/`Referer` origin is not in the configured allowlist
+/// with 403. An EMPTY allowlist disables the check (documented dev posture).
+#[handler]
+pub async fn origin_guard(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let cfg = match depot.obtain::<Config>() {
+        Ok(c) => c.clone(),
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            ctrl.skip_rest();
+            return;
+        }
+    };
+
+    // No allowlist configured -> check disabled (dev). Document the residual in
+    // the README (SameSite=Lax + one-time token + rate-limit posture).
+    if cfg.allowed_origins.is_empty() {
+        return;
+    }
+
+    let allowed = match request_origin(req) {
+        // A same-origin form post or an API client may omit Origin entirely; a
+        // cross-site browser form post always sends one. With an allowlist set
+        // we require a present, allowed origin (fail-closed for browser CSRF).
+        Some(origin) => cfg.origin_allowed(&origin),
+        None => false,
+    };
+
+    if !allowed {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(Json(serde_json::json!({ "error": "forbidden_origin" })));
+        ctrl.skip_rest();
+    }
+}
+
+/// Construct a fresh rate limiter for one pre-auth route. Keyed by the direct
+/// connection IP (XFF NOT trusted); falls back to a single bucket when the IP is
+/// unknown so the limiter still functions under the test transport.
+fn pre_auth_limiter() -> impl Handler {
+    let store: MokaStore<IpAddr, FixedGuard> = MokaStore::default();
+    RateLimiter::new(
+        FixedGuard::default(),
+        store,
+        // Closure issuer (blanket `RateIssuer` impl): direct connection IP, or
+        // the fallback sentinel when unavailable. We never read X-Forwarded-For.
+        |req: &mut Request, _: &Depot| Some(req.remote_addr().ip().unwrap_or(FALLBACK_IP)),
+        BasicQuota::per_minute(RATE_PER_MINUTE),
+    )
+}
+
+/// GitHub OAuth route extension point. No-op in this plan; Plan 02-04 fills it
+/// in, conditionally pushing `/auth/github/login` + `/auth/github/callback` onto
+/// the public subtree when `cfg.github.is_some()` (the callback also gets the
+/// rate-limit + origin hoops). Kept here so 04 extends one well-marked seam.
+pub fn attach_github(public: Router, _cfg: &Config) -> Router {
+    // Intentionally a no-op until Plan 02-04.
+    public
+}
+
+/// Build the application router (RESEARCH Pattern 5).
 pub fn build(pool: PgPool, cfg: Config) -> Router {
+    // PUBLIC subtree — no auth hoop (CAUTH-06 public set).
+    let mut public = Router::new()
+        .push(Router::with_path("health").get(health))
+        .push(Router::with_path("api/console/state").get(state::console_state))
+        .push(
+            // POST /setup: rate-limit -> uninitialized 404 guard -> origin -> handler.
+            Router::with_path("setup")
+                .hoop(pre_auth_limiter())
+                .hoop(setup::require_uninitialized)
+                .hoop(origin_guard)
+                .post(setup::setup),
+        )
+        .push(
+            // POST /login: rate-limit -> origin -> handler.
+            Router::with_path("login")
+                .hoop(pre_auth_limiter())
+                .hoop(origin_guard)
+                .post(login::login),
+        );
+    // GitHub routes (Plan 02-04 fills this in when env-configured).
+    public = attach_github(public, &cfg);
+
+    // PROTECTED subtree — the single auth chokepoint + per-session CSRF guard.
+    let protected = Router::new()
+        .hoop(auth_guard)
+        .hoop(csrf_guard)
+        .push(Router::with_path("logout").post(login::logout))
+        .push(Router::with_path("api/console/me").get(state::me));
+
+    // Root: inject shared state, then the public index + both subtrees.
     Router::new()
         .hoop(affix_state::inject(pool).inject(cfg))
         .get(index)
-        .push(Router::with_path("health").get(health))
+        .push(public)
+        .push(protected)
 }

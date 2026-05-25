@@ -36,27 +36,22 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
         session_idle_secs: 604_800,
         session_absolute_secs: 2_592_000,
         insecure_cookies: true,
+        // Empty allowlist => the pre-session origin check is disabled by default,
+        // so the existing setup/login tests (which send no Origin) still pass.
+        // The origin-rejection test sets a non-empty allowlist explicitly.
+        allowed_origins: Vec::new(),
         github: None,
     }
 }
 
-/// Build the test router with an explicit config, mounting the public auth
-/// routes (`/setup`, `/login`, `/logout`) onto the real `routes::build`
-/// skeleton. Plan 02-03 assembles the production public/protected router with
-/// the auth + CSRF + rate-limit hoops; until then the integration tests mount
-/// the handlers here so the Task-2 behaviors are exercisable now (per PLAN
-/// "mount them in the test router").
+/// Build the test router with an explicit config. As of Plan 02-03 the real
+/// `routes::build` assembles the full production public/protected router (with
+/// the auth + CSRF + rate-limit + origin hoops and the `/setup`,`/login`,
+/// `/logout`, `/api/console/state`, `/api/console/me` routes), so this helper
+/// simply delegates — the integration tests exercise the SAME router the binary
+/// serves (no test-only route mounting).
 pub fn build_test_router_cfg(pool: PgPool, cfg: ory_console_backend::config::Config) -> Router {
-    use ory_console_backend::auth::{login, setup};
-
-    let base = ory_console_backend::routes::build(pool, cfg);
-    base.push(
-        Router::with_path("setup")
-            .hoop(setup::require_uninitialized)
-            .post(setup::setup),
-    )
-    .push(Router::with_path("login").post(login::login))
-    .push(Router::with_path("logout").post(login::logout))
+    ory_console_backend::routes::build(pool, cfg)
 }
 
 /// Run the embedded console migrations against a test pool.
@@ -90,7 +85,18 @@ pub fn obtain_session_cookie(response: &Response) -> Option<String> {
     None
 }
 
-/// Mint a CSRF token bound to a session. Stub: 02-03 (CSRF guard).
-pub fn mint_csrf(_session_id: uuid::Uuid) -> Option<String> {
-    None
+/// Look up the per-session CSRF token for a session identified by its raw
+/// (cookie) token. The session layer stores only `sha256(raw)` as `token_hash`,
+/// so we hash the raw token and read the row's `csrf_token`. Used by the CSRF
+/// guard tests to supply a MATCHING `X-CSRF-Token` header.
+pub async fn csrf_for_raw_token(pool: &PgPool, raw_token: &str) -> String {
+    let token_hash = password::sha256_hex(raw_token);
+    let row = sqlx::query!(
+        "SELECT csrf_token FROM sessions WHERE token_hash = $1",
+        token_hash
+    )
+    .fetch_one(pool)
+    .await
+    .expect("session row for raw token");
+    row.csrf_token
 }

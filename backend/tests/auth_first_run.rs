@@ -235,9 +235,14 @@ async fn logout_deletes_the_session_row(pool: PgPool) {
     .unwrap();
     assert_eq!(before.n, 1);
 
-    // Logout carrying the dev session cookie.
+    // As of Plan 02-03 `/logout` lives on the PROTECTED subtree behind the
+    // auth + CSRF guards, so a state-changing POST must carry the matching
+    // per-session `X-CSRF-Token` (the dev session cookie alone is no longer
+    // sufficient — that is now a 403).
+    let csrf = common::csrf_for_raw_token(&pool, &token).await;
     let resp2 = TestClient::post("http://127.0.0.1:8080/logout")
         .add_header("Cookie", format!("console_session={token}"), true)
+        .add_header("X-CSRF-Token", csrf, true)
         .send(&service)
         .await;
     assert_eq!(resp2.status_code, Some(StatusCode::OK));

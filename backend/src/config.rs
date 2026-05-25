@@ -56,6 +56,13 @@ pub struct Config {
     /// Dev escape hatch (env `CONSOLE_INSECURE_COOKIES`, default false): drop the
     /// `__Host-` prefix + Secure so cookies work over plain-HTTP localhost (Pitfall 6).
     pub insecure_cookies: bool,
+    /// Allowlist of acceptable `Origin` values for pre-session state-changing
+    /// endpoints (`POST /setup`, `/login`, `/auth/github/callback`). Sourced from
+    /// `CONSOLE_ALLOWED_ORIGINS` (comma-separated). EMPTY = allow any origin
+    /// (the pre-session origin check is then a no-op — documented dev posture).
+    /// Plan-checker Warning 2: defends the two pre-session endpoints against
+    /// cross-site form posts before a per-session CSRF token can exist.
+    pub allowed_origins: Vec<String>,
     /// GitHub OAuth config — `Some` only when both id+secret env vars are set.
     pub github: Option<GithubCfg>,
 }
@@ -69,6 +76,7 @@ impl fmt::Debug for Config {
             .field("session_idle_secs", &self.session_idle_secs)
             .field("session_absolute_secs", &self.session_absolute_secs)
             .field("insecure_cookies", &self.insecure_cookies)
+            .field("allowed_origins", &self.allowed_origins)
             .field("github", &self.github)
             .finish()
     }
@@ -93,6 +101,20 @@ impl Config {
 
         let insecure_cookies = parse_bool("CONSOLE_INSECURE_COOKIES", false);
 
+        // Pre-session Origin allowlist (Plan-checker Warning 2). Comma-separated;
+        // each entry is trimmed and compared case-insensitively (scheme+host+port)
+        // against the request `Origin` (or `Referer` origin fallback). Empty list
+        // means the pre-session origin check is skipped (dev posture).
+        let allowed_origins = env::var("CONSOLE_ALLOWED_ORIGINS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().trim_end_matches('/').to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         // GitHub OAuth is mounted ONLY when both id and secret are present.
         let github = match (
             env::var("GITHUB_OAUTH_CLIENT_ID").ok(),
@@ -116,8 +138,20 @@ impl Config {
             session_idle_secs,
             session_absolute_secs,
             insecure_cookies,
+            allowed_origins,
             github,
         })
+    }
+
+    /// Whether `origin` (already normalized: lowercase, no trailing slash) is in
+    /// the configured allowlist. An EMPTY allowlist returns `true` for any origin
+    /// (the pre-session check is disabled — documented dev posture).
+    pub fn origin_allowed(&self, origin: &str) -> bool {
+        if self.allowed_origins.is_empty() {
+            return true;
+        }
+        let norm = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+        self.allowed_origins.iter().any(|o| o == &norm)
     }
 
     /// Whether GitHub OAuth is enabled (for `GET /api/console/state`).

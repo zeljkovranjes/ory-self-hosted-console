@@ -164,6 +164,7 @@ mod tests {
             session_idle_secs: 604_800,
             session_absolute_secs: 2_592_000,
             insecure_cookies: insecure,
+            allowed_origins: Vec::new(),
             github: None,
         }
     }
