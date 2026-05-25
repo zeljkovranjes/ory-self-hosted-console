@@ -12,10 +12,18 @@
 
 use salvo::prelude::*;
 
+use std::time::Duration;
+
 use ory_console_backend::auth::setup::ensure_bootstrap_token;
 use ory_console_backend::config::Config;
+use ory_console_backend::db::queries;
 use ory_console_backend::error::AppError;
 use ory_console_backend::{db, routes};
+
+/// WR-07: how often the background reaper deletes absolutely-expired sessions.
+/// Hourly is ample for a low-concurrency console — it bounds `sessions` growth
+/// from abandoned (never-logged-out) sessions without adding meaningful load.
+const SESSION_REAP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Initialize structured logging. Keeps the Phase-1 default filter ("info").
 fn init_tracing() {
@@ -48,6 +56,26 @@ async fn main() -> Result<(), AppError> {
     // raw value to stdout exactly once. No-op on an initialized console. Runs
     // AFTER migrate, BEFORE serve (RESEARCH "Bootstrap order").
     ensure_bootstrap_token(&pool).await?;
+
+    // WR-07: background session reaper. A detached tokio task periodically
+    // deletes sessions past their absolute `expires_at` so the table cannot grow
+    // without bound from abandoned (never-logged-out) sessions. Runs one sweep
+    // immediately at boot, then on a fixed interval. A failed sweep is logged and
+    // retried next tick — it never blocks request serving.
+    {
+        let reap_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SESSION_REAP_INTERVAL);
+            loop {
+                ticker.tick().await;
+                match queries::delete_expired_sessions(&reap_pool).await {
+                    Ok(n) if n > 0 => tracing::info!(reaped = n, "expired sessions reaped"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "session reaper sweep failed"),
+                }
+            }
+        });
+    }
 
     // Owned bind address: TcpListener::new requires a 'static address, and `cfg`
     // is moved into the router below.
