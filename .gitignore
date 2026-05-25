@@ -38,3 +38,17 @@ Thumbs.db
 backend/target
 frontend/node_modules
 frontend/.next
+
+# --- GSD planning + AI tooling meta (never committed — product code only) ---
+# Kept on disk for the GSD workflow but intentionally untracked so the repo
+# contains only the deliverable product, not planning/AI-assistant artifacts.
+.planning/
+.claude/
+.agents/
+.cursor/
+.codex/
+.github/skills/
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+.mcp.json
