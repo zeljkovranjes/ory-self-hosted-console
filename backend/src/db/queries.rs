@@ -125,6 +125,25 @@ pub async fn get_admin_by_email(pool: &PgPool, email: &str) -> Result<Option<Adm
     Ok(admin)
 }
 
+/// Fetch an admin by primary key, if present. Used by `GET /api/console/me`
+/// to render the secret-free `AdminDto` for the authenticated session's admin.
+pub async fn get_admin_by_id(pool: &PgPool, admin_id: Uuid) -> Result<Option<Admin>, AppError> {
+    let admin = sqlx::query_as!(
+        Admin,
+        r#"
+        SELECT id, email::text AS "email!", name,
+               password_hash, github_user_id,
+               created_at, updated_at, last_login_at
+        FROM admins
+        WHERE id = $1
+        "#,
+        admin_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(admin)
+}
+
 /// Record a successful login timestamp for the admin.
 pub async fn update_last_login(pool: &PgPool, admin_id: Uuid) -> Result<(), AppError> {
     sqlx::query!(
