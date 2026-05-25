@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { getMe } from "@/lib/server-api";
 import { AppSidebar } from "@/components/app-sidebar";
 import { AccountMenu } from "@/components/account-menu";
+import { CsrfSeed } from "@/components/csrf-seed";
 import {
   SidebarInset,
   SidebarProvider,
@@ -22,7 +23,9 @@ import {
 // On success it renders the UI-SPEC shell: a grouped sidebar (collapses to a
 // drawer < md), a topbar (sidebar trigger + console title + account menu with
 // logout + theme toggle), and the page content. The operator's csrf_token (from
-// /me) is handed to the AccountMenu so the logout mutation can attach it.
+// /me) is seeded into the client api cache by the <CsrfSeed> boundary in an
+// effect, so every console-page mutation (logout, future config PUTs) carries
+// X-CSRF-Token regardless of component render order (WR-01/WR-02).
 
 export default async function ConsoleLayout({
   children,
@@ -34,13 +37,17 @@ export default async function ConsoleLayout({
 
   return (
     <SidebarProvider>
+      {/* Seed the CSRF token deterministically (in an effect) from the
+          authoritative /me fetch so EVERY console page can mutate without a
+          missing-token 403 — decoupled from AccountMenu render order (WR-01/02). */}
+      <CsrfSeed token={me.csrf_token} />
       <AppSidebar />
       <SidebarInset>
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
           <span className="text-sm font-medium">Ory Console — self-hosted</span>
           <div className="ml-auto">
-            <AccountMenu email={me.email} csrfToken={me.csrf_token} />
+            <AccountMenu email={me.email} />
           </div>
         </header>
         <main className="mx-auto w-full max-w-6xl flex-1 overflow-auto p-6">

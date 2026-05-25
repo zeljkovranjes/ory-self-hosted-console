@@ -18,22 +18,17 @@ import { ThemeToggle } from "@/components/theme-toggle";
 //
 // Shows the authenticated operator's email, the light/dark theme toggle, and a
 // Logout action. Logout POSTs `/logout` via lib/api.ts, which attaches the
-// `X-CSRF-Token` header (T-05-18) from the CSRF token seeded after /me. On
-// success we clear the cached token and navigate to /login.
+// `X-CSRF-Token` header (T-05-18). The token is seeded deterministically by the
+// `<CsrfSeed>` boundary mounted in the (console) layout (WR-01/WR-02) — this
+// component no longer seeds it as a render-phase side effect. On logout we clear
+// the cached token and navigate to /login.
 
 type AccountMenuProps = {
   email: string;
-  /** CSRF token from the server /me fetch; seeded so logout can mutate. */
-  csrfToken: string;
 };
 
-export function AccountMenu({ email, csrfToken }: AccountMenuProps) {
+export function AccountMenu({ email }: AccountMenuProps) {
   const [busy, setBusy] = useState(false);
-
-  // Seed the CSRF token at render so the logout mutation carries it. The token
-  // came from the server-side /me fetch (passed down by the layout); the client
-  // wrapper needs it in its module cache.
-  if (typeof window !== "undefined" && csrfToken) setCsrfToken(csrfToken);
 
   async function onLogout() {
     setBusy(true);
