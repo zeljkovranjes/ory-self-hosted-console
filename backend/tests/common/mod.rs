@@ -59,7 +59,10 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
 /// simply delegates — the integration tests exercise the SAME router the binary
 /// serves (no test-only route mounting).
 pub fn build_test_router_cfg(pool: PgPool, cfg: ory_console_backend::config::Config) -> Router {
-    ory_console_backend::routes::build(pool, cfg)
+    // WR-03: `routes::build` is now fallible (it validates the Ory admin URLs).
+    // The test `Config` always uses the valid internal-network defaults, so this
+    // never fails in practice; `expect` surfaces a misconfigured fixture loudly.
+    ory_console_backend::routes::build(pool, cfg).expect("test router build (valid admin URLs)")
 }
 
 /// Run the embedded console migrations against a test pool.
@@ -97,7 +100,10 @@ pub fn ory_clients_from_env() -> OryClients {
         oathkeeper_api_url: url("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url),
         ..cfg
     };
-    OryClients::from_config(&cfg)
+    // WR-03: `from_config` validates the admin URLs and is now fallible. Live
+    // tests pass valid http(s) URLs (defaults or env overrides), so `expect`
+    // only fires on a genuinely malformed override — surfacing it loudly.
+    OryClients::from_config(&cfg).expect("ory clients from env (valid admin URLs)")
 }
 
 // --- Fixtures (implemented in 02-02; CSRF helper remains a 02-03 stub) -------

@@ -82,6 +82,17 @@ ory-kratos-client     = { version = "26.2.0", default-features = false, features
 ory-hydra-client      = { version = "26.2.0", default-features = false, features = ["rustls-tls"] }
 ory-keto-client       = { version = "26.2.0", default-features = false, features = ["rustls-tls"] }
 ory-oathkeeper-client = { version = "26.2.0", default-features = false, features = ["rustls-tls"] }
+# WR-01: the Ory `Configuration.client` is a reqwest **0.12** `Client` (a
+# DIFFERENT type from the backend's own reqwest 0.13 above). To inject a
+# bounded-timeout client into each Configuration we must name that 0.12 type, so
+# we add a RENAMED alias of the same 0.12 dep the crates already pull in. Feature
+# set matches the Ory crates' `rustls-tls` (no native-tls/OpenSSL) plus `json`.
+# This shares the existing 0.12.x resolution — it does NOT add a new major.
+reqwest_012 = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# WR-03: validate the five admin base URLs at startup (parse + reject missing
+# scheme/host). `url` is already in the tree transitively (via the Ory crates);
+# we depend on it directly for the fail-fast boot check.
+url = "2.5"
 
 [dev-dependencies]
 # Salvo `test` feature exposes TestClient for in-process handler/middleware tests.

@@ -82,7 +82,10 @@ async fn main() -> Result<(), AppError> {
     let bind_addr = cfg.bind_addr.clone();
 
     // Build the router (affix_state injects pool + cfg into every Depot).
-    let router = routes::build(pool.clone(), cfg);
+    // WR-03: `build` validates the five Ory admin URLs and fails fast at boot
+    // (before binding the listener) if any is malformed, rather than degrading
+    // to opaque per-request 502s.
+    let router = routes::build(pool.clone(), cfg)?;
 
     tracing::info!(%bind_addr, "starting ory-console-backend");
 

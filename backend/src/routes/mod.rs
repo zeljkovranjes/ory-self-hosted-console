@@ -178,7 +178,7 @@ pub fn attach_github(public: Router, cfg: &Config) -> Router {
 }
 
 /// Build the application router (RESEARCH Pattern 5).
-pub fn build(pool: PgPool, cfg: Config) -> Router {
+pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError> {
     // PUBLIC subtree — no auth hoop (CAUTH-06 public set).
     let mut public = Router::new()
         .push(Router::with_path("health").get(health))
@@ -232,13 +232,17 @@ pub fn build(pool: PgPool, cfg: Config) -> Router {
     // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is
     // moved into the affix_state hoop, then inject them into every Depot
     // alongside the pool + config (RESEARCH Pattern 2). Handlers obtain them with
-    // `depot.obtain::<OryClients>()`. Wrapper routes mount in Plan 02.
-    let ory_clients = crate::ory::clients::OryClients::from_config(&cfg);
+    // `depot.obtain::<OryClients>()`.
+    //
+    // WR-03: `from_config` now validates the five admin URLs and can fail; the
+    // `?` surfaces a malformed URL as a boot-time `AppError::Config` rather than
+    // an opaque per-request 502.
+    let ory_clients = crate::ory::clients::OryClients::from_config(&cfg)?;
 
     // Root: inject shared state, then the public index + both subtrees.
-    Router::new()
+    Ok(Router::new()
         .hoop(affix_state::inject(pool).inject(cfg).inject(ory_clients))
         .get(index)
         .push(public)
-        .push(protected)
+        .push(protected))
 }
