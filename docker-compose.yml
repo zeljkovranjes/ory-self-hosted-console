@@ -359,6 +359,15 @@ services:
       BACKEND_BIND_ADDR: 0.0.0.0:8080
       # Single Ory base URL + admin credential bootstrap contract (INFRA-06).
       ORY_BASE_URL: ${ORY_BASE_URL:-http://oathkeeper:4455}
+      # Phase 3 (BACK-02 / INFRA-05): per-service Ory ADMIN base URLs. Internal
+      # service-name DNS on the `internal` network ONLY — these admin ports are
+      # never host-published (no `ports:` entry on the Ory services). They carry
+      # no credential; the backend is the sole client of these endpoints.
+      KRATOS_ADMIN_URL: http://kratos:4434
+      HYDRA_ADMIN_URL: http://hydra:4445
+      KETO_READ_URL: http://keto:4466
+      KETO_WRITE_URL: http://keto:4467
+      OATHKEEPER_API_URL: http://oathkeeper:4456
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
       # Backend reaches the Docker engine ONLY through the scoped broker.

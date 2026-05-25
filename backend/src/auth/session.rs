@@ -177,6 +177,11 @@ mod tests {
             insecure_cookies: insecure,
             allowed_origins: Vec::new(),
             github: None,
+            kratos_admin_url: "http://kratos:4434".into(),
+            hydra_admin_url: "http://hydra:4445".into(),
+            keto_read_url: "http://keto:4466".into(),
+            keto_write_url: "http://keto:4467".into(),
+            oathkeeper_api_url: "http://oathkeeper:4456".into(),
         }
     }
 

@@ -20,6 +20,17 @@ const DEFAULT_SESSION_IDLE_SECS: i64 = 604_800;
 /// 30 days, in seconds — default absolute session lifetime cap.
 const DEFAULT_SESSION_ABSOLUTE_SECS: i64 = 2_592_000;
 
+/// Internal-network defaults for the five Ory Admin base URLs (Phase 3,
+/// BACK-02 / INFRA-05). These are the Docker service-key DNS names on the
+/// `internal` network; the admin ports are NEVER host-published. base_path is
+/// bare `scheme://host:port` with NO `/admin` suffix (RESEARCH Pitfall 2 — the
+/// generated crate path templates already prepend the route).
+const DEFAULT_KRATOS_ADMIN_URL: &str = "http://kratos:4434";
+const DEFAULT_HYDRA_ADMIN_URL: &str = "http://hydra:4445";
+const DEFAULT_KETO_READ_URL: &str = "http://keto:4466";
+const DEFAULT_KETO_WRITE_URL: &str = "http://keto:4467";
+const DEFAULT_OATHKEEPER_API_URL: &str = "http://oathkeeper:4456";
+
 /// Optional GitHub OAuth configuration. Present ONLY when both the client id
 /// and secret are set in the environment (CAUTH-04 env-gating).
 #[derive(Clone)]
@@ -65,6 +76,22 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// GitHub OAuth config — `Some` only when both id+secret env vars are set.
     pub github: Option<GithubCfg>,
+
+    // --- Phase 3 (BACK-02): internal Ory Admin base URLs ---------------------
+    // NON-SECRET (they carry no credential) but INFRA-05-sensitive: they live
+    // ONLY in backend env/Config and must NEVER be serialised into any
+    // frontend-facing response. They appear in CLEARTEXT in the `Debug` impl
+    // (unlike the DSN) so config stays log-useful.
+    /// Kratos Admin base URL (env `KRATOS_ADMIN_URL`, default `http://kratos:4434`).
+    pub kratos_admin_url: String,
+    /// Hydra Admin base URL (env `HYDRA_ADMIN_URL`, default `http://hydra:4445`).
+    pub hydra_admin_url: String,
+    /// Keto READ base URL (env `KETO_READ_URL`, default `http://keto:4466`).
+    pub keto_read_url: String,
+    /// Keto WRITE base URL (env `KETO_WRITE_URL`, default `http://keto:4467`).
+    pub keto_write_url: String,
+    /// Oathkeeper API base URL (env `OATHKEEPER_API_URL`, default `http://oathkeeper:4456`).
+    pub oathkeeper_api_url: String,
 }
 
 impl fmt::Debug for Config {
@@ -78,6 +105,12 @@ impl fmt::Debug for Config {
             .field("insecure_cookies", &self.insecure_cookies)
             .field("allowed_origins", &self.allowed_origins)
             .field("github", &self.github)
+            // Admin URLs are non-secret: print in cleartext (log-useful).
+            .field("kratos_admin_url", &self.kratos_admin_url)
+            .field("hydra_admin_url", &self.hydra_admin_url)
+            .field("keto_read_url", &self.keto_read_url)
+            .field("keto_write_url", &self.keto_write_url)
+            .field("oathkeeper_api_url", &self.oathkeeper_api_url)
             .finish()
     }
 }
@@ -150,6 +183,20 @@ impl Config {
             _ => None,
         };
 
+        // Phase 3 (BACK-02): the five internal Ory Admin base URLs. Each falls
+        // back to its internal-network default; no value is required (they are
+        // not secrets and resolve only on the internal Docker network).
+        let kratos_admin_url =
+            env::var("KRATOS_ADMIN_URL").unwrap_or_else(|_| DEFAULT_KRATOS_ADMIN_URL.to_string());
+        let hydra_admin_url =
+            env::var("HYDRA_ADMIN_URL").unwrap_or_else(|_| DEFAULT_HYDRA_ADMIN_URL.to_string());
+        let keto_read_url =
+            env::var("KETO_READ_URL").unwrap_or_else(|_| DEFAULT_KETO_READ_URL.to_string());
+        let keto_write_url =
+            env::var("KETO_WRITE_URL").unwrap_or_else(|_| DEFAULT_KETO_WRITE_URL.to_string());
+        let oathkeeper_api_url = env::var("OATHKEEPER_API_URL")
+            .unwrap_or_else(|_| DEFAULT_OATHKEEPER_API_URL.to_string());
+
         Ok(Config {
             console_database_url,
             bind_addr,
@@ -158,6 +205,11 @@ impl Config {
             insecure_cookies,
             allowed_origins,
             github,
+            kratos_admin_url,
+            hydra_admin_url,
+            keto_read_url,
+            keto_write_url,
+            oathkeeper_api_url,
         })
     }
 

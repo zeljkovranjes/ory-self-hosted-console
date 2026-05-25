@@ -69,6 +69,20 @@ time = { version = "0.3", features = ["serde"] }
 # Typed error enum -> generic JSON (no secret leakage; BACK-07).
 thiserror = "2.0"
 
+# --- Phase 3: per-service Ory Admin client crates ---------------------------
+# Operator-mandated typed clients, version-locked to the oryd/*:v26.2.0 images.
+# These depend on reqwest ^0.12 (DIFFERENT major from the backend's own 0.13
+# above) — that is intentional and supported: each crate's `Configuration` owns
+# its OWN default reqwest 0.12 client; we never inject the 0.13 client into them
+# (RESEARCH Pitfall 1). `default-features = false, features = ["rustls-tls"]`
+# avoids the crates' default `native-tls`/OpenSSL, which the rustls-only build
+# lacks (RESEARCH Pitfall 3). The 0.13 dep above keeps its distinct `rustls`
+# feature name for the fallback module — do NOT unify the two reqwest majors.
+ory-kratos-client     = { version = "26.2.0", default-features = false, features = ["rustls-tls"] }
+ory-hydra-client      = { version = "26.2.0", default-features = false, features = ["rustls-tls"] }
+ory-keto-client       = { version = "26.2.0", default-features = false, features = ["rustls-tls"] }
+ory-oathkeeper-client = { version = "26.2.0", default-features = false, features = ["rustls-tls"] }
+
 [dev-dependencies]
 # Salvo `test` feature exposes TestClient for in-process handler/middleware tests.
 salvo = { version = "0.93.0", features = ["test"] }

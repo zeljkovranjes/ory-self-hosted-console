@@ -41,6 +41,14 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
         // The origin-rejection test sets a non-empty allowlist explicitly.
         allowed_origins: Vec::new(),
         github: None,
+        // Phase 3 (BACK-02): internal Ory Admin base URLs — same defaults as
+        // `Config::from_env` so the literal compiles and live tests can point
+        // these at the compose services via env if needed.
+        kratos_admin_url: "http://kratos:4434".to_string(),
+        hydra_admin_url: "http://hydra:4445".to_string(),
+        keto_read_url: "http://keto:4466".to_string(),
+        keto_write_url: "http://keto:4467".to_string(),
+        oathkeeper_api_url: "http://oathkeeper:4456".to_string(),
     }
 }
 
