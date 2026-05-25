@@ -1,0 +1,48 @@
+# config/kratos/kratos.yml
+#
+# Minimal Kratos configuration to reach healthy on first boot.
+# Mounted read-only into the container at /etc/config/kratos/ (RESEARCH Pattern 3).
+# Verified minimal key set: ory/kratos contrib/quickstart kratos.yml (RESEARCH).
+#
+# DSN uses the internal compose hostname `postgres` (Plan 04 owns the service name).
+# Real credentials/secrets are placeholders here; Plan 04 injects via env/.env so no
+# production secret is committed (threat T-01-secrets). For self-hosted Ory there is
+# NO live config API — all config lives in this file and is applied via restart.
+
+dsn: postgres://kratos:changeme_kratos@postgres:5432/kratos?sslmode=disable
+
+serve:
+  public:
+    base_url: http://kratos:4433/
+  admin:
+    base_url: http://kratos:4434/
+
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/config/kratos/identity.schema.json
+
+selfservice:
+  default_browser_return_url: http://localhost:3000/
+  flows:
+    login:
+      ui_url: http://localhost:3000/login
+    registration:
+      ui_url: http://localhost:3000/registration
+    settings:
+      ui_url: http://localhost:3000/settings
+    error:
+      ui_url: http://localhost:3000/error
+    recovery:
+      ui_url: http://localhost:3000/recovery
+    verification:
+      ui_url: http://localhost:3000/verification
+
+secrets:
+  # PLACEHOLDER 32-char values — Plan 04 overrides via env/.env. Do NOT use in production.
+  cookie:
+    - PLACEHOLDERcookieSECRET0123456789AB
+  cipher:
+    # cipher MUST be exactly 32 characters
+    - PLACEHOLDERcipherSECRET0123456AB

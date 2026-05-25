@@ -1,0 +1,43 @@
+# config/hydra/hydra.yml
+#
+# Minimal Hydra (OAuth2/OIDC) configuration to reach healthy on first boot.
+# Mounted read-only into the container at /etc/config/hydra/ (RESEARCH Pattern 3).
+# Verified minimal key set: ory/hydra contrib/quickstart hydra.yml + configure-deploy
+# docs (RESEARCH). DSN uses internal compose hostname `postgres`.
+#
+# Self-hosted Hydra has NO live config API — config lives here, applied via restart.
+
+dsn: postgres://hydra:changeme_hydra@postgres:5432/hydra?sslmode=disable
+
+secrets:
+  # !! IMMUTABLE AFTER FIRST MIGRATION !!
+  # secrets.system is used to encrypt data at rest. Per Ory docs (RESEARCH Pitfall 3)
+  # it "must remain consistent across restarts and cannot be rotated" — changing it
+  # after Hydra has initialized its DB breaks decryption of all stored data.
+  # PLACEHOLDER value; Plan 04 injects a strong, STABLE value via env/.env before
+  # first boot. Production MUST set a strong random value once and never change it.
+  system:
+    - PLACEHOLDER_HYDRA_SYSTEM_SECRET_CHANGE_ME
+
+urls:
+  self:
+    issuer: http://localhost:4444/
+  login: http://localhost:3000/login
+  consent: http://localhost:3000/consent
+  logout: http://localhost:3000/logout
+  error: http://localhost:3000/error
+
+serve:
+  public:
+    port: 4444
+  admin:
+    port: 4445
+
+oidc:
+  subject_identifiers:
+    supported_types:
+      - public
+      - pairwise
+    pairwise:
+      # PLACEHOLDER salt — Plan 04 injects via env/.env. Stable per deployment.
+      salt: PLACEHOLDER_PAIRWISE_SALT_CHANGE_ME
