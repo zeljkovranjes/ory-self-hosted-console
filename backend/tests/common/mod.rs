@@ -180,17 +180,41 @@ secrets:
     - PLACEHOLDERcipherSECRET0123456AB
 "#;
 
+/// A valid draft-07 identity schema WITH `properties.traits` — the deterministic
+/// "last-known-good" the IDENT-03 schema-editor tests seed and assert is left
+/// untouched after a rejected PUT. Mirrors the shape of the shipped
+/// `config/kratos/identity.schema.json`.
+pub const IDENTITY_SCHEMA_FIXTURE_JSON: &str = r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Person",
+  "type": "object",
+  "properties": {
+    "traits": {
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email", "title": "E-Mail" }
+      },
+      "required": ["email"],
+      "additionalProperties": false
+    }
+  }
+}
+"#;
+
 /// A throwaway config-dir holding `kratos/kratos.yml` for the config-edit tests.
 ///
 /// The directory is removed on drop, so each `#[sqlx::test]` gets an isolated,
 /// deterministic fixture. `kratos_yml()` is the path the engine resolves from
-/// the closed `Service` enum (`<config_dir>/kratos/kratos.yml`).
+/// the closed `Service` enum (`<config_dir>/kratos/kratos.yml`). It ALSO seeds
+/// `kratos/identity.schema.json` (a valid draft-07 schema) so the IDENT-03
+/// schema-editor tests have a deterministic last-known-good file.
 pub struct ConfigFixture {
     root: std::path::PathBuf,
 }
 
 impl ConfigFixture {
-    /// Create a fresh temp config-dir seeded with the no-session/no-dsn Kratos doc.
+    /// Create a fresh temp config-dir seeded with the no-session/no-dsn Kratos doc
+    /// AND a valid identity schema file.
     pub fn new() -> Self {
         // Unique per call: pid + nanos avoids collisions across parallel tests.
         let nanos = std::time::SystemTime::now()
@@ -201,12 +225,23 @@ impl ConfigFixture {
         std::fs::create_dir_all(root.join("kratos")).expect("create temp kratos dir");
         std::fs::write(root.join("kratos").join("kratos.yml"), KRATOS_FIXTURE_YAML)
             .expect("seed temp kratos.yml");
+        std::fs::write(
+            root.join("kratos").join("identity.schema.json"),
+            IDENTITY_SCHEMA_FIXTURE_JSON,
+        )
+        .expect("seed temp identity.schema.json");
         Self { root }
     }
 
     /// Absolute path to the seeded `kratos/kratos.yml` (the engine's PUT target).
     pub fn kratos_yml(&self) -> std::path::PathBuf {
         self.root.join("kratos").join("kratos.yml")
+    }
+
+    /// Absolute path to the seeded `kratos/identity.schema.json` (the IDENT-03
+    /// schema-editor PUT target).
+    pub fn identity_schema_json(&self) -> std::path::PathBuf {
+        self.root.join("kratos").join("identity.schema.json")
     }
 
     /// The `config_dir` string to put on a test `Config`.
