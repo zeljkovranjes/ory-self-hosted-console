@@ -19,7 +19,7 @@
 
 ARG BASE_IMAGE
 
-FROM ghcr.io/tarampampam/curl:8.11.1 AS curlbin
+FROM ghcr.io/tarampampam/curl:8.11.1@sha256:8f09f048304280e0e50cc82a1f4ead45971e6e0f260011ab143576e7bf982493 AS curlbin
 
 FROM ${BASE_IMAGE}
 # Static curl — runs unmodified on distroless/static (verified: no loader needed).

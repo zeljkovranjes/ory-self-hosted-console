@@ -15,19 +15,22 @@ FROM rust:1.92-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Pre-cache dependencies: copy only the manifest, create a dummy source, and
-# build so the dependency layer is reused when only src/ changes.
-COPY Cargo.toml ./
+# Pre-cache dependencies: copy the manifest AND the committed lockfile, create a
+# dummy source, and build so the dependency layer is reused when only src/ changes.
+# --locked: resolve EXACTLY the versions pinned in Cargo.lock (CR-04). Without the
+# lockfile + --locked the build resolves transitive versions fresh from the
+# Cargo.toml ranges, defeating supply-chain reproducibility (INFRA-04).
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
     && echo 'fn main() { println!("dependency cache build"); }' > src/main.rs \
-    && cargo build --release \
+    && cargo build --release --locked \
     && rm -rf src
 
-# Now copy real sources and build the actual binary.
+# Now copy real sources and build the actual binary (still --locked).
 COPY src ./src
 # Bust the cached dummy-main artifact so the real main.rs is compiled.
 RUN touch src/main.rs \
-    && cargo build --release
+    && cargo build --release --locked
 
 # ---- curl stage ----
 # The distroless runtime ships no curl. We vendor a single STATICALLY-LINKED
@@ -42,7 +45,7 @@ RUN touch src/main.rs \
 # use ghcr.io/tarampampam/curl, a scratch image whose /bin/curl is fully static
 # (verified: runs in `scratch` with no loader), so the single copied binary runs
 # unmodified in distroless/cc.
-FROM ghcr.io/tarampampam/curl:8.11.1 AS curlbin
+FROM ghcr.io/tarampampam/curl:8.11.1@sha256:8f09f048304280e0e50cc82a1f4ead45971e6e0f260011ab143576e7bf982493 AS curlbin
 
 # ---- Stage 2: runtime ----
 # Distroless CC base: provides the minimal glibc runtime the binary needs,
