@@ -4,12 +4,12 @@
 # Mounted read-only into the container at /etc/config/kratos/ (RESEARCH Pattern 3).
 # Verified minimal key set: ory/kratos contrib/quickstart kratos.yml (RESEARCH).
 #
-# DSN uses the internal compose hostname `postgres` (Plan 04 owns the service name).
-# Real credentials/secrets are placeholders here; Plan 04 injects via env/.env so no
-# production secret is committed (threat T-01-secrets). For self-hosted Ory there is
-# NO live config API — all config lives in this file and is applied via restart.
-
-dsn: postgres://kratos:changeme_kratos@postgres:5432/kratos?sslmode=disable
+# DSN is NOT set here (WR-03): it is the SINGLE responsibility of the `DSN` env
+# var that docker-compose injects (built from KRATOS_DB_PASSWORD in .env). Keeping
+# a hardcoded `dsn:` here as well created a three-way drift hazard (init SQL +
+# this YAML + .env all had to agree) and shipped a password in committed config.
+# For all OTHER self-hosted Ory config there is NO live config API — it lives in
+# this file and is applied via restart.
 
 serve:
   public:

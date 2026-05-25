@@ -5,12 +5,14 @@
 # Verified minimal key set: ory/keto contrib/cat-videos-example keto.yml (RESEARCH).
 #
 # NOTE (RESEARCH Migration Commands): Keto's migrate subcommand is `migrate up`
-# (NOT `migrate sql`) and reads DSN from the DSN env var or this `dsn:` key — it
-# does NOT accept the `-e` flag. DSN here uses internal compose hostname `postgres`.
+# (NOT `migrate sql`) and reads DSN from the DSN env var — it does NOT accept the
+# `-e` flag. Both the keto-migrate and keto serve containers receive `DSN` via
+# docker-compose (built from KETO_DB_PASSWORD in .env).
 #
-# Self-hosted Keto has NO live config API — namespaces/OPL live in files, applied via restart.
-
-dsn: postgres://keto:changeme_keto@postgres:5432/keto?sslmode=disable
+# DSN is NOT set here (WR-03): the injected `DSN` env var is the single source of
+# truth. A duplicate hardcoded `dsn:` here shipped a password in committed config
+# and could drift from .env. Self-hosted Keto has NO live config API — namespaces/
+# OPL live in files, applied via restart.
 
 namespaces:
   # OPL namespaces definitions file Keto loads at start (Pitfall 6: must be valid).

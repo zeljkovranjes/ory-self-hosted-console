@@ -3,11 +3,13 @@
 # Minimal Hydra (OAuth2/OIDC) configuration to reach healthy on first boot.
 # Mounted read-only into the container at /etc/config/hydra/ (RESEARCH Pattern 3).
 # Verified minimal key set: ory/hydra contrib/quickstart hydra.yml + configure-deploy
-# docs (RESEARCH). DSN uses internal compose hostname `postgres`.
+# docs (RESEARCH).
 #
-# Self-hosted Hydra has NO live config API — config lives here, applied via restart.
-
-dsn: postgres://hydra:changeme_hydra@postgres:5432/hydra?sslmode=disable
+# DSN is NOT set here (WR-03): the `DSN` env var injected by docker-compose (built
+# from HYDRA_DB_PASSWORD in .env) is the single source of truth. A duplicate
+# hardcoded `dsn:` here shipped a password in committed config and could drift
+# from .env. Self-hosted Hydra has NO live config API — all OTHER config lives
+# here, applied via restart.
 
 secrets:
   # !! IMMUTABLE AFTER FIRST MIGRATION !!
