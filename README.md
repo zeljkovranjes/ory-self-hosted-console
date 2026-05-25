@@ -200,6 +200,65 @@ GitHub env-gating (404 + `github_oauth_enabled:false` when unconfigured).
 
 ---
 
+## Service config editing (Phase 4)
+
+Self-hosted Ory has **no live config API** — each service's settings live in a
+mounted YAML file (`config/<svc>/...`) and take effect only on restart. Phase 4
+adds the backend's transactional config-edit engine behind authenticated
+`GET`/`PUT /api/config/<service>/<section>`: it loads the current YAML, applies
+only the changes whose JSON-Pointer paths are on a code-defined per-section
+**allowlist**, validates the FULL merged doc against the service's JSON Schema
+*before* writing, atomically writes it, restarts **only the affected container**
+via the scoped restart broker, polls `/health/ready`, and — if the service fails
+to come back healthy — **rolls back to the last-known-good** `.bak` and restarts
+again. Sensitive keys (`dsn`, `secrets.*`, `serve.admin`, TLS keys, the SMTP
+connection URI) are rejected (403) regardless of schema validity; the engine
+never writes the env-injected `dsn` to disk.
+
+Verify the whole flow against the live stack:
+
+```bash
+docker compose down -v
+MSYS_NO_PATHCONV=1 docker compose build backend
+MSYS_NO_PATHCONV=1 docker compose up -d --wait
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase4-acceptance.sh   # Git Bash on Windows
+docker compose down -v
+git checkout config/kratos/kratos.yml   # restore the file the live apply mutated
+```
+
+The gate exits `0` only when all four criteria pass: a valid
+`/session/lifespan="24h"` edit applies (200) and restarts **only** `ory-kratos`
+(the other three containers' `StartedAt` are unchanged) and Kratos comes back
+healthy and a follow-up GET reflects the new value; an invalid value is rejected
+`422` with no disk write; a sensitive/out-of-scope key is rejected `403` with no
+disk write; and a health-breaking value triggers an auto-rollback to the
+last-known-good with the service recovering.
+
+### Caveats (read before editing config in production)
+
+- **Windows / Docker Desktop bind-mount rename atomicity.** The engine writes
+  via *temp-file-in-the-same-dir → fsync → atomic rename*, which is atomic on
+  native Linux filesystems. On **Windows + Docker Desktop**, `config/` is a host
+  bind mount surfaced through the WSL2/9P file-sharing layer, where the rename is
+  **not guaranteed atomic** and an interrupted write could in theory leave a
+  partial file. The backup-and-rollback path is the safety net (a failed health
+  check restores the `.bak`), but for production we recommend placing `config/`
+  on a **native-Linux / WSL2 path or a named Docker volume** rather than a
+  Windows-host bind mount. (Run the verification harness and compose commands
+  from a bash shell with `MSYS_NO_PATHCONV=1` on Git Bash — see the Windows notes
+  below.)
+- **YAML comments are not preserved across an edit.** The engine round-trips the
+  file through a structured (serde) model, so it preserves keys and values but
+  **drops comments** and applies a normalized key ordering on write. Keep any
+  human-authored documentation for a config value out-of-band (e.g. in this repo
+  / your runbook), not as inline comments in a console-editable file.
+- **Restart-broker security posture (unchanged from Phase 1).** Config edits
+  restart services only through the least-privilege `wollomatic/socket-proxy`
+  broker (restart-only, four-container scope, `-allowfrom=backend`); the backend
+  holds no Docker socket. The broker has no TLS and a restart is itself a limited
+  DoS primitive — both documented and accepted residual risks (`T-notls-broker`,
+  `T-restart-dos`) under "Security model & documented residual risks" above.
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:

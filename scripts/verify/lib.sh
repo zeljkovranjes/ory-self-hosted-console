@@ -611,6 +611,197 @@ assert_json_ok() {
   return 1
 }
 
+# =============================================================================
+# Phase 4 config-edit assert helpers (live-stack restart-scope / rollback /
+# overlay-not-persisted). Every NEGATIVE/idempotence helper obeys the
+# anti-false-green contract (T-04-17): PASS only on the explicit expected
+# condition, never merely because output is empty.
+# =============================================================================
+
+# --- _started_at <container> -------------------------------------------------
+# Echo a container's `.State.StartedAt` (an RFC3339 timestamp that changes on
+# every (re)start). Empty if the container is absent. Used to prove that ONLY
+# the affected service restarted (BACK-05/INFRA-05, T-04-18).
+_started_at() {
+  docker inspect -f '{{.State.StartedAt}}' "$1" 2>/dev/null || true
+}
+
+# --- snapshot_started_at <svc...> / assert_only_container_restarted ----------
+# Capture each container's `.State.StartedAt` into a `BEFORE_<name>` var, then
+# after the action assert ONLY the named service restarted (its StartedAt
+# CHANGED) and every "other" service is UNCHANGED. An empty timestamp (container
+# vanished) FAILs — we never green on absence (T-04-18).
+#
+# Caller pattern:
+#   snapshot_started_at ory-kratos ory-hydra ory-keto ory-oathkeeper
+#   <do the PUT that restarts ory-kratos>
+#   assert_only_container_restarted ory-kratos ory-hydra ory-keto ory-oathkeeper
+_bk_var() { printf 'BEFORE_%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+
+snapshot_started_at() {
+  local svc var val
+  for svc in "$@"; do
+    var="$(_bk_var "$svc")"
+    val="$(_started_at "$svc")"
+    eval "$var=\$val"
+  done
+}
+
+assert_only_container_restarted() {
+  local restarted="$1"; shift
+  local ok=1
+  local before_var before after
+  before_var="$(_bk_var "$restarted")"
+  eval "before=\${$before_var:-}"
+  after="$(_started_at "$restarted")"
+  if [ -z "$before" ] || [ -z "$after" ]; then
+    _fail "assert_only_container_restarted: '$restarted' StartedAt missing (before='$before' after='$after')"
+    return 1
+  fi
+  if [ "$before" = "$after" ]; then
+    _fail "assert_only_container_restarted: '$restarted' did NOT restart (StartedAt unchanged: $after)"
+    ok=0
+  fi
+  local other ob_var ob oa
+  for other in "$@"; do
+    ob_var="$(_bk_var "$other")"
+    eval "ob=\${$ob_var:-}"
+    oa="$(_started_at "$other")"
+    if [ -z "$ob" ] || [ -z "$oa" ]; then
+      _fail "assert_only_container_restarted: '$other' StartedAt missing (before='$ob' after='$oa')"
+      ok=0
+      continue
+    fi
+    if [ "$ob" != "$oa" ]; then
+      _fail "assert_only_container_restarted: '$other' ALSO restarted (StartedAt changed: $ob -> $oa)"
+      ok=0
+    fi
+  done
+  if [ "$ok" = "1" ]; then
+    _pass "assert_only_container_restarted: ONLY '$restarted' restarted; $* unchanged"
+    return 0
+  fi
+  return 1
+}
+
+# --- wait_container_healthy <container> [timeout_s] --------------------------
+# Poll a container's Docker `.State.Health.Status` until it is `healthy` or the
+# timeout elapses. After a broker restart Docker reports `starting` for a few
+# seconds before the healthcheck flips to `healthy`; a bare assert_healthy can
+# race that window. PASS when it reaches `healthy`; FAIL (with the last observed
+# status) on timeout — never green on absence.
+wait_container_healthy() {
+  local ctr="$1" timeout="${2:-60}" waited=0 status=""
+  while [ "$waited" -lt "$timeout" ]; do
+    status="$(docker inspect -f '{{.State.Health.Status}}' "$ctr" 2>/dev/null || echo '')"
+    if [ "$status" = "healthy" ]; then
+      _pass "wait_container_healthy $ctr: healthy after ${waited}s"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  _fail "wait_container_healthy $ctr: NOT healthy within ${timeout}s (last status='$status')"
+  return 1
+}
+
+# --- _file_digest <path> -----------------------------------------------------
+# sha256 of a file's bytes (empty if absent). Prefers sha256sum, then openssl,
+# then node (always present per CLAUDE.md).
+_file_digest() {
+  local path="$1"
+  if [ ! -f "$path" ]; then printf ''; return 0; fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | cut -d' ' -f1
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$path" | sed 's/.*= //'
+  elif _have_node; then
+    PATH_ARG="$path" node -e '
+      const fs=require("fs"),c=require("crypto");
+      const p=process.env.PATH_ARG;
+      process.stdout.write(c.createHash("sha256").update(fs.readFileSync(p)).digest("hex"));'
+  else
+    printf ''
+  fi
+}
+
+# --- snapshot_file <path> / assert_file_unchanged <path> ---------------------
+# Capture a file's sha256 (snapshot_file), perform the action, then assert the
+# file still exists AND is byte-identical (assert_file_unchanged). A missing
+# file or a changed digest FAILs (T-04-17: a reject must not touch disk).
+_file_var() { printf 'BEFORE_FILE_%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+
+snapshot_file() {
+  local path="$1" var val
+  var="$(_file_var "$path")"
+  val="$(_file_digest "$path")"
+  eval "$var=\$val"
+}
+
+assert_file_unchanged() {
+  local path="$1" var before after
+  var="$(_file_var "$path")"
+  eval "before=\${$var:-}"
+  after="$(_file_digest "$path")"
+  if [ -z "$before" ]; then
+    _fail "assert_file_unchanged $path: no snapshot taken (call snapshot_file first)"
+    return 1
+  fi
+  if [ -z "$after" ]; then
+    _fail "assert_file_unchanged $path: file missing after action (cannot confirm no-write)"
+    return 1
+  fi
+  if [ "$before" = "$after" ]; then
+    _pass "assert_file_unchanged $path: byte-identical (no disk write)"
+    return 0
+  fi
+  _fail "assert_file_unchanged $path: file CHANGED (a reject wrote to disk!)"
+  return 1
+}
+
+# --- assert_rolled_back <path> <backup> --------------------------------------
+# After a health-breaking edit the engine restores the last-known-good `.bak`.
+# PASS only when <path> + <backup> both exist AND their sha256 digests match
+# (the live file is byte-equal to the backup -> rolled back). Any mismatch or a
+# missing file FAILs (T-04-19).
+assert_rolled_back() {
+  local path="$1" backup="$2" dpath dbak
+  dpath="$(_file_digest "$path")"
+  dbak="$(_file_digest "$backup")"
+  if [ -z "$dpath" ]; then
+    _fail "assert_rolled_back $path: live file missing (cannot confirm rollback)"
+    return 1
+  fi
+  if [ -z "$dbak" ]; then
+    _fail "assert_rolled_back: backup '$backup' missing (cannot confirm rollback)"
+    return 1
+  fi
+  if [ "$dpath" = "$dbak" ]; then
+    _pass "assert_rolled_back $path: restored byte-equal to last-known-good ($backup)"
+    return 0
+  fi
+  _fail "assert_rolled_back $path: live file does NOT match the backup (not rolled back)"
+  return 1
+}
+
+# --- assert_no_dsn_in_file <path> --------------------------------------------
+# Prove the env-overlay validation was VALIDATION-ONLY and never persisted: the
+# written YAML must contain NO top-level `dsn:` key (T-04-25). PASS only when the
+# file exists AND no uncommented top-level `dsn:` line is present.
+assert_no_dsn_in_file() {
+  local path="$1"
+  if [ ! -f "$path" ]; then
+    _fail "assert_no_dsn_in_file $path: file does not exist"
+    return 1
+  fi
+  if grep -Ev '^[[:space:]]*#' "$path" | grep -Eq '^dsn[[:space:]]*:'; then
+    _fail "assert_no_dsn_in_file $path: a top-level 'dsn:' key IS present (overlay leaked to disk!)"
+    return 1
+  fi
+  _pass "assert_no_dsn_in_file $path: no top-level dsn key (overlay never persisted)"
+  return 0
+}
+
 # --- summary -----------------------------------------------------------------
 # Print totals and set the conventional exit code. The sourcing script should
 # call `summary; exit $?` (or `exit $(summary >/dev/null; echo $?)`).

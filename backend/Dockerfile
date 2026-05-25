@@ -45,6 +45,12 @@ COPY migrations ./migrations
 
 # Now copy real sources and build the actual binary (still --locked, offline).
 COPY src ./src
+# Phase 4 (config-edit) embeds the four Ory service config schemas + the five
+# `ory://` sub-schemas at compile time via `include_str!("../../config/schemas/…")`
+# (resolves to /app/config/schemas/…). They MUST be present before the real
+# build or the lib fails to compile (os error 2: no such file). The dep-cache
+# stub above does not need them (it builds an empty lib.rs).
+COPY config ./config
 # Bust the cached dummy artifacts so BOTH the real lib and bin are recompiled
 # (the bin depends on the lib crate, so a stale stub lib.rs would break it).
 RUN touch src/lib.rs src/main.rs \
