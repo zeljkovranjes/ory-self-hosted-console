@@ -151,3 +151,81 @@ pub async fn csrf_for_raw_token(pool: &PgPool, raw_token: &str) -> String {
     .expect("session row for raw token");
     row.csrf_token
 }
+
+// --- Config-edit temp fixture (Phase 4 BACK-04 / BACK-06) --------------------
+
+/// The live no-`session:`/no-`dsn` Kratos doc, mirrored verbatim for the
+/// config-edit integration tests so "file unchanged"/"no disk write" assertions
+/// run against a deterministic TEMP file (never the live mount, and never the
+/// real broker). The shape matches `config/kratos/kratos.yml`: it OMITS `dsn`
+/// (env-injected at runtime) and ships NO `session:` block (so a `/session/...`
+/// edit exercises the absent-parent path), while carrying `secrets` + `serve`
+/// (so a GET must omit them — they are not allowlisted).
+pub const KRATOS_FIXTURE_YAML: &str = r#"serve:
+  public:
+    base_url: http://kratos:4433/
+  admin:
+    base_url: http://kratos:4434/
+
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/config/kratos/identity.schema.json
+
+secrets:
+  cookie:
+    - PLACEHOLDERcookieSECRET0123456789AB
+  cipher:
+    - PLACEHOLDERcipherSECRET0123456AB
+"#;
+
+/// A throwaway config-dir holding `kratos/kratos.yml` for the config-edit tests.
+///
+/// The directory is removed on drop, so each `#[sqlx::test]` gets an isolated,
+/// deterministic fixture. `kratos_yml()` is the path the engine resolves from
+/// the closed `Service` enum (`<config_dir>/kratos/kratos.yml`).
+pub struct ConfigFixture {
+    root: std::path::PathBuf,
+}
+
+impl ConfigFixture {
+    /// Create a fresh temp config-dir seeded with the no-session/no-dsn Kratos doc.
+    pub fn new() -> Self {
+        // Unique per call: pid + nanos avoids collisions across parallel tests.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ory-cfg-test-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(root.join("kratos")).expect("create temp kratos dir");
+        std::fs::write(root.join("kratos").join("kratos.yml"), KRATOS_FIXTURE_YAML)
+            .expect("seed temp kratos.yml");
+        Self { root }
+    }
+
+    /// Absolute path to the seeded `kratos/kratos.yml` (the engine's PUT target).
+    pub fn kratos_yml(&self) -> std::path::PathBuf {
+        self.root.join("kratos").join("kratos.yml")
+    }
+
+    /// The `config_dir` string to put on a test `Config`.
+    pub fn config_dir(&self) -> String {
+        self.root.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for ConfigFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A test `Config` whose `config_dir` points at a [`ConfigFixture`] temp dir, so
+/// the config-edit routes read/write the fixture rather than the live mount.
+pub fn cfg_with_config_dir(config_dir: String) -> ory_console_backend::config::Config {
+    ory_console_backend::config::Config {
+        config_dir,
+        ..default_test_cfg()
+    }
+}
