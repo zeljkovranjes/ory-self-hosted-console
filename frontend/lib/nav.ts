@@ -58,8 +58,10 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "Users",
         href: "/users",
         icon: Users,
-        built: false,
-        comingIn: "Phase 6",
+        // Phase 6 delivered the real Users pages (list/detail/create/edit,
+        // schema editor, bulk import), so /users routes to the feature, not the
+        // "coming in a later phase" placeholder.
+        built: true,
       },
       {
         slug: "authentication",
