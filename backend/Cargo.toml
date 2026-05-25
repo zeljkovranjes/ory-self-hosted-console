@@ -1,0 +1,29 @@
+[package]
+name = "ory-console-backend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Ory Self-Hosted Console backend (Phase 1 skeleton — single API layer the frontend talks to; real implementation lands in Phase 2)."
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ory-console-backend"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned per CLAUDE.md (authoritative). Salvo is the operator-mandated web
+# framework (override of Axum/Actix) — do NOT switch.
+salvo = { version = "0.93.0", features = ["server", "http1"] }
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Smaller, faster-to-ship release binary for the runtime image stage.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

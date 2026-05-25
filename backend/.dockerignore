@@ -1,0 +1,14 @@
+# Build artifacts — never ship the host target/ into the image build context.
+target/
+**/*.rs.bk
+
+# Local env / secrets must never enter the build context (T-02-secrets-in-image).
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
