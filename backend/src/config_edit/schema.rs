@@ -124,8 +124,22 @@ fn service_schema_str(service: &str) -> Option<&'static str> {
 ///   to define `properties.traits` as an object. If `properties` is absent/not an
 ///   object, or `properties.traits` is absent/not an object, push a single
 ///   `FieldError` at `/properties/traits`.
+/// - **Layer 3 (external-reference rejection, WR-02 / T-04-01 latent SSRF):** an
+///   operator-supplied schema is written to `identity.schema.json` and then loaded
+///   by Kratos. A `$ref` pointing at `file://`, `http(s)://`, or any other
+///   non-same-document URI would make Kratos RESOLVE (dereference) a remote/file
+///   reference. We refuse any `$ref` that is not a same-document JSON-Pointer
+///   fragment (`#`/`#/…`), pushing a value-free `FieldError` at the offending
+///   pointer. This closes the schema-injection surface at the layer that WRITES
+///   the file rather than relying on the downstream resolver + health-rollback as
+///   the only guard. NOTE: we deliberately restrict `$ref` (the keyword that
+///   triggers DEREFERENCING) and NOT `$id`. In draft-07 `$id` is a non-resolving
+///   document identifier — the shipped Ory starter schemas and the editor presets
+///   legitimately set `$id` to a `https://schemas.ory.sh/…` label that Kratos
+///   never fetches. Because every external `$ref` is rejected, an `$id` base-URI
+///   cannot be exploited to smuggle a relative ref to an external resource.
 ///
-/// Returns `Ok(())` only when BOTH layers pass; otherwise `Err(non-empty Vec)`
+/// Returns `Ok(())` only when ALL layers pass; otherwise `Err(non-empty Vec)`
 /// with every collected violation. No offending value is ever included.
 pub fn validate_identity_schema(candidate: &Value) -> Result<(), Vec<FieldError>> {
     let mut errors: Vec<FieldError> = Vec::new();
@@ -169,10 +183,62 @@ pub fn validate_identity_schema(candidate: &Value) -> Result<(), Vec<FieldError>
         });
     }
 
+    // --- Layer 3: reject any external/non-local $ref (WR-02) ------------------
+    // Walk the whole candidate and refuse a `$ref` whose value is not a
+    // same-document JSON-Pointer fragment. This runs regardless of Layers 1/2 so
+    // every offending reference is reported in one pass.
+    reject_external_refs(candidate, String::new(), &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// True when a `$ref` string is a SAFE same-document reference — i.e. a
+/// JSON-Pointer fragment (`#` or `#/…`). Anything else (an absolute URI such as
+/// `file://`, `http(s)://`, `urn:`, a bare relative path, or an empty string) is
+/// treated as external and rejected (WR-02). The match is intentionally strict:
+/// only a leading `#` is allowed.
+fn is_local_reference(value: &str) -> bool {
+    value == "#" || value.starts_with("#/")
+}
+
+/// Recursively walk `node`, pushing a value-free [`FieldError`] for every `$ref`
+/// whose VALUE is not a same-document fragment (WR-02). `pointer` is the RFC-6901
+/// JSON-Pointer of `node` within the candidate schema, used for the error path so
+/// the operator can locate the offending reference. The offending value itself is
+/// never placed in the message (BACK-07 / T-04-03).
+fn reject_external_refs(node: &Value, pointer: String, errors: &mut Vec<FieldError>) {
+    match node {
+        Value::Object(map) => {
+            if let Some(v) = map.get("$ref") {
+                // A `$ref` MUST be a string; a non-string is itself invalid and a
+                // non-local string is an external (dereferencing) reference.
+                let ok = v.as_str().map(is_local_reference).unwrap_or(false);
+                if !ok {
+                    errors.push(FieldError {
+                        path: format!("{pointer}/$ref"),
+                        message:
+                            "$ref must be a same-document fragment (\"#\" or \"#/…\"); \
+                             external references (file://, http(s)://, …) are not allowed"
+                                .to_string(),
+                    });
+                }
+            }
+            for (k, child) in map {
+                // RFC-6901 escaping for the child token: ~ -> ~0, / -> ~1.
+                let escaped = k.replace('~', "~0").replace('/', "~1");
+                reject_external_refs(child, format!("{pointer}/{escaped}"), errors);
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                reject_external_refs(child, format!("{pointer}/{i}"), errors);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -357,6 +423,19 @@ fn set_pointer(root: &mut Value, pointer: &str, value: Value) {
         if last {
             if let Value::Object(map) = cur {
                 map.insert(token.clone(), value);
+            } else {
+                // WR-03: the final-token parent is not an object, so the overlay
+                // value cannot be inserted. For the current single-level keys (e.g.
+                // `/dsn` onto the always-object root) this is unreachable, but a
+                // future multi-segment env-injected key whose parent slot is a
+                // scalar would otherwise be DROPPED silently — producing a spurious
+                // 422 or validating a doc that differs from the operator's intent.
+                // Emit an error-level trace (value-free) so the no-op is observable.
+                tracing::error!(
+                    pointer = %pointer,
+                    "config validation overlay: parent at final token is not an object; \
+                     env-injected key was not applied"
+                );
             }
             return;
         }
@@ -615,6 +694,98 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.path == "/properties/traits"),
             "missing properties must surface the traits requirement; got {errs:?}"
+        );
+    }
+
+    // --- WR-02: external $ref rejection (latent SSRF / schema injection) ------
+
+    #[test]
+    fn layer3_rejects_http_ref() {
+        // A draft-07-VALID schema (with properties.traits) carrying an http(s)
+        // $ref must be rejected: Kratos would dereference it on load.
+        let bad = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "traits": {
+                    "type": "object",
+                    "properties": { "x": { "$ref": "http://attacker.example/x" } }
+                }
+            }
+        });
+        let errs = validate_identity_schema(&bad).expect_err("http $ref must be rejected");
+        assert!(
+            errs.iter().any(|e| e.path.ends_with("/$ref")),
+            "expected a $ref field error; got {errs:?}"
+        );
+        // Value-free: the offending URL must not appear in any message (BACK-07).
+        for e in &errs {
+            assert!(
+                !e.message.contains("attacker.example"),
+                "message must not echo the offending ref value: {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn layer3_rejects_file_ref() {
+        // A `file://` $ref (local file disclosure) must be rejected.
+        let bad = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "traits": { "type": "object", "$ref": "file:///etc/passwd" }
+            }
+        });
+        let errs = validate_identity_schema(&bad).expect_err("file:// $ref must be rejected");
+        assert!(
+            errs.iter().any(|e| e.path.ends_with("/$ref")),
+            "expected a $ref field error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn layer3_allows_local_fragment_ref() {
+        // A same-document JSON-Pointer fragment $ref is allowed (self-contained).
+        let ok = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "definitions": { "Email": { "type": "string", "format": "email" } },
+            "properties": {
+                "traits": {
+                    "type": "object",
+                    "properties": { "email": { "$ref": "#/definitions/Email" } },
+                    "required": ["email"]
+                }
+            }
+        });
+        assert!(
+            validate_identity_schema(&ok).is_ok(),
+            "a self-contained #/… fragment $ref must validate"
+        );
+    }
+
+    #[test]
+    fn layer3_allows_https_id_label() {
+        // `$id` is a non-resolving document identifier in draft-07; the shipped
+        // Ory starter schema + presets legitimately set a `https://schemas.ory.sh`
+        // $id. It must NOT be rejected (only $ref dereferences).
+        let ok = json!({
+            "$id": "https://schemas.ory.sh/presets/identity.schema.json",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "traits": {
+                    "type": "object",
+                    "properties": { "email": { "type": "string" } },
+                    "required": ["email"]
+                }
+            }
+        });
+        assert!(
+            validate_identity_schema(&ok).is_ok(),
+            "a non-resolving https $id label must be allowed (shipped-schema parity)"
         );
     }
 
