@@ -22,7 +22,7 @@ export default function RootLayout({
   // single app-wide toast surface (UI-SPEC §3 transient success).
   return (
     <html lang="en" suppressHydrationWarning>
-      <body>
+      <body className="antialiased">
         <Providers>{children}</Providers>
         <Toaster />
       </body>
