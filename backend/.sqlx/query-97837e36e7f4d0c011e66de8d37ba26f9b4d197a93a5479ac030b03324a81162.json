@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE console_settings\n        SET initialized = true, bootstrap_token_hash = NULL\n        WHERE id = true AND initialized = false\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "97837e36e7f4d0c011e66de8d37ba26f9b4d197a93a5479ac030b03324a81162"
+}

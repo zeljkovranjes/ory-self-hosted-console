@@ -23,8 +23,10 @@ pub async fn is_initialized(pool: &PgPool) -> Result<bool, AppError> {
     Ok(row.map(|r| r.initialized).unwrap_or(false))
 }
 
-/// Count existing admins. Used at boot to decide whether to generate a
-/// first-run bootstrap token.
+/// Count existing admins. IN-01: now WIRED — used by the GitHub callback's
+/// verified-primary-email fallback (WR-04) to assert that email-based linking
+/// only ever binds to the SINGLE v1 admin (never an ambiguous match once Phase
+/// 11 introduces multiple admins).
 pub async fn count_admins(pool: &PgPool) -> Result<i64, AppError> {
     let row = sqlx::query!(r#"SELECT COUNT(*) AS "count!" FROM admins"#)
         .fetch_one(pool)
@@ -85,7 +87,11 @@ pub async fn mark_initialized(pool: &PgPool) -> Result<(), AppError> {
 }
 
 /// Insert a new local admin with an Argon2id PHC password hash. Returns the new
-/// admin id. Used by `/setup` (CAUTH-03).
+/// admin id. Used by test seeding and (historically) `/setup`.
+///
+/// WR-03: a unique-constraint violation (`23505` on `email`/`github_user_id`, or
+/// the `admins_single_row_guard` cap) maps to a 4xx conflict instead of a 500 —
+/// a duplicate is a client/state condition, not a server fault.
 pub async fn insert_admin(
     pool: &PgPool,
     email: &str,
@@ -103,8 +109,121 @@ pub async fn insert_admin(
         password_hash
     )
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(map_unique_violation)?;
     Ok(row.id)
+}
+
+/// Map a Postgres unique-constraint violation (SQLSTATE `23505`) to a 4xx
+/// conflict (`AppError::BadRequest`); any other sqlx error stays a 500-class
+/// `AppError::Db`. Centralizes WR-03 so every admin-write path classifies a
+/// duplicate the same way. The message is operator-safe (no secret, no raw
+/// constraint detail beyond the generic cause).
+fn map_unique_violation(e: sqlx::Error) -> AppError {
+    match e.as_database_error().and_then(|d| d.code()).as_deref() {
+        Some("23505") => {
+            AppError::BadRequest("email or github account already in use".into())
+        }
+        _ => AppError::Db(e),
+    }
+}
+
+/// CR-01: atomically create the first console admin and close the setup window
+/// in ONE transaction. This is the SOLE path `/setup` uses to create an admin.
+///
+/// Steps inside the transaction (all-or-nothing):
+///   1. `SELECT ... FOR UPDATE` the `console_settings` singleton (serializes
+///      concurrent `/setup` POSTs on the row lock).
+///   2. Re-check `initialized` INSIDE the lock — abort with `NotFound` (404,
+///      matching the post-init guard) if already initialized.
+///   3. Verify the submitted bootstrap token against the stored hash; abort
+///      `Forbidden` on mismatch / no stored hash.
+///   4. Belt-and-suspenders: abort `Forbidden` if any admin already exists.
+///   5. INSERT the admin (the `admins_single_row_guard` unique index is the hard
+///      DB cap; a violation maps to a 4xx via `map_unique_violation`).
+///   6. Conditional `UPDATE ... WHERE initialized = false` — MUST affect exactly
+///      one row, else abort (a concurrent winner already flipped it).
+///   7. Commit. Two concurrent valid-token POSTs therefore yield EXACTLY one
+///      admin: the loser blocks on the row lock, then sees `initialized = true`
+///      at step 2 (or a 0-row update at step 6) and is rejected.
+///
+/// `verify_token` is injected (the constant-time SHA-256 compare lives in the
+/// auth layer) to keep this module free of the crypto dependency.
+pub async fn create_first_admin_atomic(
+    pool: &PgPool,
+    submitted_token: &str,
+    email: &str,
+    name: &str,
+    password_hash: &str,
+    verify_token: impl Fn(&str, &str) -> bool,
+) -> Result<Uuid, AppError> {
+    let mut tx = pool.begin().await?;
+
+    // 1 + 2: lock the singleton and re-check inside the lock. No row => not in a
+    // setup state at all (fail-closed Forbidden); initialized => closed (404).
+    let row = sqlx::query!(
+        r#"
+        SELECT initialized, bootstrap_token_hash
+        FROM console_settings
+        WHERE id = true
+        FOR UPDATE
+        "#
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+
+    if row.initialized {
+        return Err(AppError::NotFound);
+    }
+
+    // 3: constant-time token verify against the stored hash.
+    let stored = row.bootstrap_token_hash.ok_or(AppError::Forbidden)?;
+    if !verify_token(submitted_token, &stored) {
+        return Err(AppError::Forbidden);
+    }
+
+    // 4: belt-and-suspenders — refuse if an admin somehow already exists.
+    let existing = sqlx::query!(r#"SELECT COUNT(*) AS "count!" FROM admins"#)
+        .fetch_one(&mut *tx)
+        .await?;
+    if existing.count > 0 {
+        return Err(AppError::Forbidden);
+    }
+
+    // 5: insert the admin (hard DB cap = admins_single_row_guard unique index).
+    let inserted = sqlx::query!(
+        r#"
+        INSERT INTO admins (email, name, password_hash)
+        VALUES ($1, $2, $3)
+        RETURNING id
+        "#,
+        email,
+        name,
+        password_hash
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(map_unique_violation)?;
+
+    // 6: conditional close — must flip exactly one row, else a concurrent winner
+    // already initialized the console; abort so we never produce a 2nd admin.
+    let flipped = sqlx::query!(
+        r#"
+        UPDATE console_settings
+        SET initialized = true, bootstrap_token_hash = NULL
+        WHERE id = true AND initialized = false
+        "#
+    )
+    .execute(&mut *tx)
+    .await?;
+    if flipped.rows_affected() != 1 {
+        return Err(AppError::Forbidden);
+    }
+
+    // 7: commit the all-or-nothing first-run transaction.
+    tx.commit().await?;
+    Ok(inserted.id)
 }
 
 /// Fetch an admin by (case-insensitive) email, if present. Used by `/login`.
@@ -286,4 +405,16 @@ pub async fn delete_sessions_for_admin(pool: &PgPool, admin_id: Uuid) -> Result<
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// WR-07: reap sessions past their absolute `expires_at`. Run periodically by
+/// the background reaper task in `main.rs` to bound `sessions` growth (abandoned
+/// sessions are never logged out, so without this the table grows without
+/// bound). Idle-expired-but-not-absolutely-expired rows are left for the next
+/// pass once they cross `expires_at`. Returns the number of rows deleted.
+pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64, AppError> {
+    let result = sqlx::query!("DELETE FROM sessions WHERE expires_at <= now()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }

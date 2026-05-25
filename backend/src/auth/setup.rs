@@ -17,6 +17,7 @@ use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::auth::validate::{validate_email, validate_name};
 use crate::auth::{password, session};
 use crate::config::Config;
 use crate::db::queries;
@@ -119,25 +120,31 @@ pub async fn setup(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
         .or(header_token)
         .ok_or(AppError::Forbidden)?;
 
+    // WR-02: validate + normalize the operator-supplied fields BEFORE any DB
+    // work. A normalized (trimmed, lowercased) email is what gets persisted and
+    // is what the GitHub email-fallback link later compares against.
+    let email = validate_email(&body.email)?;
+    let name = validate_name(&body.name)?;
+
     // Password policy BEFORE touching secrets/DB.
     password::enforce_password_policy(&body.password)?;
 
-    // Load the stored bootstrap hash. No row / no hash => not in a setup state.
-    let settings = queries::get_console_settings(&pool)
-        .await?
-        .ok_or(AppError::Forbidden)?;
-    let stored_hash = settings.bootstrap_token_hash.ok_or(AppError::Forbidden)?;
-
-    // Constant-time verify; generic 403 on mismatch (no field disclosure).
-    if !password::verify_token_ct(&submitted, &stored_hash) {
-        return Err(AppError::Forbidden);
-    }
-
-    // Create the local admin with an Argon2id hash, flip initialized, mint a
-    // fresh session (regenerate-on-auth), set the hardened cookie.
+    // CR-01: create the admin and close the setup window ATOMICALLY in a single
+    // transaction (row-locked re-check of `initialized` + conditional flip + a
+    // belt-and-suspenders empty-admins check + the hard `admins_single_row_guard`
+    // DB cap). Two concurrent valid-token POSTs therefore yield exactly one
+    // admin. The constant-time token verify is injected so the DB layer stays
+    // crypto-free. A unique-violation surfaces as a 4xx (WR-03).
     let pw_hash = password::hash_password(&body.password)?;
-    let admin_id = queries::insert_admin(&pool, &body.email, &body.name, &pw_hash).await?;
-    queries::mark_initialized(&pool).await?;
+    let admin_id = queries::create_first_admin_atomic(
+        &pool,
+        &submitted,
+        &email,
+        &name,
+        &pw_hash,
+        password::verify_token_ct,
+    )
+    .await?;
 
     let ip = req.remote_addr().to_string();
     let user_agent = req.header::<String>("user-agent");
@@ -154,8 +161,8 @@ pub async fn setup(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
     res.status_code(StatusCode::CREATED);
     res.render(Json(AdminDto {
         id: admin_id.to_string(),
-        email: body.email,
-        name: body.name,
+        email,
+        name,
     }));
     Ok(())
 }

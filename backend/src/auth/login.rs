@@ -12,6 +12,7 @@ use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::auth::validate::validate_email;
 use crate::auth::{password, session};
 use crate::config::Config;
 use crate::db::queries;
@@ -49,9 +50,18 @@ pub async fn login(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
         .await
         .map_err(|_| AppError::BadRequest("invalid JSON body".into()))?;
 
+    // WR-02: normalize the email the SAME way `/setup` did before persisting, so
+    // the lookup key matches the stored value (trim + lowercase). A malformed
+    // email collapses to the generic 401 — never disclose validation detail on a
+    // credential endpoint (T-02-11), so we do not surface a 400 here.
+    let email = match validate_email(&body.email) {
+        Ok(e) => e,
+        Err(_) => return Err(AppError::Unauthorized),
+    };
+
     // Look up the admin. A missing admin and a wrong password both collapse to
     // the SAME generic 401 (no field disclosure, T-02-11).
-    let admin = queries::get_admin_by_email(&pool, &body.email).await?;
+    let admin = queries::get_admin_by_email(&pool, &email).await?;
     let admin = match admin {
         Some(a) => a,
         None => return Err(AppError::Unauthorized),

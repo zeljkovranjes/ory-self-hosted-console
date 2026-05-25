@@ -138,6 +138,105 @@ async fn setup_after_init_returns_404(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn concurrent_setup_creates_exactly_one_admin(pool: PgPool) {
+    // CR-01: two concurrent valid-token POST /setup requests must result in
+    // EXACTLY one admin (the atomic FOR UPDATE + conditional flip serializes
+    // them; the loser sees `initialized = true` and is rejected).
+    let raw = seed_bootstrap_token(&pool).await;
+    let service = std::sync::Arc::new(Service::new(common::build_test_router(pool.clone())));
+
+    let mk = |email: &'static str, svc: std::sync::Arc<Service>, token: String| async move {
+        TestClient::post("http://127.0.0.1:8080/setup")
+            .json(&serde_json::json!({
+                "name": "Owner",
+                "email": email,
+                "password": "a-very-long-password",
+                "token": token,
+            }))
+            .send(svc.as_ref())
+            .await
+            .status_code
+    };
+
+    let (a, b) = tokio::join!(
+        mk("first@example.com", service.clone(), raw.clone()),
+        mk("second@example.com", service.clone(), raw.clone()),
+    );
+
+    // Exactly one CREATED, the other rejected (404 once initialized, or 403 from
+    // the in-transaction guards — both are non-success).
+    let created = [a, b]
+        .iter()
+        .filter(|s| **s == Some(StatusCode::CREATED))
+        .count();
+    assert_eq!(created, 1, "exactly one /setup must succeed, got a={a:?} b={b:?}");
+
+    // And the DB holds exactly one admin row.
+    let n = sqlx::query!(r#"SELECT COUNT(*) AS "n!" FROM admins"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n.n, 1, "single-tenant invariant: exactly one admin");
+
+    // Console is initialized and the bootstrap hash is cleared.
+    assert!(queries::is_initialized(&pool).await.unwrap());
+    let settings = queries::get_console_settings(&pool).await.unwrap().unwrap();
+    assert!(settings.bootstrap_token_hash.is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn setup_rejects_malformed_email(pool: PgPool) {
+    // WR-02: a malformed email is a 400 before any admin is created.
+    let raw = seed_bootstrap_token(&pool).await;
+    let service = Service::new(common::build_test_router(pool.clone()));
+
+    let resp = TestClient::post("http://127.0.0.1:8080/setup")
+        .json(&serde_json::json!({
+            "name": "Owner",
+            "email": "not-an-email",
+            "password": "a-very-long-password",
+            "token": raw
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST));
+
+    // No admin created, console still uninitialized (setup remains open).
+    let n = sqlx::query!(r#"SELECT COUNT(*) AS "n!" FROM admins"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n.n, 0);
+    assert!(!queries::is_initialized(&pool).await.unwrap());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn setup_normalizes_email_case_and_whitespace(pool: PgPool) {
+    // WR-02: the persisted email is trimmed + lowercased so /login (which
+    // normalizes identically) matches it.
+    let raw = seed_bootstrap_token(&pool).await;
+    let service = Service::new(common::build_test_router(pool.clone()));
+
+    let resp = TestClient::post("http://127.0.0.1:8080/setup")
+        .json(&serde_json::json!({
+            "name": "  Owner  ",
+            "email": "  Owner@Example.COM ",
+            "password": "a-very-long-password",
+            "token": raw
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::CREATED));
+
+    let row = sqlx::query!(r#"SELECT email::text AS "email!", name FROM admins"#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.email, "owner@example.com");
+    assert_eq!(row.name, "Owner");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn setup_short_password_is_rejected(pool: PgPool) {
     let raw = seed_bootstrap_token(&pool).await;
     let service = Service::new(common::build_test_router(pool));

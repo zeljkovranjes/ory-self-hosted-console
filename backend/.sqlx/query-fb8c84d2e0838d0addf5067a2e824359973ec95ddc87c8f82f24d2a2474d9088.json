@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT initialized, bootstrap_token_hash\n        FROM console_settings\n        WHERE id = true\n        FOR UPDATE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "initialized",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "console_settings",
+            "name": "initialized"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "bootstrap_token_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "console_settings",
+            "name": "bootstrap_token_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "fb8c84d2e0838d0addf5067a2e824359973ec95ddc87c8f82f24d2a2474d9088"
+}

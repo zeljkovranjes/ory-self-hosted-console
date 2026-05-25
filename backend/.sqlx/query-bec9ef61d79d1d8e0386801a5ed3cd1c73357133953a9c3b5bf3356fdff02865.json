@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT email::text AS \"email!\", name FROM admins",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "email!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admins",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      false
+    ]
+  },
+  "hash": "bec9ef61d79d1d8e0386801a5ed3cd1c73357133953a9c3b5bf3356fdff02865"
+}
