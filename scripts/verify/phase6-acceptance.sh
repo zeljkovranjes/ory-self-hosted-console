@@ -338,13 +338,35 @@ if [ -n "$NEW_ID" ]; then
     _fail "DELETE -> '$del_code' (want 204)"
   fi
 
-  # Post-delete GET -> 404 (FAIL-CLOSED: a 2xx here is a hard FAIL).
-  gone_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+  # Post-delete GET must NO LONGER return 200 (FAIL-CLOSED: a 2xx here is a hard
+  # FAIL — the identity would still exist). The backend maps a Kratos 404 to its
+  # generic mapped UPSTREAM error (502 upstream_error), so "gone" is any non-2xx
+  # — we accept the explicit 404 OR the documented mapped 502 upstream_error
+  # (06-01 SUMMARY: "a Kratos 404 surfaces as the mapped 502 upstream error").
+  gone_resp="$(curl -s -w '\n%{http_code}' --max-time 20 \
     -H "$COOKIE_HEADER" "${IDENTITIES_URL}/${NEW_ID}" 2>/dev/null)"
+  gone_code="$(_code_of "$gone_resp")"; gone_body="$(_body_of "$gone_resp")"
   if [ "$gone_code" = "404" ]; then
     _pass "post-delete GET /{id} -> 404 (identity gone, fail-closed)"
+  elif [ "$gone_code" = "502" ] && printf '%s' "$gone_body" | grep -q 'upstream_error'; then
+    _pass "post-delete GET /{id} -> 502 upstream_error (Kratos 404 mapped; identity gone, fail-closed)"
   else
-    _fail "post-delete GET /{id} -> '$gone_code' (want 404; the identity was NOT deleted)"
+    _fail "post-delete GET /{id} -> '$gone_code' (want 404 or mapped 502 upstream_error; the identity was NOT deleted; body: $gone_body)"
+  fi
+
+  # Backstop: the deleted id is ABSENT from a fresh list (independent of the
+  # detail-route status mapping). A present id here is a hard FAIL.
+  postdel_list="$(_body_of "$(_auth_get "${IDENTITIES_URL}?page_size=500")")"
+  still_there="$(printf '%s' "$postdel_list" | ID="$NEW_ID" node -e '
+    const id = process.env.ID;
+    let d; try { d = JSON.parse(require("fs").readFileSync(0,"utf8")); } catch(e){ process.stdout.write("UNKNOWN"); process.exit(0); }
+    const rows = (d && d.rows) || [];
+    process.stdout.write(rows.some(r => r && r.id === id) ? "YES" : "NO");
+  ' 2>/dev/null)"
+  if [ "$still_there" = "NO" ]; then
+    _pass "deleted id is absent from a fresh list (delete confirmed end-to-end)"
+  else
+    _fail "deleted id is STILL in the list (delete did not take effect: $still_there)"
   fi
 else
   _fail "no created id — skipping the rest of the CRUD round-trip"
@@ -390,21 +412,26 @@ fi
 
 # Over-limit reject: 201 records each carrying a CLEARTEXT password -> 422
 # (>200-cleartext authoritative limit). Negative assertion: a 2xx is a hard FAIL.
+# The body is ~30KB, which exceeds the Git-Bash/MSYS command-line argument limit
+# for an inline `--data`, so we write it to a temp file and POST it with
+# `--data-binary @file` (avoids "Argument list too long" on Windows).
 echo
 echo "--- [IDENT-04] over-limit (>200 cleartext) import -> 422 (fail-closed) ---"
-OVERLIMIT_BODY="$(N=201 SID="$SCHEMA_ID" node -e '
+OVERLIMIT_FILE="$(mktemp 2>/dev/null || echo "${REPO_ROOT}/.phase6-overlimit.$$.json")"
+N=201 SID="$SCHEMA_ID" OUT="$OVERLIMIT_FILE" node -e '
   const n = parseInt(process.env.N, 10), sid = process.env.SID;
   const arr = [];
   for (let i = 0; i < n; i++) {
     arr.push({ schema_id: sid, traits: { email: `phase6-ol-${i}-${Date.now()}@example.com` },
       credentials: { password: { config: { password: "a-very-long-test-password" } } } });
   }
-  process.stdout.write(JSON.stringify(arr));
-')"
-ol_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST \
+  require("fs").writeFileSync(process.env.OUT, JSON.stringify(arr));
+' 2>/dev/null
+ol_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X POST \
   -H "$COOKIE_HEADER" -H "X-CSRF-Token: ${CSRF_TOKEN}" \
-  -H 'Content-Type: application/json' --data "$OVERLIMIT_BODY" \
+  -H 'Content-Type: application/json' --data-binary "@${OVERLIMIT_FILE}" \
   "${IDENTITIES_URL}/import" 2>/dev/null)"
+rm -f "$OVERLIMIT_FILE" 2>/dev/null || true
 if [ "$ol_code" = "422" ]; then
   _pass "over-limit (>200 cleartext) import -> 422 (authoritative limit enforced, fail-closed)"
 else
