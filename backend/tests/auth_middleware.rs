@@ -84,7 +84,7 @@ async fn me_without_cookie_is_401_json(pool: PgPool) {
 async fn me_with_valid_session_is_200(pool: PgPool) {
     common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
     let service = Service::new(common::build_test_router(pool.clone()));
-    let (raw, _csrf) = login_and_get_session(&service, &pool).await;
+    let (raw, csrf) = login_and_get_session(&service, &pool).await;
 
     let mut resp = TestClient::get("http://127.0.0.1:8080/api/console/me")
         .add_header("Cookie", format!("console_session={raw}"), true)
@@ -94,7 +94,28 @@ async fn me_with_valid_session_is_200(pool: PgPool) {
 
     let body = resp.take_string().await.unwrap();
     assert!(body.contains("owner@example.com"), "me returns the admin: {body}");
-    for forbidden in ["password_hash", "token", "bootstrap", "client_secret"] {
+    // A3 contract (05-02): /me now exposes the readable per-session csrf_token so
+    // the frontend can echo it in X-CSRF-Token. Assert it is present AND equals
+    // the session's actual CSRF value (read from the sessions row via the same
+    // helper the CSRF-guard tests use).
+    assert!(
+        body.contains("csrf_token"),
+        "me must expose the csrf_token field: {body}"
+    );
+    assert!(
+        body.contains(&csrf),
+        "me csrf_token must equal the session's actual CSRF value: {body}"
+    );
+    // Narrowed from the broad `"token"` substring (which false-positives on the
+    // legitimate `csrf_token` field) to the PRECISE secret column names that must
+    // never leak through the response body.
+    for forbidden in [
+        "password_hash",
+        "token_hash",
+        "bootstrap_token",
+        "session_token",
+        "client_secret",
+    ] {
         assert!(
             !body.contains(forbidden),
             "me body must not contain `{forbidden}`: {body}"
