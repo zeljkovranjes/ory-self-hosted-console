@@ -156,6 +156,10 @@ echo "==> Step 8 (BACK-05): restart-broker scope"
 # Allowlisted path (literal reference): POST /v1.<ver>/containers/ory-kratos/restart
 # Allowed: scoped restart of an Ory container.
 assert_broker_allowed POST "/${API_VER}/containers/${KRATOS_CONTAINER}/restart"
+# Allowed WITH the standard graceful-stop timeout query string (CR-02). The real
+# backend / `docker restart --time` path appends `?t=<seconds>`; the broker
+# allowlist must accept it. This exercises the query-string branch of the regex.
+assert_broker_allowed POST "/${API_VER}/containers/${KRATOS_CONTAINER}/restart?t=5"
 # Denied: listing containers (GET), stopping (different verb-path), and
 # restarting a non-Ory container (postgres) outside the allowlist.
 assert_broker_denied GET  "/${API_VER}/containers/json"

@@ -1,0 +1,14 @@
+{
+  "_comment": [
+    "PLACEHOLDER ONLY — this is NOT a usable signing key and is NEVER loaded at runtime.",
+    "The real id_token JWKS is generated automatically on first boot by the",
+    "`oathkeeper-jwks-init` one-shot service (see docker-compose.yml) into the",
+    "`oathkeeper-secrets` named volume, and Oathkeeper reads it from",
+    "file:///etc/secrets/oathkeeper/jwks.json — NOT from this directory.",
+    "Do NOT commit a real private key here. To regenerate manually (e.g. to rotate),",
+    "destroy the volume and re-up: `docker compose down -v && docker compose up -d --wait`,",
+    "or run: `docker run --rm oryd/oathkeeper:v26.2.0 oathkeeper credentials generate --alg RS256 > jwks.json`.",
+    "Treat any key previously committed to git history as COMPROMISED and rotate it."
+  ],
+  "keys": []
+}

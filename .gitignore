@@ -3,6 +3,13 @@
 .env.*
 !.env.example
 
+# --- Generated signing keys (never commit a real private key; CR-01) ---
+# The Oathkeeper id_token JWKS is generated at first boot into a named volume,
+# not committed. If an operator generates one into the config dir, keep it out
+# of git; only the placeholder jwks.json.example is tracked.
+/config/oathkeeper/jwks.json
+!/config/oathkeeper/jwks.json.example
+
 # --- Rust (backend) ---
 /backend/target/
 **/*.rs.bk

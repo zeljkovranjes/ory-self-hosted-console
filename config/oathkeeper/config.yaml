@@ -39,7 +39,10 @@ mutators:
     enabled: true
     config:
       issuer_url: http://oathkeeper:4455/
-      jwks_url: file:///etc/config/oathkeeper/jwks.json
+      # JWKS is GENERATED at first boot by the `oathkeeper-jwks-init` one-shot
+      # into the `oathkeeper-secrets` volume (mounted read-only here) — never a
+      # committed private key (CR-01). To rotate: `docker compose down -v`.
+      jwks_url: file:///etc/secrets/oathkeeper/jwks.json
 
 errors:
   fallback:

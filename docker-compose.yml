@@ -35,6 +35,11 @@ x-images:
   hydra-image: &hydra-image oryd/hydra:v26.2.0-distroless
   keto-image: &keto-image oryd/keto:v26.2.0-distroless
   oathkeeper-image: &oathkeeper-image oryd/oathkeeper:v26.2.0-distroless
+  # Non-distroless Oathkeeper (same v26.2.0 release, with a shell) used ONLY by
+  # the oathkeeper-jwks-init one-shot to generate the id_token signing JWKS at
+  # first boot (CR-01). It is NOT a long-lived service and is intentionally the
+  # non-distroless tag so the `-distroless` INFRA-04 pin grep still counts == 4.
+  oathkeeper-tools-image: &oathkeeper-tools-image oryd/oathkeeper:v26.2.0
 
 # -----------------------------------------------------------------------------
 # Networks (Pattern 1 — two-network isolation)
@@ -52,6 +57,10 @@ networks:
 # -----------------------------------------------------------------------------
 volumes:
   postgres-data:
+  # Holds the Oathkeeper id_token signing JWKS, GENERATED at first boot by the
+  # oathkeeper-jwks-init one-shot (CR-01 — no private key is committed to git).
+  # Destroying this volume (`docker compose down -v`) rotates the key on next up.
+  oathkeeper-secrets:
 
 services:
   # ===========================================================================
@@ -217,6 +226,42 @@ services:
       start_period: 25s
     networks: [internal]
 
+  # ---------------------------------------------------------------------------
+  # Oathkeeper JWKS init (one-shot — CR-01). Generates the id_token signing JWKS
+  # into the `oathkeeper-secrets` volume on first boot ONLY if it does not yet
+  # exist, so NO private key is ever committed to git. Idempotent across restarts
+  # (the volume persists the key); `docker compose down -v` rotates it. Uses the
+  # non-distroless oathkeeper image (has a shell for the stdout redirect). Runs
+  # `restart: "no"` so `service_completed_successfully` gates the oathkeeper svc.
+  # ---------------------------------------------------------------------------
+  oathkeeper-jwks-init:
+    image: *oathkeeper-tools-image
+    container_name: oathkeeper-jwks-init
+    # Runs as root ONLY to create the key file in the fresh (root-owned) volume,
+    # then hands it to Oathkeeper read-only. The long-lived oathkeeper service
+    # mounts the volume :ro and runs as its own non-root user. This one-shot has
+    # NO socket, NO host port, and exits immediately, so the elevated uid is
+    # short-lived and tightly scoped to writing one file.
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -s /etc/secrets/oathkeeper/jwks.json ]; then
+          echo "JWKS already present — keeping existing key (no rotation)."
+        else
+          echo "Generating Oathkeeper id_token JWKS (RS256) into volume..."
+          oathkeeper credentials generate --alg RS256 --kid oathkeeper-id-token > /etc/secrets/oathkeeper/jwks.json
+          # World-readable so the non-root oathkeeper user can read it (the file
+          # is the SIGNING key; it lives only inside the internal-only volume).
+          chmod 0644 /etc/secrets/oathkeeper/jwks.json
+          echo "JWKS generated."
+        fi
+    volumes:
+      - oathkeeper-secrets:/etc/secrets/oathkeeper
+    restart: "no"
+    networks: [internal]
+
   oathkeeper:
     build:
       context: ./docker/ory-healthcheck
@@ -227,6 +272,11 @@ services:
     command: ["serve", "--config", "/etc/config/oathkeeper/config.yaml"]
     volumes:
       - ./config/oathkeeper:/etc/config/oathkeeper:ro
+      # Generated id_token JWKS, read-only (CR-01). The init one-shot owns writes.
+      - oathkeeper-secrets:/etc/secrets/oathkeeper:ro
+    depends_on:
+      oathkeeper-jwks-init:
+        condition: service_completed_successfully
     healthcheck:
       # Oathkeeper api/health port is 4456. NOTE: unlike Hydra/Keto, Oathkeeper's
       # /health/ready returns 503 ("resource could not be found") for this
@@ -273,7 +323,12 @@ services:
       # binary that probes it). This does NOT widen the Docker-API allowlist —
       # it is a separate internal health endpoint, not a proxied socket route.
       - "-allowhealthcheck"
-      - '-allowPOST=/v1\..{1,2}/containers/(ory-kratos|ory-hydra|ory-keto|ory-oathkeeper)/restart'
+      # Allow an OPTIONAL query string after /restart (CR-02). The Docker Engine
+      # restart endpoint is normally called with `?t=<seconds>` (graceful stop
+      # timeout) and, on newer engines, `?signal=`. wollomatic auto-anchors with
+      # ^...$, so without `(\?.*)?` a real `.../restart?t=10` call is denied 403.
+      # Still scoped to ONLY the four ory-* containers + the restart verb.
+      - '-allowPOST=/v1\..{1,2}/containers/(ory-kratos|ory-hydra|ory-keto|ory-oathkeeper)/restart(\?.*)?'
     volumes:
       # ONLY container with the socket — mounted read-only.
       - /var/run/docker.sock:/var/run/docker.sock:ro
