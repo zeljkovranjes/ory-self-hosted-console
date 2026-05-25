@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO sessions\n            (token_hash, admin_id, expires_at, last_seen_at, ip, user_agent, csrf_token)\n        VALUES ($1, $2, $3, now(), $4, $5, $6)\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sessions",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e3b513ac1f9f495c4dab5f2b9bd0519ac34c870b518d31c9bd37739e0879fa48"
+}

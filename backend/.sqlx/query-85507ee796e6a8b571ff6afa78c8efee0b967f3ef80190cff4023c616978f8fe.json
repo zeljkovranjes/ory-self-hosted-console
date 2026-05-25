@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE sessions SET last_seen_at = now() - interval '10 seconds' WHERE admin_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "85507ee796e6a8b571ff6afa78c8efee0b967f3ef80190cff4023c616978f8fe"
+}

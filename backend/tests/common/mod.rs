@@ -42,17 +42,29 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     sqlx::migrate!("./migrations").run(pool).await
 }
 
-// --- Stubs for later plans (CAUTH-02..06) -----------------------------------
-// These return inert values so 02-01 tests compile. Plans 02-02..04 implement
-// them once /setup, /login, and the session/CSRF subsystem exist.
+// --- Fixtures (implemented in 02-02; CSRF helper remains a 02-03 stub) -------
 
-/// Seed a console admin. Stub: implemented in 02-02 (setup/login).
-pub async fn seed_admin(_pool: &PgPool) -> Option<uuid::Uuid> {
-    None
+use ory_console_backend::auth::password;
+use ory_console_backend::db::queries;
+
+/// Seed a console admin with an Argon2id password hash and return its id.
+/// Implemented in 02-02 now that the password primitives exist.
+pub async fn seed_admin(pool: &PgPool, email: &str, plaintext_password: &str) -> uuid::Uuid {
+    let hash = password::hash_password(plaintext_password).expect("hash seed admin password");
+    queries::insert_admin(pool, email, "Seed Admin", &hash)
+        .await
+        .expect("insert seed admin")
 }
 
-/// Log in and return the `__Host-console_session` cookie value. Stub: 02-02.
-pub fn obtain_session_cookie(_client_response: &Response) -> Option<String> {
+/// Extract the session cookie VALUE (the raw opaque token) from a `Set-Cookie`
+/// header on a TestClient response. Matches either the hardened `__Host-`
+/// name or the dev `console_session` name. Returns `None` if absent.
+pub fn obtain_session_cookie(response: &Response) -> Option<String> {
+    for c in response.cookies().iter() {
+        if c.name() == "__Host-console_session" || c.name() == "console_session" {
+            return Some(c.value().to_owned());
+        }
+    }
     None
 }
 
