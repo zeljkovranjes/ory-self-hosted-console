@@ -26,6 +26,7 @@
 
 pub mod clients;
 pub mod error;
+pub mod fallback;
 pub mod hydra;
 pub mod keto;
 pub mod kratos;
