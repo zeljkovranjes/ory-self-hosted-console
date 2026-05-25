@@ -51,6 +51,31 @@ const DOCKER_API_SEGMENT: &str = "v1.43";
 /// How often to re-poll `/health/ready` while waiting for a restarted service.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// WR-05: per-PROBE timeout for the `/health/ready` poll, independent of the
+/// shared 10s Ory-fallback client timeout. A hanging connect during the boot
+/// window is bounded to this (well under the 1s cadence + interval) so the loop
+/// keeps probing at the intended ~1s cadence instead of being coarsened to ~5
+/// probes across the 60s budget by a 10s per-attempt stall.
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Build the reqwest client used for BOTH the broker restart POST and the
+/// `/health/ready` poll.
+///
+/// WR-04: redirects are DISABLED (`Policy::none()`), consistent with the SSRF
+/// guard posture used elsewhere — the targets are fixed internal URLs, and a 3xx
+/// `Location` from a compromised/misbehaving internal service (or a broker
+/// mis-config) must never steer a follow-up request, nor be read as "healthy" by
+/// following it to a 200 elsewhere. WR-05: a short connect/request timeout keeps
+/// the health probe cadence tight; the per-request `.timeout()` in
+/// [`wait_healthy`] bounds each individual probe further.
+pub fn restart_client() -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HEALTH_PROBE_TIMEOUT)
+        .build()
+        .map_err(|e| AppError::Internal(format!("build restart/health http client: {e}")))
+}
+
 impl Service {
     /// Parse a `<service>` path segment into a [`Service`]. An unrecognised name
     /// is `AppError::NotFound` — no URL is ever built for an unknown service, so
@@ -161,10 +186,16 @@ pub async fn wait_healthy(
 
     let poll = async {
         loop {
-            match http.get(&url).send().await {
+            // WR-05: bound each individual probe with an explicit per-request
+            // timeout so a hanging connect during boot cannot consume the shared
+            // 10s client timeout and coarsen the ~1s poll cadence. WR-04: the
+            // client disables redirects, so a 3xx arrives here as a non-200 and
+            // is treated as "not yet" — never followed to a 200 elsewhere.
+            match http.get(&url).timeout(HEALTH_PROBE_TIMEOUT).send().await {
                 Ok(resp) if resp.status() == reqwest::StatusCode::OK => return true,
-                // Non-200 (e.g. boot-time 503) or a transport/connection error:
-                // treat as "not yet" and keep polling (Pitfall 6).
+                // Non-200 (e.g. boot-time 503 or a 3xx redirect) or a
+                // transport/connection/timeout error: treat as "not yet" and
+                // keep polling (Pitfall 6).
                 Ok(_) | Err(_) => {
                     tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
                 }

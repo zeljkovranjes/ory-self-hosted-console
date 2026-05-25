@@ -49,7 +49,6 @@ use serde_json::{Map, Value};
 use crate::config::Config;
 use crate::config_edit::{allowlist, locks, restart, schema, yaml};
 use crate::error::AppError;
-use crate::ory::fallback::fallback_client;
 
 /// How long to wait for a restarted service to report healthy before rolling
 /// back (RESEARCH Pitfall 6: services briefly 503; allow ample boot time).
@@ -109,8 +108,20 @@ pub async fn get_config(
     // PRESENT in the doc. An absent pointer is OMITTED (no null, no key); the
     // response therefore never contains a denylisted/secret value, because the
     // allowlist never lists one and we never serialise the whole doc.
+    //
+    // WR-01: additionally run the SAME sensitive denylist the PUT path uses, on
+    // the read path. Today the proof allowlist lists no sensitive pointer, but a
+    // future mistake (adding a sensitive pointer to a section allowlist) must NOT
+    // leak that secret via GET while PUT would still refuse it — the denylist's
+    // authority holds on read too.
     let mut out = Map::new();
     for ptr in allow.allowed_paths {
+        if allowlist::is_sensitive(ptr) {
+            // Never surface a denylisted/secret value, even if it was mistakenly
+            // allowlisted. (is_sensitive expects the canonical pointer form; the
+            // const allowed_paths are authored canonical.)
+            continue;
+        }
         if let Some(value) = doc.pointer(ptr) {
             out.insert((*ptr).to_string(), value.clone());
         }
@@ -194,20 +205,33 @@ pub async fn put_config(
     // --- Step 6: BACKUP the live file (last-known-good) ----------------------
     yaml::backup(&path)?;
 
+    // WR-02: never commit a write we cannot reverse. Assert the backup actually
+    // landed BEFORE the atomic write, so the rollback paths below always have a
+    // last-known-good to restore. A missing backup here is a hard internal fault
+    // (the write has NOT happened yet, so the live file is still good).
+    if !yaml::backup_exists(&path) {
+        tracing::error!(service = svc.key(), "config put: backup missing after backup(); refusing reversible write");
+        return Err(AppError::Internal("config backup missing".into()));
+    }
+
     // --- Step 7: ATOMIC WRITE the MERGED doc (NO env overlay -> no dsn) -------
     let serialized = yaml::serialize(&merged)?;
     yaml::write_atomic(&path, &serialized)?;
     tracing::info!(service = svc.key(), status = "applied", "config put: written");
 
     // --- Step 8: RESTART only the affected container via the broker ----------
-    let http = fallback_client()?;
+    // WR-04/WR-05: a dedicated redirect-disabled, short-timeout client for the
+    // broker POST + health poll (NOT the 10s-timeout, redirect-following Ory
+    // fallback client). A 3xx must never be followed or read as healthy.
+    let http = restart::restart_client()?;
     tracing::info!(service = svc.key(), status = "restarting", "config put: restarting");
     if let Err(e) = restart::restart(&http, &cfg.restart_broker_url, svc).await {
-        // Broker failure: the write already applied but the restart did not fire.
-        // Roll back to the last-known-good so the on-disk state matches the
-        // running service, then surface the broker 502.
-        tracing::warn!(service = svc.key(), "config put: broker restart failed; rolling back");
-        rollback(&http, &path, &cfg, svc).await;
+        // WR-03 — BROKER-FAILURE path: the service NEVER restarted, so it is
+        // still running its OLD (last-known-good) in-memory config. We only need
+        // to restore the `.bak` so DISK matches the running service; issuing a
+        // second restart through the just-failed broker would only fail again.
+        tracing::warn!(service = svc.key(), "config put: broker restart failed; restoring disk (no re-restart)");
+        restore_only(&path, svc);
         return Err(e);
     }
 
@@ -218,30 +242,90 @@ pub async fn put_config(
     }
 
     // --- Step 10: ROLLBACK on health failure ---------------------------------
-    // Restore the .bak, restart, re-poll, report failed (rolled back). The detail
-    // (which service, the values) is never placed in the body.
+    // WR-03 — HEALTH-FAILURE path: the service DID restart into the bad config,
+    // so we must restore the `.bak`, restart AGAIN, and re-poll to bring it back
+    // onto the last-known-good. The detail (service, values) is never in the body.
     tracing::warn!(service = svc.key(), "config put: health failed; rolling back");
-    rollback(&http, &path, &cfg, svc).await;
+    rollback_and_restart(&http, &path, &cfg, svc).await;
     Err(AppError::HealthFailed)
 }
 
-/// Restore the last-known-good `.bak`, restart, and re-poll the service. Used by
-/// both the broker-failure and health-timeout paths so the on-disk file always
-/// returns to the state the running service can serve. A failure DURING rollback
-/// is logged (server-side) but never changes the client-facing outcome — the
-/// caller already returns the originating error. No value is logged.
-async fn rollback(
+/// WR-03 broker-failure rollback: restore the last-known-good `.bak` ONLY (no
+/// restart — the broker just failed and the service never left its old config).
+/// Surfaces the restore outcome distinctly (WR-02): a missing backup or a
+/// restore IO fault is logged at error with a clear marker so an operator can
+/// detect that disk may NOT match the running service. The client still receives
+/// the originating broker error regardless.
+fn restore_only(path: &std::path::Path, svc: restart::Service) {
+    match yaml::restore(path) {
+        Ok(yaml::RestoreOutcome::Restored) => {
+            tracing::info!(
+                service = svc.key(),
+                status = "rolled_back_disk_only",
+                "config put: broker failed; disk restored to last-known-good (service never restarted)"
+            );
+        }
+        Ok(yaml::RestoreOutcome::NoBackup) => {
+            tracing::error!(
+                service = svc.key(),
+                status = "rollback_no_backup",
+                "config put: broker failed AND no backup to restore — DISK MAY DIFFER from running config"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                service = svc.key(),
+                status = "rollback_restore_failed",
+                "config put: broker failed AND restore failed — DISK LEFT IN WRITTEN (BAD) STATE"
+            );
+        }
+    }
+}
+
+/// WR-03 health-failure rollback: restore the last-known-good `.bak`, restart,
+/// and re-poll the service so it returns onto a config it can serve. The restore
+/// outcome AND the rollback-restart outcome are each surfaced distinctly
+/// (WR-02/WR-03) at error level with a stable marker so operators can detect a
+/// stuck service. A failure DURING rollback never changes the client-facing
+/// outcome — the caller already returns the originating error. No value logged.
+async fn rollback_and_restart(
     http: &reqwest::Client,
     path: &std::path::Path,
     cfg: &Config,
     svc: restart::Service,
 ) {
-    if let Err(e) = yaml::restore(path) {
-        tracing::error!(error = %e, service = svc.key(), "rollback: restore failed");
-        return;
+    match yaml::restore(path) {
+        Ok(yaml::RestoreOutcome::Restored) => {}
+        Ok(yaml::RestoreOutcome::NoBackup) => {
+            // Nothing to restore: the service is running the bad config and we
+            // have no last-known-good. Loudly flag it; do NOT restart into bad.
+            tracing::error!(
+                service = svc.key(),
+                status = "rollback_no_backup",
+                "config put: health failed AND no backup to restore — service may be STUCK on bad config"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                service = svc.key(),
+                status = "rollback_restore_failed",
+                "config put: health failed AND restore failed — service may be STUCK on bad config"
+            );
+            return;
+        }
     }
+
+    // Restart back into the restored last-known-good config; report the outcome.
     if let Err(e) = restart::restart(http, &cfg.restart_broker_url, svc).await {
-        tracing::error!(error = %e, service = svc.key(), "rollback: restart failed");
+        tracing::error!(
+            error = %e,
+            service = svc.key(),
+            status = "rollback_restart_failed",
+            "config put: rollback restart FAILED — service may be STUCK; disk is last-known-good"
+        );
         return;
     }
     let healthy = restart::wait_healthy(http, svc, HEALTH_TIMEOUT, None).await;
@@ -275,10 +359,14 @@ mod tests {
 
     /// Re-implement the GET response-building (the pure core of `get_config`)
     /// against an in-memory doc, so the omit-absent + secret-free behavior is
-    /// unit-testable without a router/filesystem.
+    /// unit-testable without a router/filesystem. Mirrors the handler EXACTLY,
+    /// including the WR-01 sensitive-denylist filter on the read path.
     fn build_get_response(allow: &allowlist::SectionAllowlist, doc: &Value) -> Value {
         let mut out = Map::new();
         for ptr in allow.allowed_paths {
+            if allowlist::is_sensitive(ptr) {
+                continue; // WR-01: never surface a denylisted/secret value on GET
+            }
             if let Some(value) = doc.pointer(ptr) {
                 out.insert((*ptr).to_string(), value.clone());
             }
@@ -332,6 +420,34 @@ mod tests {
         assert!(!serialized.contains("secrets"), "secrets must never appear");
         assert!(!serialized.contains("PLACEHOLDERcookie"), "secret value must never appear");
         assert!(!serialized.contains("base_url"), "serve.admin must never appear");
+    }
+
+    #[test]
+    fn get_applies_denylist_even_if_allowlisted() {
+        // WR-01: if a sensitive pointer were MISTAKENLY added to a section
+        // allowlist, GET must still refuse to surface its value (the denylist
+        // wins on the read path, exactly as it does on PUT).
+        let mistaken = allowlist::SectionAllowlist {
+            service: "kratos",
+            section: "mistaken",
+            allowed_paths: &["/session/lifespan", "/dsn", "/secrets/cookie/0"],
+        };
+        let mut doc = no_session_kratos();
+        doc["session"] = json!({ "lifespan": "24h" });
+        let resp = build_get_response(&mistaken, &doc);
+        let obj = resp.as_object().expect("object");
+        // The benign allowlisted pointer is returned...
+        assert_eq!(obj.get("/session/lifespan"), Some(&json!("24h")));
+        // ...but the sensitive ones are filtered out by the denylist, even
+        // though they are present in the doc AND (wrongly) in the allowlist.
+        assert!(!obj.contains_key("/dsn"), "denylisted /dsn must be filtered on GET");
+        assert!(
+            !obj.contains_key("/secrets/cookie/0"),
+            "denylisted /secrets/* must be filtered on GET"
+        );
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(!serialized.contains("postgres://"), "no dsn value leaks via GET");
+        assert!(!serialized.contains("PLACEHOLDERcookie"), "no secret value leaks via GET");
     }
 
     #[test]

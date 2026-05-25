@@ -127,9 +127,13 @@ pub fn validator_for(service: &str) -> Result<&'static Validator, String> {
         other => return Err(format!("unknown service: {other}")),
     };
 
+    // IN-01: recover the guard from a poisoned lock instead of panicking. The
+    // validator build is pure/deterministic, so a poisoned read view is still
+    // sound to use; turning every subsequent validation into a 500 panic would be
+    // a worse failure mode than reading through the recovered guard.
     if let Some(v) = validator_cache()
         .read()
-        .expect("validator cache poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .get(key)
     {
         return Ok(v);
@@ -147,9 +151,12 @@ pub fn validator_for(service: &str) -> Result<&'static Validator, String> {
     // exactly four services, compiled at most once each, so the leak is a tiny,
     // bounded, one-time cost (a process-lifetime singleton) — not a growing leak.
     let leaked: &'static Validator = Box::leak(Box::new(validator));
+    // IN-01: recover from a poisoned write lock rather than panicking (see the
+    // read path above). The insert-after-build ordering is preserved, keeping the
+    // Box::leak bound (IN-02) structural.
     validator_cache()
         .write()
-        .expect("validator cache poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .insert(key, leaked);
     Ok(leaked)
 }
