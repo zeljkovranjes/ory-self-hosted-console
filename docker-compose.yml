@@ -1,0 +1,250 @@
+# docker-compose.yml
+# =============================================================================
+# Ory Self-Hosted Console — full stack orchestration (Phase 1 convergence).
+#
+# A single `docker compose up -d --wait` on a FRESH volume brings up:
+#   - postgres (creates 5 DBs on first boot via db/init)
+#   - kratos / hydra / keto migrate one-shots (gated on postgres healthy)
+#   - kratos / hydra / keto / oathkeeper long-lived Ory services (distroless)
+#   - restart-broker (wollomatic/socket-proxy — sole docker.sock holder)
+#   - backend (Rust/Salvo skeleton) + frontend (Next.js skeleton)
+#
+# Security topology (Phase 1 deliverable):
+#   - Two networks: `internal` (internal: true, NO host route) carries Postgres,
+#     all Ory Admin/public APIs, and the broker; `edge` carries only the two
+#     host-published services (backend, frontend).
+#   - NO Ory admin OR public port is published to the host (INFRA-05).
+#   - config/ mounted :ro into every Ory container, :rw into the backend only
+#     (INFRA-07) — tamper-resistance for the Phase 4 YAML-edit subsystem.
+#   - The backend holds NO docker.sock; it reaches the engine ONLY through the
+#     scoped restart-broker (BACK-05).
+#
+# Compose v2: the obsolete top-level `version:` key is intentionally OMITTED.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Image pins (single source of truth — INFRA-04).
+# Each Ory image literal appears EXACTLY ONCE here and is referenced by YAML
+# alias from both the migrate one-shot and the long-lived service, so a fresh
+# `grep -E 'oryd/(kratos|hydra|keto|oathkeeper):v26.2.0-distroless'` counts
+# exactly 4 (the acceptance harness asserts == 4). Every image is tag-pinned;
+# no floating/rolling tags are used anywhere in this file.
+# -----------------------------------------------------------------------------
+x-images:
+  kratos-image: &kratos-image oryd/kratos:v26.2.0-distroless
+  hydra-image: &hydra-image oryd/hydra:v26.2.0-distroless
+  keto-image: &keto-image oryd/keto:v26.2.0-distroless
+  oathkeeper-image: &oathkeeper-image oryd/oathkeeper:v26.2.0-distroless
+
+# -----------------------------------------------------------------------------
+# Networks (Pattern 1 — two-network isolation)
+# -----------------------------------------------------------------------------
+networks:
+  internal:
+    # internal: true => Docker creates NO gateway to the host/internet. Combined
+    # with publishing no ports, the Ory Admin APIs are unreachable from the host.
+    internal: true
+  edge:
+    driver: bridge
+
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
+volumes:
+  postgres-data:
+
+services:
+  # ===========================================================================
+  # Postgres — owns all five logical databases. HAS a shell + pg_isready, so a
+  # normal healthcheck works here (unlike the distroless Ory images).
+  # ===========================================================================
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ory}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      # POSTGRES_DB intentionally unset: db/init/01-init.sql creates the 5 DBs.
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # First-boot init: runs ONLY on an empty data dir (Pitfall 2). Read-only.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [internal]
+    # NO host ports — Postgres is internal-only.
+
+  # ===========================================================================
+  # Migrate one-shots (Pattern 4 — completion-gated ordering).
+  # Each gates on postgres: service_healthy, runs its service's migrate command,
+  # and exits 0. restart: "no" so service_completed_successfully fires cleanly
+  # (Pitfall 4). NOTE the per-service flag differences (RESEARCH Migration table):
+  #   Kratos / Hydra: `migrate sql -e --yes` (-e reads DSN env)
+  #   Keto:           `migrate up -c <config> --yes` (NO -e; DSN from env/config)
+  #   Oathkeeper:     NONE — stateless, no migrate container.
+  # ===========================================================================
+  kratos-migrate:
+    image: *kratos-image
+    container_name: kratos-migrate
+    command: ["migrate", "sql", "-e", "--yes"]
+    environment:
+      DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@postgres:5432/kratos?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [internal]
+
+  hydra-migrate:
+    image: *hydra-image
+    container_name: hydra-migrate
+    command: ["migrate", "sql", "-e", "--yes"]
+    environment:
+      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@postgres:5432/hydra?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [internal]
+
+  keto-migrate:
+    image: *keto-image
+    container_name: keto-migrate
+    # Keto: `migrate up`, NO -e flag; DSN from the DSN env var.
+    command: ["migrate", "up", "-c", "/etc/config/keto/keto.yml", "--yes"]
+    environment:
+      DSN: postgres://keto:${KETO_DB_PASSWORD:?set KETO_DB_PASSWORD}@postgres:5432/keto?sslmode=disable
+    volumes:
+      - ./config/keto:/etc/config/keto:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [internal]
+
+  # ===========================================================================
+  # Long-lived Ory services (distroless). container_name: ory-<svc> so the
+  # broker allowlist (Task 2) scopes exactly to these names.
+  # Each mounts ONLY its own config dir, read-only (INFRA-07). NO host ports.
+  # Healthchecks: Kratos uses in-image `kratos remote status`; Hydra/Keto/
+  # Oathkeeper readiness is gated via curl sidecars added in Task 2 (their
+  # `depends_on: <svc>-health: service_healthy` is wired in Task 2).
+  # ===========================================================================
+  kratos:
+    image: *kratos-image
+    container_name: ory-kratos
+    command: ["serve", "--config", "/etc/config/kratos/kratos.yml"]
+    environment:
+      DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@postgres:5432/kratos?sslmode=disable
+    volumes:
+      - ./config/kratos:/etc/config/kratos:ro
+    depends_on:
+      kratos-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Distroless: no shell/curl, but the kratos binary ships `remote status`,
+      # which probes /health/alive + /health/ready via the admin endpoint.
+      test: ["CMD", "kratos", "remote", "status", "--endpoint", "http://127.0.0.1:4434"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [internal]
+
+  hydra:
+    image: *hydra-image
+    container_name: ory-hydra
+    command: ["serve", "all", "--config", "/etc/config/hydra/hydra.yml"]
+    environment:
+      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@postgres:5432/hydra?sslmode=disable
+      SECRETS_SYSTEM: ${HYDRA_SECRETS_SYSTEM:?set HYDRA_SECRETS_SYSTEM (immutable after first migration)}
+    volumes:
+      - ./config/hydra:/etc/config/hydra:ro
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    # Healthcheck gating is provided by the hydra-health curl sidecar (Task 2).
+    networks: [internal]
+
+  keto:
+    image: *keto-image
+    container_name: ory-keto
+    command: ["serve", "-c", "/etc/config/keto/keto.yml"]
+    environment:
+      DSN: postgres://keto:${KETO_DB_PASSWORD:?set KETO_DB_PASSWORD}@postgres:5432/keto?sslmode=disable
+    volumes:
+      - ./config/keto:/etc/config/keto:ro
+    depends_on:
+      keto-migrate:
+        condition: service_completed_successfully
+    # Healthcheck gating is provided by the keto-health curl sidecar (Task 2).
+    networks: [internal]
+
+  oathkeeper:
+    image: *oathkeeper-image
+    container_name: ory-oathkeeper
+    # Stateless: no DB, no migrate dependency — serve only.
+    command: ["serve", "--config", "/etc/config/oathkeeper/config.yaml"]
+    volumes:
+      - ./config/oathkeeper:/etc/config/oathkeeper:ro
+    # Healthcheck gating is provided by the oathkeeper-health curl sidecar (Task 2).
+    networks: [internal]
+
+  # ===========================================================================
+  # Backend (Rust/Salvo skeleton). Dual-homed: `internal` to reach Ory + broker,
+  # `edge` to publish to host. config/ mounted :rw (INFRA-07). NO docker.sock
+  # (BACK-05) — it talks to the engine only via restart-broker. (Task 2 adds the
+  # no-new-privileges hardening.)
+  # ===========================================================================
+  backend:
+    build:
+      context: ./backend
+    container_name: backend
+    environment:
+      BACKEND_BIND_ADDR: 0.0.0.0:8080
+      # Single Ory base URL + admin credential bootstrap contract (INFRA-06).
+      ORY_BASE_URL: ${ORY_BASE_URL:-http://oathkeeper:4455}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+      # Backend reaches the Docker engine ONLY through the scoped broker.
+      RESTART_BROKER_URL: http://restart-broker:2375
+      # Backend's own state DB (Phase 2 owns the schema).
+      DATABASE_URL: postgres://console:${CONSOLE_DB_PASSWORD:?set CONSOLE_DB_PASSWORD}@postgres:5432/console?sslmode=disable
+    volumes:
+      # Read-WRITE config mount (the ONLY rw config mount) — Phase 4 edit subsystem.
+      - ./config:/etc/config:rw
+    healthcheck:
+      # Backend image vendors a static curl (see backend/Dockerfile) so it can
+      # both self-healthcheck and serve as the harness's internal probe source.
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    networks: [internal, edge]
+
+  # ===========================================================================
+  # Frontend (Next.js skeleton). Edge-only; publishes 3000 to host.
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+    container_name: frontend
+    environment:
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    networks: [edge]

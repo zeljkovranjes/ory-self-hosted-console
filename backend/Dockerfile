@@ -27,12 +27,25 @@ COPY src ./src
 RUN touch src/main.rs \
     && cargo build --release
 
+# ---- curl stage ----
+# The distroless runtime ships no curl. We vendor a single statically-linked
+# curl binary so the backend can (a) self-healthcheck its own /health and
+# (b) serve as the internal probe source for the Phase 1 acceptance harness
+# (it curls kratos:4434/health/ready and the restart-broker over the internal
+# network). This keeps the distroless hardening (no shell, no package manager,
+# non-root) while satisfying the harness contract. The static musl curl has no
+# shared-lib dependencies, so it runs unmodified in distroless/cc.
+FROM curlimages/curl:8.11.1 AS curlbin
+
 # ---- Stage 2: runtime ----
 # Distroless CC base: provides the minimal glibc runtime the binary needs,
 # no shell, runs as the built-in nonroot user.
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 WORKDIR /app
+
+# curlimages/curl is built on Alpine with a static musl curl at /usr/bin/curl.
+COPY --from=curlbin /usr/bin/curl /usr/local/bin/curl
 
 COPY --from=builder /app/target/release/ory-console-backend /usr/local/bin/ory-console-backend
 
