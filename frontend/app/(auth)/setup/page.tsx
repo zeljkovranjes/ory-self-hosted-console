@@ -11,13 +11,16 @@
 //
 // Security (V2/V5): the password field is type=password with
 // autocomplete="new-password"; credentials are posted via lib/api.ts only and
-// never stored in client state beyond the in-flight form. Backend 422
-// `{path,message}[]` errors map to inline field errors; other failures surface a
-// destructive Alert.
+// never stored in client state beyond the in-flight form. The backend /setup
+// route does NOT emit 422/per-field validation (a bad bootstrap token → 403,
+// other input problems → 400) — so setup failures surface as a single
+// destructive Alert (formError). There is intentionally NO inline per-field
+// 422 mapping here, because that branch would be unreachable against the real
+// backend (WR-05).
 
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -39,9 +42,6 @@ export default function SetupPage() {
   const router = useRouter();
   const [checking, setChecking] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-  const [fieldErrors, setFieldErrors] = useState<Partial<Record<Field, string>>>(
-    {},
-  );
   const [formError, setFormError] = useState<string | null>(null);
 
   // Redirect away once the console is already initialized.
@@ -66,7 +66,6 @@ export default function SetupPage() {
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setSubmitting(true);
-    setFieldErrors({});
     setFormError(null);
     const data = new FormData(e.currentTarget);
     // The backend SetupRequest DTO expects the bootstrap token under the key
@@ -84,23 +83,13 @@ export default function SetupPage() {
       await api("/setup", { method: "POST", body: JSON.stringify(body) });
       // The backend does not auto-log-in; route to /login for explicit auth.
       router.replace("/login");
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 422) {
-        const mapped: Partial<Record<Field, string>> = {};
-        for (const { path, message } of err.fieldErrors) {
-          if ((FIELDS as readonly string[]).includes(path)) {
-            mapped[path as Field] = message;
-          }
-        }
-        setFieldErrors(mapped);
-        if (Object.keys(mapped).length === 0) {
-          setFormError("Setup failed. Please check your input and try again.");
-        }
-      } else {
-        setFormError(
-          "Setup failed. Please verify the bootstrap token and try again.",
-        );
-      }
+    } catch {
+      // The /setup route does not return per-field 422s (bad token → 403,
+      // other input → 400), so surface a single generic message. No inline
+      // per-field mapping here — that branch would never execute (WR-05).
+      setFormError(
+        "Setup failed. Please verify the bootstrap token and try again.",
+      );
     } finally {
       setSubmitting(false);
     }
@@ -141,28 +130,19 @@ export default function SetupPage() {
             label="Bootstrap token"
             type="password"
             autoComplete="off"
-            error={fieldErrors.bootstrap_token}
           />
-          <Field
-            id="name"
-            label="Name"
-            type="text"
-            autoComplete="name"
-            error={fieldErrors.name}
-          />
+          <Field id="name" label="Name" type="text" autoComplete="name" />
           <Field
             id="email"
             label="Email"
             type="email"
             autoComplete="username"
-            error={fieldErrors.email}
           />
           <Field
             id="password"
             label="Password"
             type="password"
             autoComplete="new-password"
-            error={fieldErrors.password}
           />
 
           <Button type="submit" disabled={submitting} className="mt-2">
@@ -179,15 +159,12 @@ function Field({
   label,
   type,
   autoComplete,
-  error,
 }: {
   id: Field;
   label: string;
   type: string;
   autoComplete: string;
-  error?: string;
 }) {
-  const errorId = `${id}-error`;
   return (
     <div className="grid gap-2">
       <Label htmlFor={id}>{label}</Label>
@@ -197,14 +174,7 @@ function Field({
         type={type}
         autoComplete={autoComplete}
         required
-        aria-invalid={error ? true : undefined}
-        aria-describedby={error ? errorId : undefined}
       />
-      {error ? (
-        <p id={errorId} className="text-destructive text-sm">
-          {error}
-        </p>
-      ) : null}
     </div>
   );
 }
