@@ -35,6 +35,8 @@ use ory_kratos_client::models::{
 };
 use salvo::prelude::*;
 
+use crate::config::Config;
+use crate::config_edit::routes::identity_schema_path;
 use crate::config_edit::schema::FieldError;
 use crate::error::AppError;
 use crate::ory::clients::OryClients;
@@ -257,6 +259,46 @@ pub async fn delete_identity(
 
     res.status_code(StatusCode::NO_CONTENT);
     Ok(())
+}
+
+// =============================================================================
+// IDENT-03: read the active identity schema (for schema-driven form generation)
+// =============================================================================
+
+/// `GET /api/kratos/identity-schema` — return the ACTIVE identity schema JSON
+/// (IDENT-03 read side).
+///
+/// Reads the server-defined file `{config_dir}/kratos/identity.schema.json` (the
+/// SAME file [`crate::config_edit::routes::put_identity_schema`] writes) and
+/// returns it verbatim as JSON, so the frontend can derive the create/edit form
+/// fields from `properties.traits` (RESEARCH Pattern 6). The path is fixed from
+/// `Config::config_dir`, never client input.
+///
+/// On the protected subtree (`auth_guard` -> 401 unauth); GET is auto-exempt from
+/// `csrf_guard`. The schema is not secret material, but it is NOT the place to
+/// leak file paths: a read/parse failure maps to a generic [`AppError`] without
+/// echoing the path (BACK-07).
+#[handler]
+pub async fn get_active_schema(
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cfg = depot
+        .obtain::<Config>()
+        .cloned()
+        .map_err(|_| AppError::Internal("config missing from depot".into()))?;
+
+    let path = identity_schema_path(&cfg.config_dir);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        // Never echo the path in the client-facing body (BACK-07); log it server-side.
+        tracing::error!(error = %e, "identity schema read failed");
+        AppError::Internal("identity schema read failed".into())
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        tracing::error!(error = %e, "identity schema parse failed");
+        AppError::Internal("identity schema parse failed".into())
+    })?;
+
+    Ok(Json(value))
 }
 
 // =============================================================================

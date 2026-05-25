@@ -67,6 +67,19 @@ fn config_file_path(config_dir: &str, svc: restart::Service) -> PathBuf {
     PathBuf::from(config_dir).join(dir).join(file)
 }
 
+/// The server-defined path of the ACTIVE Kratos identity schema FILE
+/// (`{config_dir}/kratos/identity.schema.json`).
+///
+/// IDENT-03: the schema editor targets THIS file only — it is NOT routed through
+/// the `{service}/{section}` allowlist, so it can never write an arbitrary
+/// `kratos.yml` key (config-injection guard, threat T-06-10). The path is built
+/// purely from `Config::config_dir` + fixed segments; no part is client input.
+pub fn identity_schema_path(config_dir: &str) -> PathBuf {
+    PathBuf::from(config_dir)
+        .join("kratos")
+        .join("identity.schema.json")
+}
+
 /// Pull the `(service, section)` path params, mapping a missing/empty segment to
 /// 404 (an unrecognised route shape must not fall through).
 fn path_params(req: &Request) -> Result<(String, String), AppError> {
@@ -246,6 +259,112 @@ pub async fn put_config(
     // so we must restore the `.bak`, restart AGAIN, and re-poll to bring it back
     // onto the last-known-good. The detail (service, values) is never in the body.
     tracing::warn!(service = svc.key(), "config put: health failed; rolling back");
+    rollback_and_restart(&http, &path, &cfg, svc).await;
+    Err(AppError::HealthFailed)
+}
+
+/// `PUT /api/kratos/identity-schema` — validate-as-draft-07 + atomic-write the
+/// identity schema FILE + restart Kratos + rollback on failure (IDENT-03).
+///
+/// This REUSES the Phase-4 engine's transactional machinery (lock -> validate ->
+/// backup -> atomic-write -> restart -> health-poll -> rollback) but differs from
+/// [`put_config`] in four ways:
+///   1. the target is the FIXED schema file (`identity_schema_path`), NOT a
+///      `{service}/{section}` allowlist lookup — the editor can only write the
+///      schema file, never an arbitrary `kratos.yml` key (T-06-10);
+///   2. the body is the FULL schema JSON object (not a flat pointer patch);
+///   3. validation is [`schema::validate_identity_schema`] (draft-07 metaschema +
+///      `properties.traits`-object), NOT a service-config schema check — a
+///      malformed schema crashing Kratos is the primary risk (Pitfall 5);
+///   4. the file is `.json`, so it is serialised with
+///      [`serde_json::to_string_pretty`], NOT `yaml::serialize` (RESEARCH
+///      anti-pattern: never YAML-serialise the schema file).
+///
+/// On the protected subtree: `auth_guard` (401 unauth) + `csrf_guard` (403 without
+/// `X-CSRF-Token`, since this is state-changing — T-06-14).
+#[handler]
+pub async fn put_identity_schema(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    let cfg = config_from(depot)?;
+    let svc = restart::Service::Kratos;
+
+    // Parse the body as the FULL candidate schema (a malformed body -> 400 before
+    // the lock). The candidate is the operator's proposed identity schema.
+    let candidate: Value = req
+        .parse_json()
+        .await
+        .map_err(|_| AppError::BadRequest("invalid JSON body".into()))?;
+
+    // --- Step 1: kratos write lock (busy -> 409 config_busy) -----------------
+    // Shares the per-service lock with put_config so a schema edit and a config
+    // edit for kratos can never interleave.
+    let _guard = locks::try_acquire("kratos").await?;
+    tracing::info!(service = svc.key(), "identity-schema put: lock acquired");
+
+    // --- Step 2: VALIDATE the candidate AS a draft-07 JSON Schema ------------
+    // Pitfall 5 / A3: reject a non-schema OR a schema lacking properties.traits
+    // BEFORE any disk touch (422, no write). The engine rollback is the backstop,
+    // not the primary guard.
+    if let Err(fields) = schema::validate_identity_schema(&candidate) {
+        tracing::debug!(
+            service = svc.key(),
+            count = fields.len(),
+            "identity-schema put: validation failed"
+        );
+        return Err(AppError::Validation(fields));
+    }
+
+    // --- Step 3: BACKUP the live schema file (last-known-good) ---------------
+    let path = identity_schema_path(&cfg.config_dir);
+    yaml::backup(&path)?;
+
+    // WR-02: never commit a write we cannot reverse. Assert the backup landed
+    // BEFORE the atomic write so every rollback path has a last-known-good.
+    if !yaml::backup_exists(&path) {
+        tracing::error!(
+            service = svc.key(),
+            "identity-schema put: backup missing after backup(); refusing reversible write"
+        );
+        return Err(AppError::Internal("identity schema backup missing".into()));
+    }
+
+    // --- Step 4: ATOMIC WRITE the schema as pretty JSON (NOT YAML) -----------
+    // The file is `.json`, consumed by Kratos as a JSON Schema — serialise with
+    // serde_json, not serde_yaml_ng (RESEARCH anti-pattern). The atomic write
+    // (temp+fsync+rename) is the reused engine primitive (T-06-15).
+    let serialized = serde_json::to_string_pretty(&candidate)
+        .map_err(|e| AppError::Internal(format!("serialize identity schema: {e}")))?;
+    yaml::write_atomic(&path, &serialized)?;
+    tracing::info!(service = svc.key(), status = "applied", "identity-schema put: written");
+
+    // --- Step 5: RESTART kratos via the scoped broker ------------------------
+    // WR-04/WR-05: dedicated redirect-disabled, short-timeout client.
+    let http = restart::restart_client()?;
+    tracing::info!(service = svc.key(), status = "restarting", "identity-schema put: restarting");
+    if let Err(e) = restart::restart(&http, &cfg.restart_broker_url, svc).await {
+        // BROKER-FAILURE: the service never restarted, so it still runs its old
+        // (good) schema; restore disk only so disk matches the running service.
+        tracing::warn!(
+            service = svc.key(),
+            "identity-schema put: broker restart failed; restoring disk (no re-restart)"
+        );
+        restore_only(&path, svc);
+        return Err(e);
+    }
+
+    // --- Step 6: HEALTH-POLL until ready or timeout --------------------------
+    if restart::wait_healthy(&http, svc, HEALTH_TIMEOUT, None).await {
+        tracing::info!(service = svc.key(), status = "healthy", "identity-schema put: healthy");
+        return Ok(Json(serde_json::json!({ "status": "healthy" })));
+    }
+
+    // --- Step 7: ROLLBACK on health failure ----------------------------------
+    // HEALTH-FAILURE: kratos restarted into a schema it cannot load (Pitfall 5).
+    // Restore the .bak, restart again, re-poll to bring it back onto the
+    // last-known-good schema. The detail is never in the body.
+    tracing::warn!(service = svc.key(), "identity-schema put: health failed; rolling back");
     rollback_and_restart(&http, &path, &cfg, svc).await;
     Err(AppError::HealthFailed)
 }

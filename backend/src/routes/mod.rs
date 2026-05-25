@@ -258,6 +258,19 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
             Router::with_path("api/config/{service}/{section}")
                 .get(crate::config_edit::routes::get_config)
                 .put(crate::config_edit::routes::put_config),
+        )
+        // Phase 6 (IDENT-03): the identity-schema editor. A DEDICATED route (NOT
+        // the {service}/{section} allowlist) so it can only read/write the schema
+        // FILE, never an arbitrary kratos.yml key (config-injection guard,
+        // T-06-10). GET returns the active schema (csrf-exempt); PUT validates as
+        // draft-07 + properties.traits, atomic-writes the .json, restarts Kratos
+        // via the broker, and rolls back on health failure (Pitfall 5). PUT is
+        // state-changing so `csrf_guard` enforces `X-CSRF-Token` (T-06-14); both
+        // inherit `auth_guard` (401 unauth, T-06-13).
+        .push(
+            Router::with_path("api/kratos/identity-schema")
+                .get(crate::ory::kratos::get_active_schema)
+                .put(crate::config_edit::routes::put_identity_schema),
         );
 
     // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is
