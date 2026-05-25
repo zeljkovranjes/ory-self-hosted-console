@@ -1,0 +1,23 @@
+{
+  "name": "ory-console-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ory Self-Hosted Console frontend (Phase 1 skeleton — proves the compose slot + healthcheck; real admin shell lands in Phase 5).",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "16.2.6",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "^22.10.0",
+    "@types/react": "19.2.15",
+    "@types/react-dom": "19.2.3"
+  }
+}

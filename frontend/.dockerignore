@@ -1,0 +1,17 @@
+# Build / dependency artifacts — never ship the host versions into the build context.
+node_modules
+.next
+out
+.turbo
+
+# Local env / secrets must never enter the build context (T-02-secrets-in-image).
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.idea
+.vscode
+*.swp
+.DS_Store
+npm-debug.log*
