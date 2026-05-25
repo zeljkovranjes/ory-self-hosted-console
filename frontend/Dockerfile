@@ -14,6 +14,11 @@ ARG NODE_VERSION=24-slim
 FROM node:${NODE_VERSION} AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
+# The package.json `postinstall` hook runs `node scripts/copy-monaco.mjs` (it
+# syncs monaco-editor/min/vs -> public/monaco/vs so the editor loads same-origin,
+# never from a CDN — FE-04 / MONACO.md). npm runs it after install, so the script
+# MUST be present in this layer or `npm ci` exits 1. Copy it before install.
+COPY scripts ./scripts
 # Use a clean, reproducible install when a lockfile exists; fall back to install otherwise.
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 

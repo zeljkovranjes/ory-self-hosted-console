@@ -69,8 +69,13 @@ export default function SetupPage() {
     setFieldErrors({});
     setFormError(null);
     const data = new FormData(e.currentTarget);
+    // The backend SetupRequest DTO expects the bootstrap token under the key
+    // `token` (it may alternatively arrive via the X-Setup-Token header) — NOT
+    // `bootstrap_token`. Sending the wrong key makes the backend see no token
+    // and reject /setup with 403, blocking first-run setup. (Caught by the live
+    // FE-01 auth e2e against the real backend.)
     const body = {
-      bootstrap_token: String(data.get("bootstrap_token") ?? ""),
+      token: String(data.get("bootstrap_token") ?? ""),
       name: String(data.get("name") ?? ""),
       email: String(data.get("email") ?? ""),
       password: String(data.get("password") ?? ""),
