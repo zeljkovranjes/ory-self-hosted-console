@@ -21,6 +21,7 @@
 //! binary. The error body is a generic `forbidden_key` (mapped from
 //! `AppError::Forbidden`); we deliberately never echo the rejected pointer's value.
 
+use crate::config_edit::yaml::{canonical_pointer, pointer_tokens};
 use crate::error::AppError;
 use serde_json::Value;
 
@@ -90,16 +91,36 @@ pub fn lookup(service: &str, section: &str) -> Result<&'static SectionAllowlist,
         .ok_or(AppError::NotFound)
 }
 
-/// True if `pointer` is sensitive: it equals a `SENSITIVE_PREFIXES` entry or sits
-/// directly under one (segment-boundary match, so `/secrets` blocks
+/// True if `canonical` is sensitive: it equals a `SENSITIVE_PREFIXES` entry or
+/// sits directly under one (segment-boundary match, so `/secrets` blocks
 /// `/secrets/cookie/0` but never a sibling like `/secretsX`).
-fn is_sensitive(pointer: &str) -> bool {
+///
+/// CR-01: the argument MUST be the CANONICAL pointer form produced by
+/// `canonical_pointer(&pointer_tokens(raw))` — the SAME normalisation the
+/// writer ([`super::yaml::apply_patch`]) addresses the doc with. Because the
+/// `SENSITIVE_PREFIXES` entries themselves contain no `~`/`/`-escaped segment,
+/// they are already canonical, so a denylist node reached via ANY escape
+/// spelling (e.g. `/secrets/cipher~0/0`) canonicalises here and is still caught
+/// — the gate no longer depends on the implicit "a literal `/` cannot be encoded
+/// past the split" invariant.
+pub(crate) fn is_sensitive(canonical: &str) -> bool {
     SENSITIVE_PREFIXES.iter().any(|prefix| {
-        pointer == *prefix
-            || pointer
+        canonical == *prefix
+            || canonical
                 .strip_prefix(prefix)
                 .is_some_and(|rest| rest.starts_with('/'))
     })
+}
+
+/// Normalise a raw client pointer to its canonical RFC-6901 spelling: decode the
+/// escapes ONCE and re-encode. `canonicalize("/a/b~1c")` and
+/// `canonicalize("/a/b~1c")` agree; an over/odd-escaped spelling that decodes to
+/// the same tokens yields the same canonical string the writer will address.
+///
+/// This is the single normal form the gate matches on so the allowlist and the
+/// writer can never disagree about the target (CR-01).
+fn canonicalize(pointer: &str) -> String {
+    canonical_pointer(&pointer_tokens(pointer))
 }
 
 /// Filter an incoming patch against a section allowlist + the sensitive denylist.
@@ -120,15 +141,32 @@ pub fn filter(
 ) -> Result<Vec<(String, Value)>, AppError> {
     let mut accepted = Vec::with_capacity(patch.len());
     for (pointer, value) in patch {
-        // Gate 1: hard sensitive denylist — wins over any allowlist.
-        if is_sensitive(pointer) {
+        // CR-01: canonicalise the incoming pointer ONCE (decode escapes, then
+        // re-encode) so BOTH gates AND the downstream writer address the exact
+        // same node. The gate's verdict can no longer disagree with the location
+        // `yaml::apply_patch` will write.
+        let canonical = canonicalize(pointer);
+
+        // Gate 1: hard sensitive denylist — wins over any allowlist. Run on the
+        // canonical form so a sensitive node reached via any escape spelling is
+        // still denied.
+        if is_sensitive(&canonical) {
             return Err(AppError::Forbidden);
         }
-        // Gate 2: default-deny full-pointer allowlist membership.
-        if !allowlist.allowed_paths.contains(&pointer.as_str()) {
+        // Gate 2: default-deny full-pointer allowlist membership. Compare the
+        // canonical incoming pointer against the canonical spelling of each
+        // allowed path so an allowlisted key whose name needs escaping matches
+        // regardless of the (equivalent) escape spelling the client sent.
+        let allowed = allowlist
+            .allowed_paths
+            .iter()
+            .any(|allowed| canonicalize(allowed) == canonical);
+        if !allowed {
             return Err(AppError::Forbidden);
         }
-        accepted.push((pointer.clone(), value.clone()));
+        // Forward the CANONICAL pointer (not the raw client spelling) so the
+        // writer addresses exactly the node the gate just authorised.
+        accepted.push((canonical, value.clone()));
     }
     Ok(accepted)
 }
@@ -239,6 +277,76 @@ mod tests {
         assert!(matches!(lookup("hydra", "session"), Err(AppError::NotFound)));
         let found = lookup("kratos", "session").expect("kratos/session is registered");
         assert_eq!(found.allowed_paths.len(), 3);
+    }
+
+    #[test]
+    fn escaped_pointer_gate_agrees_with_writer_target() {
+        // CR-01: an allowlist whose key literally contains `~` and `/` must be
+        // matched by the gate under ANY equivalent escape spelling, and the
+        // location the gate authorises must be EXACTLY where apply_patch writes.
+        use crate::config_edit::yaml;
+        use serde_json::json;
+
+        // Allowed key is `same~site` (contains `~`) nested under a key `a/b`
+        // (contains `/`). Canonical spelling: `/a~1b/same~0site`.
+        let al = SectionAllowlist {
+            service: "kratos",
+            section: "escaped",
+            allowed_paths: &["/a~1b/same~0site"],
+        };
+
+        // The client sends the SAME canonical spelling -> accepted, and the
+        // forwarded (canonical) pointer addresses the literal-keyed node.
+        let patch = vec![("/a~1b/same~0site".to_string(), json!("Lax"))];
+        let accepted = filter(&al, &patch).expect("canonical escaped pointer is allowlisted");
+        assert_eq!(accepted.len(), 1);
+        let mut doc = json!({});
+        yaml::apply_patch(&mut doc, &accepted).expect("apply the accepted patch");
+        // The decoded tokens are ["a/b", "same~site"]; serde_json::pointer
+        // re-decodes the canonical pointer to the SAME tokens, so this resolves.
+        assert_eq!(
+            doc.pointer("/a~1b/same~0site"),
+            Some(&json!("Lax")),
+            "the gate-authorised canonical pointer addresses the literal-keyed node"
+        );
+        // Verify the actual object key is the DECODED literal name.
+        assert_eq!(doc["a/b"]["same~site"], json!("Lax"));
+
+        // A pointer that decodes to DIFFERENT tokens than the allowlist key is
+        // rejected (no raw-string coincidence can sneak past the canonical match).
+        let evil = vec![("/a~1b/same~1site".to_string(), json!("x"))]; // `same/site` != `same~site`
+        assert!(matches!(filter(&al, &evil), Err(AppError::Forbidden)));
+    }
+
+    #[test]
+    fn sensitive_via_escape_spelling_still_denied() {
+        // CR-01: a sensitive node addressed with an escaped spelling that decodes
+        // back onto a denylist prefix is still caught by the canonical denylist.
+        // `/secrets~1x` decodes to the single token `secrets/x` (NOT under
+        // `/secrets`), so it must NOT be falsely blocked...
+        let permissive = SectionAllowlist {
+            service: "kratos",
+            section: "evil",
+            allowed_paths: &["/secrets~1x"],
+        };
+        let patch = vec![("/secrets~1x".to_string(), json!("ok"))];
+        assert!(
+            filter(&permissive, &patch).is_ok(),
+            "/secrets~1x is the single key `secrets/x`, not under /secrets"
+        );
+
+        // ...while `/secrets/cipher~00` (an over-escaped child of /secrets)
+        // canonicalises under `/secrets` and is denied regardless of allowlisting.
+        let denied = SectionAllowlist {
+            service: "kratos",
+            section: "evil2",
+            allowed_paths: &["/secrets/cipher~00"],
+        };
+        let patch2 = vec![("/secrets/cipher~00".to_string(), json!("x"))];
+        assert!(
+            matches!(filter(&denied, &patch2), Err(AppError::Forbidden)),
+            "an escaped child of /secrets must still be denied"
+        );
     }
 
     #[test]

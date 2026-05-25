@@ -34,7 +34,15 @@ salvo = { version = "0.93.0", features = [
 ] }
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0"
+# WR-06: `preserve_order` makes serde_json::Value back an `IndexMap` (insertion
+# order) instead of a `BTreeMap` (alphabetical). Without it, the FIRST save of an
+# operator's hand-authored kratos.yml/hydra.yml rewrites the whole file in
+# alphabetical key order — a noisy diff that destroys the operator's grouping on
+# a file they may also hand-edit. With it, the round-trip through yaml.rs
+# preserves the original key ORDER of unmanaged keys (comment loss remains, per
+# the documented best-effort caveat). serde_yaml_ng serializes via the serde data
+# model, so the ordered Value round-trips key order through write-back.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

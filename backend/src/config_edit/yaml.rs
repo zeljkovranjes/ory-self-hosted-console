@@ -13,15 +13,18 @@
 //!   written to disk (and returned to the client) therefore never contains `dsn`,
 //!   even though the overlay was used to validate it.
 //!
-//! ## Serialization & ordering (Pitfall 3)
+//! ## Serialization & ordering (Pitfall 3 / WR-06)
 //!
-//! `serde_json::Value` is built WITHOUT the `preserve_order` feature, so its map is
-//! a `BTreeMap` (keys sort lexicographically). The round-trip through this module
-//! is therefore deterministic but does NOT preserve the operator's original key
-//! ORDER, and it DROPS YAML comments (the serde data model has no comment node).
-//! Comment loss is accepted per CONTEXT ("best-effort"); operators must not rely on
-//! comments in editable files. We serialize with a SINGLE consistent path
-//! ([`serde_yaml_ng::to_string`] of the `serde_json::Value`) so behavior is stable.
+//! `serde_json::Value` is built WITH the `preserve_order` feature (see
+//! `backend/Cargo.toml`), so its map is an `IndexMap` that keeps INSERTION order.
+//! The round-trip through this module therefore PRESERVES the operator's original
+//! key ORDER for unmanaged keys: the first save of a hand-authored file no longer
+//! alphabetises it into a noisy diff. The round-trip still DROPS YAML comments
+//! (the serde data model has no comment node); comment loss is accepted per
+//! CONTEXT ("best-effort") and documented in the README — operators must not rely
+//! on comments in editable files. We serialize with a SINGLE consistent path
+//! ([`serde_yaml_ng::to_string`] of the order-preserving `serde_json::Value`) so
+//! behavior is stable.
 
 use std::io::Write;
 use std::path::Path;
@@ -62,7 +65,13 @@ pub fn serialize(doc: &Value) -> Result<String, AppError> {
 ///
 /// `""` -> empty (the whole document); `/a/b~1c` -> `["a", "b/c"]`. Unescapes
 /// `~1`->`/` and `~0`->`~` (order matters: `~1`/`~0` first, then `~`-escapes).
-fn pointer_tokens(pointer: &str) -> Vec<String> {
+///
+/// This is the SINGLE canonical decode the whole subsystem agrees on: the
+/// allowlist gate ([`super::allowlist::filter`]) decodes the incoming pointer
+/// with this same function so the gate's verdict is computed against the exact
+/// token sequence [`apply_patch`] will use to address the doc (CR-01 — the gate
+/// and the writer must compute the identical target).
+pub(crate) fn pointer_tokens(pointer: &str) -> Vec<String> {
     if pointer.is_empty() {
         return Vec::new();
     }
@@ -71,6 +80,26 @@ fn pointer_tokens(pointer: &str) -> Vec<String> {
         .skip(1) // the leading "" before the first '/'
         .map(|t| t.replace("~1", "/").replace("~0", "~"))
         .collect()
+}
+
+/// Re-encode decoded reference tokens into the CANONICAL RFC-6901 pointer
+/// (`~`->`~0`, `/`->`~1`, in that order, joined by `/` with a leading `/`).
+///
+/// `["a", "b/c"]` -> `/a/b~1c`; `[]` -> `""`. Pairing [`pointer_tokens`] with
+/// this gives an idempotent normal form: `canonical_pointer(&pointer_tokens(p))`
+/// is the unique canonical spelling of `p`. The allowlist gate matches on this
+/// form so any escape spelling that DECODES to the same tokens (and only those)
+/// is accepted, and the gate can never disagree with the writer about the
+/// target (CR-01).
+pub(crate) fn canonical_pointer(tokens: &[String]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        out.push('/');
+        // Order matters: escape `~` first, THEN `/`, so a literal `/` does not
+        // get double-escaped by the `~`->`~0` pass.
+        out.push_str(&token.replace('~', "~0").replace('/', "~1"));
+    }
+    out
 }
 
 /// Apply an ALREADY-ALLOWLIST-FILTERED patch into the FULL file doc, CREATING
@@ -168,15 +197,51 @@ pub fn backup(target: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// True iff the last-known-good backup for `target` (`<target>.bak`) exists.
+///
+/// WR-02: the PUT flow asserts this immediately AFTER [`backup`] and BEFORE the
+/// `write_atomic` it intends to be reversible, so the engine never commits a
+/// write it cannot roll back.
+pub fn backup_exists(target: &Path) -> bool {
+    backup_path(target).is_file()
+}
+
+/// Outcome of a [`restore`] attempt — distinguishes a real rollback from the
+/// "there was no backup to restore" case (WR-02). The caller must NOT claim
+/// "rolled back to last-known-good" on [`RestoreOutcome::NoBackup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The `.bak` existed and was written back over `target` byte-for-byte.
+    Restored,
+    /// No `.bak` existed: nothing was restored. The live file is UNCHANGED
+    /// (still whatever the failing flow last wrote) — a distinct, loud condition.
+    NoBackup,
+}
+
 /// Restore `target` byte-for-byte from `<target>.bak` via an atomic write, so a
 /// failed restore can never leave a torn live file (threat T-04-07).
-pub fn restore(target: &Path) -> Result<(), AppError> {
+///
+/// WR-02: a MISSING backup is NOT a generic internal error that silently leaves
+/// the (possibly broken) live file in place — it is reported distinctly as
+/// [`RestoreOutcome::NoBackup`] so the caller never claims a rollback that did
+/// not happen. A backup that EXISTS but cannot be read/written is still a hard
+/// `AppError::Internal` (a genuine IO fault).
+pub fn restore(target: &Path) -> Result<RestoreOutcome, AppError> {
     let bak = backup_path(target);
+    if !bak.is_file() {
+        // No last-known-good to restore. Surface it loudly and distinctly; the
+        // caller must not report "rolled back" (WR-02).
+        tracing::error!(
+            "config restore: NO backup present — cannot roll back; live file left as-is"
+        );
+        return Ok(RestoreOutcome::NoBackup);
+    }
     let contents = std::fs::read_to_string(&bak).map_err(|e| {
         tracing::error!(error = %e, "config restore: backup read failed");
         AppError::Internal("config restore failed".to_string())
     })?;
-    write_atomic(target, &contents)
+    write_atomic(target, &contents)?;
+    Ok(RestoreOutcome::Restored)
 }
 
 #[cfg(test)]
@@ -251,14 +316,96 @@ mod tests {
         write_atomic(&target, "version: 2\n").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "version: 2\n");
 
-        // restore returns the file byte-identical to the backup.
-        restore(&target).unwrap();
+        // A backup is present, so backup_exists is true (WR-02 invariant the PUT
+        // flow asserts before committing a reversible write).
+        assert!(backup_exists(&target), "backup present after backup()");
+
+        // restore returns Restored and the file is byte-identical to the backup.
+        assert_eq!(restore(&target).unwrap(), RestoreOutcome::Restored);
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             std::fs::read_to_string(&bak).unwrap(),
             "restore is byte-identical to the .bak"
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "version: 1\n");
+    }
+
+    #[test]
+    fn restore_without_backup_reports_no_backup_distinctly() {
+        // WR-02: with NO `.bak`, restore must NOT hard-fail and must NOT claim a
+        // rollback — it returns NoBackup and leaves the live file untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("kratos.yml");
+        write_atomic(&target, "version: 99\n").unwrap();
+        assert!(!backup_exists(&target), "precondition: no .bak");
+
+        let outcome = restore(&target).expect("missing backup is not a hard error");
+        assert_eq!(outcome, RestoreOutcome::NoBackup);
+        // The live file is unchanged (nothing to restore from).
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "version: 99\n");
+    }
+
+    #[test]
+    fn round_trip_preserves_unmanaged_key_order() {
+        // WR-06: with serde_json `preserve_order`, loading a hand-authored,
+        // NON-alphabetical YAML and serializing it back keeps the operator's key
+        // ORDER (no alphabetisation on the first save).
+        let yaml = "version: v0.13.0\n\
+                    serve:\n  \
+                      public:\n    \
+                        base_url: http://kratos:4433/\n  \
+                      admin:\n    \
+                        base_url: http://kratos:4434/\n\
+                    selfservice:\n  \
+                      default_browser_return_url: http://localhost:3000/\n\
+                    identity:\n  \
+                      default_schema_id: default\n";
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("kratos.yml");
+        std::fs::write(&p, yaml).unwrap();
+
+        let doc = load(&p).expect("load ok");
+        // Top-level key order as authored (NOT alphabetical — `version` would
+        // sort after `selfservice`/`serve`/`identity` under a BTreeMap).
+        let top_keys: Vec<&str> = doc
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            top_keys,
+            vec!["version", "serve", "selfservice", "identity"],
+            "top-level key order must match the authored order, not alphabetical"
+        );
+
+        // Serialize back and reparse: the order survives the full round-trip.
+        let out = serialize(&doc).expect("serialize ok");
+        let reparsed = load_from_str(&out);
+        let reparsed_keys: Vec<&str> = reparsed
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            reparsed_keys,
+            vec!["version", "serve", "selfservice", "identity"],
+            "serialized YAML must preserve the unmanaged key order"
+        );
+        // Nested order preserved too (public before admin).
+        let serve_keys: Vec<&str> = reparsed["serve"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(serve_keys, vec!["public", "admin"], "nested order preserved");
+    }
+
+    /// Parse YAML text into a Value via the same path `load` uses (for tests).
+    fn load_from_str(text: &str) -> Value {
+        serde_yaml_ng::from_str(text).expect("reparse YAML")
     }
 
     #[test]
