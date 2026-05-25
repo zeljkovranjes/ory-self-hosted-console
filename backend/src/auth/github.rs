@@ -22,13 +22,10 @@
 //! Secrets: the client secret and the GitHub bearer token are NEVER logged and
 //! NEVER serialized into a response (BACK-07).
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl,
 };
-use rand::Rng;
 use salvo::http::cookie::time::Duration as CookieDuration;
 use salvo::http::cookie::{Cookie, SameSite};
 use salvo::prelude::*;
@@ -130,9 +127,18 @@ fn set_state_cookie(res: &mut Response, state: &str, cfg: &Config) {
     res.add_cookie(builder.build());
 }
 
-/// Clear the state-nonce cookie once consumed (single-use).
-fn clear_state_cookie(res: &mut Response) {
-    res.remove_cookie(STATE_COOKIE);
+/// Clear the state-nonce cookie once consumed (single-use). WR-05: emit an
+/// explicit expired cookie mirroring the SET attributes (Path=/, HttpOnly,
+/// SameSite=Lax, Secure in the hardened posture) so the overwrite is reliably
+/// honored rather than a name-only removal the browser may ignore.
+fn clear_state_cookie(res: &mut Response, cfg: &Config) {
+    let mut builder = Cookie::build((STATE_COOKIE, ""))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(CookieDuration::seconds(0));
+    builder = builder.secure(!cfg.insecure_cookies);
+    res.add_cookie(builder.build());
 }
 
 /// `GET /auth/github/login` — start the OAuth dance. Builds the authorize URL
@@ -236,7 +242,7 @@ pub async fn github_callback(
         .filter(|v| !v.is_empty())
         .ok_or(AppError::Forbidden)?;
     // Single-use: clear the nonce regardless of the outcome below.
-    clear_state_cookie(res);
+    clear_state_cookie(res, &cfg);
     if !ct_eq(&query.state, &nonce) {
         return Err(AppError::Forbidden);
     }
@@ -270,18 +276,45 @@ pub async fn github_callback(
     // Link-or-deny (T-02-32): match an existing admin by github_user_id, then by
     // verified primary email. NEVER auto-provision a new admin.
     let admin = match queries::find_admin_by_github_id(&pool, user.id).await? {
+        // Already linked by the durable numeric id — the unambiguous, trusted path.
         Some(a) => a,
         None => match &verified_primary {
-            Some(email) => queries::find_admin_by_email(&pool, email)
-                .await?
-                .ok_or(AppError::Forbidden)?,
+            // WR-04: email-fallback linking is a one-time bootstrap convenience
+            // and is UNAMBIGUOUS only while a single admin exists. Once Phase 11
+            // introduces multiple admins, a GitHub account whose verified primary
+            // email coincides with an admin's email must NOT be able to link in
+            // by email coincidence alone — so restrict the fallback to the
+            // single-admin case and deny otherwise (operator must link while
+            // logged in, proving ownership by the password session).
+            Some(email) => {
+                if queries::count_admins(&pool).await? != 1 {
+                    return Err(AppError::Forbidden);
+                }
+                let candidate = queries::find_admin_by_email(&pool, email)
+                    .await?
+                    .ok_or(AppError::Forbidden)?;
+                // Refuse to MOVE an existing link: if the matched admin is
+                // already bound to a DIFFERENT GitHub id, deny rather than
+                // silently overwriting which GitHub account owns this admin.
+                if let Some(existing) = candidate.github_user_id {
+                    if existing != user.id {
+                        return Err(AppError::Forbidden);
+                    }
+                }
+                candidate
+            }
             None => return Err(AppError::Forbidden),
         },
     };
 
-    // Persist the GitHub id on first link (idempotent on re-login).
-    if admin.github_user_id != Some(user.id) {
-        queries::link_github(&pool, admin.id, user.id).await?;
+    // Persist the GitHub id on first link only. If the admin is already linked to
+    // a DIFFERENT non-null id we never reach a relink here (the by-id lookup above
+    // returned this admin only for an exact id match; the email path denied a
+    // mismatch), so this is a no-op on re-login and a first-time bind otherwise.
+    match admin.github_user_id {
+        Some(existing) if existing != user.id => return Err(AppError::Forbidden),
+        Some(_) => {} // already linked to this id — idempotent no-op.
+        None => queries::link_github(&pool, admin.id, user.id).await?,
     }
 
     // Regenerate-on-auth: clear stale sessions, mint a fresh one, set the cookie.
@@ -326,14 +359,4 @@ async fn github_get<T: for<'de> serde::Deserialize<'de>>(
         return Err(AppError::Unauthorized);
     }
     resp.json::<T>().await.map_err(|_| AppError::Unauthorized)
-}
-
-/// Encode 32 random bytes as base64url-no-pad. (Reserved for any future
-/// server-side nonce store; the cookie nonce currently uses the oauth2
-/// `CsrfToken`.)
-#[allow(dead_code)]
-fn random_nonce() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
 }

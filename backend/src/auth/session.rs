@@ -144,13 +144,24 @@ pub fn set_session_cookie(res: &mut Response, raw_token: &str, max_age_secs: i64
     res.add_cookie(builder.build());
 }
 
-/// Clear the session cookie (logout). Uses the in-force name and Path=/ so the
-/// browser drops the matching cookie.
+/// Clear the session cookie (logout). WR-05: emit an explicit EXPIRED cookie
+/// that mirrors the SET attributes (same name, Path=/, HttpOnly, SameSite=Lax,
+/// and Secure in the hardened posture) with an empty value + Max-Age=0. A bare
+/// name-only `remove_cookie` can be ignored by the browser for a `__Host-`
+/// prefixed cookie (the clearing Set-Cookie must itself satisfy Secure+Path=/),
+/// leaving a stale cookie behind. Building the overwrite explicitly guarantees
+/// the browser drops the matching cookie.
 pub fn clear_session_cookie(res: &mut Response, cfg: &Config) {
     let name = cookie_name(cfg);
-    // remove_cookie takes the cookie name (Salvo 0.93 verified signature); it
-    // emits a Set-Cookie with an immediate expiry for that name.
-    res.remove_cookie(name);
+    let mut builder = Cookie::build((name, ""))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(CookieDuration::seconds(0));
+    // Secure must match the SET cookie so the overwrite is accepted (mandatory
+    // for the `__Host-` prefix; dropped only under the dev escape hatch).
+    builder = builder.secure(!cfg.insecure_cookies);
+    res.add_cookie(builder.build());
 }
 
 #[cfg(test)]
@@ -202,6 +213,40 @@ mod tests {
         assert_eq!(c.secure(), Some(true));
         assert_eq!(c.same_site(), Some(SameSite::Lax));
         assert_eq!(c.path(), Some("/"));
+    }
+
+    #[test]
+    fn clear_session_cookie_overwrites_with_expired_hardened_attrs() {
+        // WR-05: the logout Set-Cookie must carry the SAME attributes as the set
+        // cookie (name, Path=/, Secure, HttpOnly, Lax) with an empty value, so a
+        // `__Host-` prefixed cookie is actually overwritten.
+        let mut res = Response::new();
+        clear_session_cookie(&mut res, &cfg(false));
+        let c = res
+            .cookies()
+            .get(COOKIE_HOST)
+            .expect("clear emits a Set-Cookie under the hardened name");
+        assert_eq!(c.name(), "__Host-console_session");
+        assert_eq!(c.value(), "");
+        assert_eq!(c.path(), Some("/"));
+        assert_eq!(c.secure(), Some(true));
+        assert_eq!(c.http_only(), Some(true));
+        assert_eq!(c.same_site(), Some(SameSite::Lax));
+        // Expired immediately (Max-Age=0).
+        assert_eq!(c.max_age(), Some(CookieDuration::seconds(0)));
+    }
+
+    #[test]
+    fn clear_session_cookie_dev_drops_secure() {
+        let mut res = Response::new();
+        clear_session_cookie(&mut res, &cfg(true));
+        let c = res
+            .cookies()
+            .get(COOKIE_DEV)
+            .expect("clear emits a Set-Cookie under the dev name");
+        assert_eq!(c.value(), "");
+        assert_eq!(c.path(), Some("/"));
+        assert_ne!(c.secure(), Some(true));
     }
 
     #[test]
