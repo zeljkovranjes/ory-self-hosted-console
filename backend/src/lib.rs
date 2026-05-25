@@ -1,0 +1,10 @@
+//! Ory Self-Hosted Console — backend library crate.
+//!
+//! The binary (`main.rs`) is a thin bootstrap over this library; integration
+//! tests under `tests/` import these modules (`ory_console_backend::*`) to
+//! exercise the real router/handlers with Salvo `TestClient`.
+
+pub mod config;
+pub mod db;
+pub mod error;
+pub mod routes;

@@ -7,6 +7,10 @@ description = "Ory Self-Hosted Console backend — single API layer the frontend
 license = "Apache-2.0"
 publish = false
 
+[lib]
+name = "ory_console_backend"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ory-console-backend"
 path = "src/main.rs"

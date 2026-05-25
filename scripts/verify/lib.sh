@@ -382,6 +382,146 @@ assert_grep_count() {
   return 1
 }
 
+# =============================================================================
+# Phase 2 auth assert helpers (live-stack HTTP).
+#
+# Base URL is overridable; defaults to the host-published backend port.
+# Every NEGATIVE helper obeys the anti-false-green contract (T-03): it PASSes
+# only on the EXPLICIT expected code/condition and FAILs on empty output or any
+# unexpected (often 2xx) result — never green merely because output is empty.
+# =============================================================================
+: "${BACKEND_BASE_URL:=http://localhost:${BACKEND_PORT:-8080}}"
+
+# --- assert_status <method> <url> <expected_code> ----------------------------
+# Issue <method> <url> and PASS only when the HTTP status EXACTLY equals
+# <expected_code>. Optional request body via $REQ_DATA (sent as JSON) and extra
+# header via $REQ_HEADER. An empty/unreadable code (connection error) FAILs.
+assert_status() {
+  local method="$1" url="$2" expected="$3" code
+  local -a curlargs=(-s -o /dev/null -w '%{http_code}' --max-time 10 -X "$method")
+  if [ -n "${REQ_DATA:-}" ]; then
+    curlargs+=(-H 'Content-Type: application/json' --data "$REQ_DATA")
+  fi
+  if [ -n "${REQ_HEADER:-}" ]; then
+    curlargs+=(-H "$REQ_HEADER")
+  fi
+  code="$(curl "${curlargs[@]}" "$url" 2>/dev/null)"
+  if [ -z "$code" ]; then
+    _fail "assert_status $method $url: no response (connection error; want $expected)"
+    return 1
+  fi
+  if [ "$code" = "$expected" ]; then
+    _pass "assert_status $method $url: $code (expected $expected)"
+    return 0
+  fi
+  _fail "assert_status $method $url: got '$code' (expected $expected)"
+  return 1
+}
+
+# --- assert_route_absent <url> -----------------------------------------------
+# Negative assertion: a route that must NOT exist (e.g. /auth/github/login when
+# OAuth is unconfigured, or /setup after init). PASS ONLY on an explicit 404.
+# Any 2xx/3xx (route present) or empty code (connection error) FAILs.
+assert_route_absent() {
+  local url="$1" code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null)"
+  if [ -z "$code" ]; then
+    _fail "assert_route_absent $url: no response (connection error; want 404)"
+    return 1
+  fi
+  if [ "$code" = "404" ]; then
+    _pass "assert_route_absent $url: 404 (absent)"
+    return 0
+  fi
+  _fail "assert_route_absent $url: got '$code' (route PRESENT; want 404)"
+  return 1
+}
+
+# --- assert_set_cookie_flags <url> <data> ------------------------------------
+# POST <data> (JSON) to <url> and inspect the response headers. PASS ONLY when a
+# `Set-Cookie: __Host-console_session=...` line is present AND carries HttpOnly,
+# Secure, SameSite=Lax, and Path=/. Missing header or any missing flag FAILs
+# (never green on empty headers).
+assert_set_cookie_flags() {
+  local url="$1" data="$2" headers line
+  headers="$(curl -s -D - -o /dev/null --max-time 10 \
+      -H 'Content-Type: application/json' --data "$data" "$url" 2>/dev/null)"
+  if [ -z "$headers" ]; then
+    _fail "assert_set_cookie_flags $url: no response headers (connection error)"
+    return 1
+  fi
+  # Extract the session Set-Cookie line (case-insensitive header name).
+  line="$(printf '%s' "$headers" | grep -iE '^Set-Cookie:[[:space:]]*__Host-console_session=' | head -n1)"
+  if [ -z "$line" ]; then
+    _fail "assert_set_cookie_flags $url: no '__Host-console_session' Set-Cookie present"
+    return 1
+  fi
+  local missing=""
+  printf '%s' "$line" | grep -qi 'HttpOnly'      || missing="$missing HttpOnly"
+  printf '%s' "$line" | grep -qi 'Secure'        || missing="$missing Secure"
+  printf '%s' "$line" | grep -qi 'SameSite=Lax'  || missing="$missing SameSite=Lax"
+  printf '%s' "$line" | grep -qi 'Path=/'        || missing="$missing Path=/"
+  if [ -n "$missing" ]; then
+    _fail "assert_set_cookie_flags $url: cookie missing flag(s):$missing"
+    return 1
+  fi
+  _pass "assert_set_cookie_flags $url: __Host-console_session HttpOnly+Secure+SameSite=Lax+Path=/"
+  return 0
+}
+
+# --- assert_no_secret_in_body <method> <url> ---------------------------------
+# Fetch the response body and PASS ONLY when it is non-empty AND contains NONE
+# of the secret markers (password_hash, token_hash, bootstrap, client_secret,
+# $argon2, postgres:// DSN). An EMPTY body FAILs (anti-false-green: we never
+# green on absence of output). Optional $REQ_DATA / $REQ_HEADER as in assert_status.
+assert_no_secret_in_body() {
+  local method="$1" url="$2" body
+  local -a curlargs=(-s --max-time 10 -X "$method")
+  if [ -n "${REQ_DATA:-}" ]; then
+    curlargs+=(-H 'Content-Type: application/json' --data "$REQ_DATA")
+  fi
+  if [ -n "${REQ_HEADER:-}" ]; then
+    curlargs+=(-H "$REQ_HEADER")
+  fi
+  body="$(curl "${curlargs[@]}" "$url" 2>/dev/null)"
+  if [ -z "$body" ]; then
+    _fail "assert_no_secret_in_body $method $url: empty body (cannot confirm secret-absence)"
+    return 1
+  fi
+  if printf '%s' "$body" | grep -qiE 'password_hash|token_hash|bootstrap|client_secret|\$argon2|postgres://'; then
+    _fail "assert_no_secret_in_body $method $url: SECRET marker found in response body"
+    return 1
+  fi
+  _pass "assert_no_secret_in_body $method $url: no secret markers present"
+  return 0
+}
+
+# --- assert_rate_limited <url> <data> <count> --------------------------------
+# Fire <count> POSTs of <data> at <url>; PASS ONLY if AT LEAST one response is
+# 429 (rate limit tripped). Zero 429s (or all-empty responses) FAILs — we never
+# green on absence of a 429.
+assert_rate_limited() {
+  local url="$1" data="$2" count="$3" i code saw_429=0 saw_any=0
+  for i in $(seq 1 "$count"); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        -H 'Content-Type: application/json' --data "$data" "$url" 2>/dev/null)"
+    [ -n "$code" ] && saw_any=1
+    if [ "$code" = "429" ]; then
+      saw_429=1
+    fi
+  done
+  if [ "$saw_any" = "0" ]; then
+    _fail "assert_rate_limited $url: no responses at all over $count requests (connection error)"
+    return 1
+  fi
+  if [ "$saw_429" = "1" ]; then
+    _pass "assert_rate_limited $url: at least one 429 over $count requests"
+    return 0
+  fi
+  _fail "assert_rate_limited $url: no 429 over $count requests (rate limit NOT enforced)"
+  return 1
+}
+
 # --- summary -----------------------------------------------------------------
 # Print totals and set the conventional exit code. The sourcing script should
 # call `summary; exit $?` (or `exit $(summary >/dev/null; echo $?)`).

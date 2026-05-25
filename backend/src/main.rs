@@ -1,60 +1,58 @@
-//! Ory Self-Hosted Console — backend skeleton (Phase 1).
+//! Ory Self-Hosted Console — backend (Phase 2).
 //!
-//! This is intentionally minimal: it stands up the empty Salvo server slot in
-//! the compose graph (Plan 04) and exposes `GET /health` so the container has a
-//! healthcheck target and can serve as the curl source for the Plan 03 internal
-//! network probes. It contains NO real application logic — no Ory clients, no
-//! auth, no persistence, no config subsystem. Those land in Phase 2.
+//! Structured Salvo application that is the single authenticated API layer
+//! (BACK-01) with its own `console` Postgres database (BACK-03) and secret-safe
+//! error handling (BACK-07). Bootstrap order (RESEARCH "Bootstrap order"):
 //!
-//! Bind address is read from the `BACKEND_BIND_ADDR` env var (default
-//! `0.0.0.0:8080`) so Plan 04 / the operator can override it without rebuilding.
+//!   init tracing -> Config::from_env -> build PgPool -> sqlx::migrate!() -> serve
+//!
+//! Migrations run BEFORE the listener binds, so the schema is always present by
+//! the time `/health` answers. The auth subsystem (setup/login/session/
+//! middleware/CSRF/github) lands in Plans 02-02..04 under `mod auth`.
 
 use salvo::prelude::*;
 
-/// Default bind address. Listens on all interfaces so the container is reachable
-/// from both the edge network (host-published) and the internal network (where
-/// the Plan 03 harness probes `backend:8080/health`).
-const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
+use ory_console_backend::config::Config;
+use ory_console_backend::error::AppError;
+use ory_console_backend::{db, routes};
 
-/// Liveness/readiness probe.
-///
-/// Returns HTTP 200 with a small JSON body. The body content is not part of any
-/// contract this phase — only the 200 status matters for the healthcheck. Real
-/// readiness semantics (DB reachable, Ory reachable) are a Phase 2 concern.
-#[handler]
-async fn health(res: &mut Response) {
-    res.status_code(StatusCode::OK);
-    res.render(Json(serde_json::json!({ "status": "ok" })));
-}
-
-/// Root placeholder so a manual `GET /` does not 404 during smoke checks.
-#[handler]
-async fn index() -> &'static str {
-    "ory-console-backend: ok"
-}
-
-fn build_router() -> Router {
-    Router::new()
-        .get(index)
-        .push(Router::with_path("health").get(health))
-}
-
-#[tokio::main]
-async fn main() {
+/// Initialize structured logging. Keeps the Phase-1 default filter ("info").
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
 
-    let bind_addr =
-        std::env::var("BACKEND_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+    init_tracing();
 
-    let router = build_router();
+    // Config first — never logs the DSN or any secret (redacting Debug).
+    let cfg = Config::from_env()?;
 
-    tracing::info!(%bind_addr, "starting ory-console-backend skeleton");
+    // Console-DB pool. The DSN is a secret; build_pool maps failures to the
+    // generic AppError::Db (no DSN in the message).
+    let pool = db::build_pool(&cfg.console_database_url).await?;
+
+    // Run migrations BEFORE binding; idempotent. AppError::Migrate -> 500-class
+    // exit with a generic message (no connection string leaked).
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    tracing::info!("console DB migrations applied");
+
+    // Owned bind address: TcpListener::new requires a 'static address, and `cfg`
+    // is moved into the router below.
+    let bind_addr = cfg.bind_addr.clone();
+
+    // Build the router (affix_state injects pool + cfg into every Depot).
+    let router = routes::build(pool.clone(), cfg);
+
+    tracing::info!(%bind_addr, "starting ory-console-backend");
 
     let acceptor = TcpListener::new(bind_addr).bind().await;
     Server::new(acceptor).serve(router).await;
+
+    Ok(())
 }
