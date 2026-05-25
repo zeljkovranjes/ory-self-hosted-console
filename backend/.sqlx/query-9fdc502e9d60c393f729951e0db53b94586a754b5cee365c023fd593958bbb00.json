@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO console_settings (id, initialized, bootstrap_token_hash)\n        VALUES (true, false, $1)\n        ON CONFLICT (id) DO UPDATE\n            SET bootstrap_token_hash = EXCLUDED.bootstrap_token_hash,\n                initialized = false\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9fdc502e9d60c393f729951e0db53b94586a754b5cee365c023fd593958bbb00"
+}

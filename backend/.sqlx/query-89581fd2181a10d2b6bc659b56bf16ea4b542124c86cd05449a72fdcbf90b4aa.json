@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT initialized FROM console_settings WHERE id = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "initialized",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "console_settings",
+            "name": "initialized"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "89581fd2181a10d2b6bc659b56bf16ea4b542124c86cd05449a72fdcbf90b4aa"
+}

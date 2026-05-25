@@ -15,6 +15,12 @@ FROM rust:1.92-slim-bookworm AS builder
 
 WORKDIR /app
 
+# SQLX_OFFLINE: the sqlx `query!`/`query_as!` macros verify SQL at compile time
+# against a live DB unless offline metadata is present. The build stage has NO
+# database, so we force offline mode and ship the committed `.sqlx` metadata
+# (Pitfall 2). Set BEFORE any cargo build so both invocations honor it.
+ENV SQLX_OFFLINE=true
+
 # Pre-cache dependencies: copy the manifest AND the committed lockfile, create a
 # dummy source, and build so the dependency layer is reused when only src/ changes.
 # --locked: resolve EXACTLY the versions pinned in Cargo.lock (CR-04). Without the
@@ -26,7 +32,13 @@ RUN mkdir -p src \
     && cargo build --release --locked \
     && rm -rf src
 
-# Now copy real sources and build the actual binary (still --locked).
+# Copy the committed sqlx offline metadata and the migrations BEFORE the real
+# build so the query macros resolve with no DB, and `sqlx::migrate!()` finds the
+# embedded migration source.
+COPY .sqlx ./.sqlx
+COPY migrations ./migrations
+
+# Now copy real sources and build the actual binary (still --locked, offline).
 COPY src ./src
 # Bust the cached dummy-main artifact so the real main.rs is compiled.
 RUN touch src/main.rs \

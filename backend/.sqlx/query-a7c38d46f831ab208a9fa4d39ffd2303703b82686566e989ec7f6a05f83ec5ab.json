@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT initialized, bootstrap_token_hash, created_at\n        FROM console_settings\n        WHERE id = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "initialized",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "console_settings",
+            "name": "initialized"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "bootstrap_token_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "console_settings",
+            "name": "bootstrap_token_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "console_settings",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "a7c38d46f831ab208a9fa4d39ffd2303703b82686566e989ec7f6a05f83ec5ab"
+}

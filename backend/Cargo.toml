@@ -2,8 +2,8 @@
 name = "ory-console-backend"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
-description = "Ory Self-Hosted Console backend (Phase 1 skeleton — single API layer the frontend talks to; real implementation lands in Phase 2)."
+rust-version = "1.92"
+description = "Ory Self-Hosted Console backend — single API layer the frontend talks to (structured Salvo app + console-DB persistence; Phase 2)."
 license = "Apache-2.0"
 publish = false
 
@@ -14,12 +14,70 @@ path = "src/main.rs"
 [dependencies]
 # Pinned per CLAUDE.md (authoritative). Salvo is the operator-mandated web
 # framework (override of Axum/Actix) — do NOT switch.
-salvo = { version = "0.93.0", features = ["server", "http1"] }
+# Feature set (RESEARCH "Installation", corrected against salvo 0.93 feature list):
+# cookie (=> __Host- session cookies), rate-limiter (=> per-IP rate limit on
+# /setup,/login; MokaStore + FixedGuard ship inside this feature, they are NOT
+# separate umbrella features — research assumption A4 was wrong, caught at
+# lockfile resolve), affix-state (=> inject PgPool + Config into Depot),
+# oapi (=> OpenAPI for the SPA).
+salvo = { version = "0.93.0", features = [
+    "server",
+    "http1",
+    "cookie",
+    "rate-limiter",
+    "affix-state",
+    "oapi",
+] }
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- Phase 2: persistence + auth primitives ---------------------------------
+# sqlx 0.9 split runtime and TLS into SEPARATE features (Pitfall 3): the runtime
+# is `runtime-tokio`, the TLS backend is `tls-rustls` (NOT `runtime-tokio-rustls`).
+sqlx = { version = "0.9.0", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "uuid",
+    "time",
+] }
+# Argon2id (default()) for console-admin passwords; `std` pulls password-hash + OsRng.
+argon2 = { version = "0.5.3", features = ["std"] }
+# GitHub OAuth authorization-code exchange (5.0 typestate client; explicit http client).
+oauth2 = "5.0.0"
+# Explicit async HTTP client for oauth2 5.0 + GitHub user API; rustls (no system
+# OpenSSL). reqwest 0.13 renamed the rustls feature `rustls-tls` -> `rustls`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# CSPRNG for bootstrap/session/CSRF tokens (OsRng); base64url encoding; SHA-256
+# (fast hash for the 256-bit session token — NOT Argon2, Pitfall 5); constant-time eq.
+rand = "0.10"
+base64 = "0.22"
+sha2 = "0.10"
+subtle = "2.6"
+# Primary keys + timestamp columns (matches the sqlx `uuid` + `time` features).
+uuid = { version = "1.23", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde"] }
+# Typed error enum -> generic JSON (no secret leakage; BACK-07).
+thiserror = "2.0"
+
+[dev-dependencies]
+# Salvo `test` feature exposes TestClient for in-process handler/middleware tests.
+salvo = { version = "0.93.0", features = ["test"] }
+# `#[sqlx::test]` provisions an isolated temp database per test (Validation Architecture).
+sqlx = { version = "0.9.0", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "uuid",
+    "time",
+] }
 
 [profile.release]
 # Smaller, faster-to-ship release binary for the runtime image stage.
