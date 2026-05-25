@@ -259,6 +259,108 @@ last-known-good with the service recovering.
   DoS primitive — both documented and accepted residual risks (`T-notls-broker`,
   `T-restart-dos`) under "Security model & documented residual risks" above.
 
+## Frontend console (Phase 5)
+
+Phase 5 delivers the real Next.js admin console — the shell every later feature
+page renders inside — and three reusable primitives (a TanStack DataTable, a
+React-Hook-Form + Zod SettingsForm, and a Monaco editor wrapper). The frontend
+is the **only** host-published UI; it talks to the Rust backend and **never** to
+the Ory services directly.
+
+### Running the console
+
+The console comes up as part of the normal full-stack bring-up — it is the
+`frontend` service:
+
+```bash
+cp .env.example .env          # fill in the values (see Quick start above)
+docker compose up -d --wait   # waits for every service, including the frontend
+```
+
+Then open **http://localhost:3000** and complete the day-one flow:
+
+1. **`/setup`** — first run only. Paste the one-time **bootstrap token** (read it
+   from the backend logs, see below) and create the first operator account. On
+   success you are routed to `/login` (setup does **not** auto-log-in).
+2. **`/login`** — sign in with the operator email + password. (A "Sign in with
+   GitHub" button appears only when GitHub OAuth is configured — see the Phase 2
+   section.) On success you land on the authenticated console shell.
+3. **The console shell** — a sidebar of sections (Users, Authentication, OAuth2,
+   Permissions, Activity, Branding, Project) and a topbar with the account menu
+   (logout + light/dark theme toggle). Feature pages for each section land in
+   Phases 6–11; until then a section shows a labeled "Coming in a later phase"
+   panel (the navigation is complete; no fake-working controls).
+
+The console is **server-guarded**: the authenticated `(console)` layout performs
+an authoritative server-side `GET /api/console/me` on every navigation and
+redirects to `/login` whenever there is no valid session — so the shell is
+unreachable unauthenticated (a 401 always lands you back on `/login`).
+
+### The bootstrap token (same as Phase 2)
+
+```bash
+docker compose logs backend | grep 'FIRST-RUN SETUP TOKEN'
+# -> FIRST-RUN SETUP TOKEN: <token>
+```
+
+It is regenerated on every uninitialized boot and is single-use; once an admin
+exists, `/setup` redirects to `/login` and `GET /api/console/state` reports
+`{"initialized":true}`.
+
+### Same-origin `/backend` proxy + the FE-05 no-Ory-egress invariant
+
+The browser bundle contains **no Ory hostname, no admin port, and no Ory SDK** —
+a hard invariant (FE-05). The frontend's only backend reference is the literal
+same-origin path `/backend/*`: the Next server rewrites those requests to the
+internal backend (`BACKEND_INTERNAL_URL`, set to `http://backend:8080` on the
+compose `frontend` service). `BACKEND_INTERNAL_URL` is read on the **server
+only** — it is never a `NEXT_PUBLIC_` var and never reaches client JS. The
+session cookie therefore stays first-party on the frontend origin (no CORS, no
+cross-site cookie). This is enforced at build time by
+`scripts/verify/bundle-egress.sh`, which greps the built output and fails on any
+Ory host/port/SDK literal. See `frontend/.env.example` for the full `BACKEND_INTERNAL_URL` notes.
+
+### Monaco loads from our own origin (no CDN)
+
+The Monaco editor wrapper loads its engine and language workers from the
+vendored, same-origin `public/monaco/vs` assets — **never** from jsDelivr/unpkg/
+cdnjs. This keeps the console air-gap-friendly and removes a supply-chain egress.
+The same `bundle-egress.sh` gate also fails on any CDN host in the built bundle.
+See `frontend/MONACO.md` for the local-bundling strategy.
+
+### Security posture — plain-HTTP cookie caveat
+
+Over plain-HTTP `localhost` the hardened `__Host-`/`Secure` session cookie is
+silently dropped by browsers, causing a 401 loop after an apparently successful
+login. For a local **browser** bring-up set `CONSOLE_INSECURE_COOKIES=true` (the
+cookie name becomes `console_session`, without `Secure`); the Phase-5 acceptance
+gate exports this for the duration of its ephemeral run. **Production keeps it
+unset** and terminates TLS at the edge — see "Dev escape hatch —
+`CONSOLE_INSECURE_COOKIES`" and the pre-session origin allowlist notes under the
+Phase 2 section, which describe the residual risk in full.
+
+### Verifying Phase 5
+
+A single live gate proves all four phase success criteria against the real stack
+and tears it down cleanly afterward (a `trap` runs `docker compose down -v`):
+
+```bash
+docker compose down -v
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase5-acceptance.sh   # Git Bash on Windows
+```
+
+The script: (1) runs `bundle-egress.sh` (FE-05 + the Monaco no-CDN check); (2)
+runs the three primitive component suites (FE-02/03/04); (3) builds + brings up
+the full stack and waits for the frontend to be healthy; (4) parses the
+bootstrap token from `docker compose logs backend` and drives the Playwright
+`auth-flow` e2e — `/setup → /login → the authenticated shell`, then drops the
+session and asserts the 401 → `/login` redirect (FE-01). It exits `0` only when
+every gate passes. The frontend image build is heavy, so the bring-up allows a
+generous timeout (override with `UP_TIMEOUT=<seconds>`); pass `KEEP_STACK=1` to
+leave the stack up for debugging.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:

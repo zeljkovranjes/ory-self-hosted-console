@@ -50,29 +50,29 @@ test.describe("Auth journey (FE-01) — live stack", () => {
     // Either way the operator ends on /setup on a fresh stack.
     await page.goto("/");
     await page.waitForURL(/\/setup$/, { timeout: 30_000 });
-    await expect(
-      page.getByRole("heading", { name: /set up your console/i }),
-    ).toBeVisible();
+    // The setup card's title (shadcn CardTitle is a div, not a semantic heading)
+    // + its submit button confirm the form rendered (after the state check).
+    const createBtn = page.getByRole("button", {
+      name: /create operator account/i,
+    });
+    await expect(createBtn).toBeVisible({ timeout: 30_000 });
 
     // --- (2) Complete /setup with the bootstrap token + the first admin. -----
     await page.getByLabel("Bootstrap token").fill(BOOTSTRAP_TOKEN);
     await page.getByLabel("Name").fill("Phase5 E2E Admin");
     await page.getByLabel("Email").fill(ADMIN_EMAIL);
     await page.getByLabel("Password", { exact: true }).fill(ADMIN_PASSWORD);
-    await page
-      .getByRole("button", { name: /create operator account/i })
-      .click();
+    await createBtn.click();
 
     // setup routes to /login on success (no auto-login).
     await page.waitForURL(/\/login$/, { timeout: 30_000 });
-    await expect(
-      page.getByRole("heading", { name: /sign in/i }),
-    ).toBeVisible();
+    const signInBtn = page.getByRole("button", { name: /^sign in$/i });
+    await expect(signInBtn).toBeVisible({ timeout: 30_000 });
 
     // --- (3) Sign in -> the server-guarded (console) shell renders. ----------
     await page.getByLabel("Email").fill(ADMIN_EMAIL);
     await page.getByLabel("Password", { exact: true }).fill(ADMIN_PASSWORD);
-    await page.getByRole("button", { name: /^sign in$/i }).click();
+    await signInBtn.click();
 
     // Land on the dashboard ("/"): the (console) layout's /me guard passed.
     await page.waitForURL((url) => new URL(url).pathname === "/", {
@@ -80,9 +80,13 @@ test.describe("Auth journey (FE-01) — live stack", () => {
     });
 
     // The authenticated shell chrome is present (topbar + sidebar). The topbar
-    // shows the console title; the sidebar exposes the navigation landmark.
-    await expect(page.getByText(/ory console/i).first()).toBeVisible();
-    await expect(page.getByRole("navigation").first()).toBeVisible();
+    // shows the console title; the sidebar renders the nav links (each an <a>).
+    await expect(page.getByText(/ory console/i).first()).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(
+      page.getByRole("link", { name: /users/i }).first(),
+    ).toBeVisible({ timeout: 30_000 });
 
     // A session cookie was set by the successful login (either name).
     const cookies = await context.cookies();
@@ -99,7 +103,7 @@ test.describe("Auth journey (FE-01) — live stack", () => {
     await page.goto("/users"); // a (console) section route, behind the guard
     await page.waitForURL(/\/login$/, { timeout: 30_000 });
     await expect(
-      page.getByRole("heading", { name: /sign in/i }),
-    ).toBeVisible();
+      page.getByRole("button", { name: /^sign in$/i }),
+    ).toBeVisible({ timeout: 30_000 });
   });
 });

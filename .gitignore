@@ -24,6 +24,9 @@
 /frontend/.turbo/
 /frontend/next-env.d.ts
 /frontend/tsconfig.tsbuildinfo
+# Playwright e2e run artifacts (traces, screenshots, HTML report) — generated.
+/frontend/test-results/
+/frontend/playwright-report/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
