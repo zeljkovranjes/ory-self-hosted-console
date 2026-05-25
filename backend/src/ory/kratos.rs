@@ -126,6 +126,14 @@ pub async fn list_identities(
         .filter(|n| *n > 0 && *n <= 1000)
         .unwrap_or(DEFAULT_LIST_PAGE_SIZE);
     let page_token = req.query::<String>("page_token");
+    // IDENT-01 / WR-01: optional exact-match search filter from the Users-list
+    // search box. Kratos's `GET /admin/identities` accepts `credentials_identifier`;
+    // we forward a non-empty (trimmed) term and treat blank/whitespace as no
+    // filter so an empty search box returns the full page rather than nothing.
+    let credentials_identifier = req
+        .query::<String>("credentials_identifier")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // The Kratos Admin base URL is fixed backend config (no SSRF surface). Build
     // a bounded reqwest-0.13 client for the one list call.
@@ -135,6 +143,7 @@ pub async fn list_identities(
         &clients_kratos_base(&clients),
         page_size,
         page_token.as_deref(),
+        credentials_identifier.as_deref(),
     )
     .await?;
 
