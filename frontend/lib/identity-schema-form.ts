@@ -114,10 +114,18 @@ function zodFor(field: TraitField): ZodType {
       break;
     case "text":
     default:
-      leaf = z.string().min(1);
+      // Required-ness is enforced below; a plain string leaf so optional fields
+      // can carry the form's "" default without a spurious min-length error.
+      leaf = field.required ? z.string().min(1) : z.string();
       break;
   }
-  return field.required ? leaf : leaf.optional();
+  if (field.required) return leaf;
+  // Optional fields default to "" in the form; for string-like inputs that
+  // would fail `.email()`/`.enum()`, so accept the empty sentinel as "unset".
+  if (field.input === "switch" || field.input === "number") {
+    return leaf.optional();
+  }
+  return leaf.or(z.literal("")).optional();
 }
 
 /**
