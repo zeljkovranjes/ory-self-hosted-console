@@ -63,6 +63,29 @@ _csrf_for_email() {
     | tr -d '[:space:]'
 }
 
+# --- Helper: log in and echo the RAW session token --------------------------
+# The acceptance run uses the hardened `__Host-console_session` (Secure) cookie.
+# `curl` will NOT replay a Secure cookie over plain HTTP via its cookie jar, so
+# we parse the token out of the login Set-Cookie header and send it back on an
+# EXPLICIT `Cookie:` header (which curl honors regardless of Secure). This makes
+# the authenticated (c)/(d)/(e) assertions meaningful over the plain-HTTP edge.
+_login_session_token() {
+  local email="$1" pw="$2" headers
+  headers="$(curl -s -D - -o /dev/null --max-time 10 \
+    -H 'Content-Type: application/json' \
+    --data "{\"email\":\"${email}\",\"password\":\"${pw}\"}" \
+    "${BACKEND_BASE_URL}/login" 2>/dev/null)"
+  # Extract the cookie value from either the hardened or dev cookie name.
+  printf '%s' "$headers" \
+    | grep -iE '^Set-Cookie:[[:space:]]*(__Host-)?console_session=' \
+    | head -n1 \
+    | sed -E 's/^[Ss]et-[Cc]ookie:[[:space:]]*(__Host-)?console_session=([^;]+).*/\2/' \
+    | tr -d '\r'
+}
+
+# The in-force session cookie name (hardened unless CONSOLE_INSECURE_COOKIES set).
+: "${SESSION_COOKIE_NAME:=__Host-console_session}"
+
 # --- Bootstrap token: read from backend stdout (CAUTH-02) --------------------
 # `ensure_bootstrap_token` prints `FIRST-RUN SETUP TOKEN: <token>` once at boot
 # on an uninitialized console. We parse it from the backend logs to drive the
@@ -125,44 +148,41 @@ assert_status GET "${BACKEND_BASE_URL}/api/console/state" 200
 # /setup is now 404 (post-init) but still part of the public subtree (not 401);
 # /login is reachable (a GET is not its method, but it must not be 401).
 
-# --- (d) rate-limit on /login + CSRF on a protected state-changing route -----
-echo
-echo "--- [CAUTH-05] /login rate-limited (d) ---"
-# >10 POST /login within a minute -> at least one 429.
-assert_rate_limited "${BACKEND_BASE_URL}/login" \
-  "{\"email\":\"nobody@example.com\",\"password\":\"a-very-long-password\"}" 15
-
+# --- (d) CSRF on a protected state-changing route ----------------------------
+# NOTE on ordering: the rate-limit assertion (also part of (d)) runs LAST,
+# after every check that needs a fresh successful /login. The per-IP limiter
+# (10/min) would otherwise exhaust the quota and 429 the subsequent logins.
 echo
 echo "--- [CAUTH-05] CSRF: authed POST /logout needs X-CSRF-Token (d) ---"
-# Establish an authenticated session: capture the session cookie from /login.
-COOKIE_JAR="$(mktemp)"
-curl -s -c "$COOKIE_JAR" -o /dev/null --max-time 10 \
-  -H 'Content-Type: application/json' \
-  --data "{\"email\":\"${ADMIN_EMAIL_TEST}\",\"password\":\"${ADMIN_PW_TEST}\"}" \
-  "${BACKEND_BASE_URL}/login" 2>/dev/null
-# Authenticated POST /logout WITHOUT X-CSRF-Token -> 403.
-csrf_no_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-  -b "$COOKIE_JAR" -X POST "${BACKEND_BASE_URL}/logout" 2>/dev/null)"
-if [ "$csrf_no_code" = "403" ]; then
-  _pass "POST /logout without X-CSRF-Token: 403 (CSRF enforced)"
+# Establish an authenticated session and capture the raw session token.
+SESSION_TOKEN="$(_login_session_token "$ADMIN_EMAIL_TEST" "$ADMIN_PW_TEST")"
+if [ -z "$SESSION_TOKEN" ]; then
+  _fail "could not obtain a session token from /login (CSRF check cannot run)"
 else
-  _fail "POST /logout without X-CSRF-Token: got '$csrf_no_code' (want 403)"
-fi
-# WITH the matching X-CSRF-Token (read from the session row) -> 200.
-CSRF_TOKEN="$(_csrf_for_email "$ADMIN_EMAIL_TEST")"
-if [ -z "$CSRF_TOKEN" ]; then
-  _fail "could not read csrf_token from session row for ${ADMIN_EMAIL_TEST}"
-else
-  csrf_ok_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-    -b "$COOKIE_JAR" -H "X-CSRF-Token: ${CSRF_TOKEN}" \
-    -X POST "${BACKEND_BASE_URL}/logout" 2>/dev/null)"
-  if [ "$csrf_ok_code" = "200" ]; then
-    _pass "POST /logout with matching X-CSRF-Token: 200"
+  COOKIE_HEADER="Cookie: ${SESSION_COOKIE_NAME}=${SESSION_TOKEN}"
+  # Authenticated POST /logout WITHOUT X-CSRF-Token -> 403.
+  csrf_no_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H "$COOKIE_HEADER" -X POST "${BACKEND_BASE_URL}/logout" 2>/dev/null)"
+  if [ "$csrf_no_code" = "403" ]; then
+    _pass "POST /logout without X-CSRF-Token: 403 (CSRF enforced)"
   else
-    _fail "POST /logout with matching X-CSRF-Token: got '$csrf_ok_code' (want 200)"
+    _fail "POST /logout without X-CSRF-Token: got '$csrf_no_code' (want 403)"
+  fi
+  # WITH the matching X-CSRF-Token (read from the session row) -> 200.
+  CSRF_TOKEN="$(_csrf_for_email "$ADMIN_EMAIL_TEST")"
+  if [ -z "$CSRF_TOKEN" ]; then
+    _fail "could not read csrf_token from session row for ${ADMIN_EMAIL_TEST}"
+  else
+    csrf_ok_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+      -H "$COOKIE_HEADER" -H "X-CSRF-Token: ${CSRF_TOKEN}" \
+      -X POST "${BACKEND_BASE_URL}/logout" 2>/dev/null)"
+    if [ "$csrf_ok_code" = "200" ]; then
+      _pass "POST /logout with matching X-CSRF-Token: 200"
+    else
+      _fail "POST /logout with matching X-CSRF-Token: got '$csrf_ok_code' (want 200)"
+    fi
   fi
 fi
-rm -f "$COOKIE_JAR"
 
 # --- (e) no secret in any response body --------------------------------------
 echo
@@ -172,21 +192,22 @@ assert_no_secret_in_body GET "${BACKEND_BASE_URL}/api/console/state"
 # /login success body (secret-free admin DTO).
 REQ_DATA="{\"email\":\"${ADMIN_EMAIL_TEST}\",\"password\":\"${ADMIN_PW_TEST}\"}" \
   assert_no_secret_in_body POST "${BACKEND_BASE_URL}/login"
-# /api/console/me (protected) — authenticate, then assert the body carries no secret.
-ME_JAR="$(mktemp)"
-curl -s -c "$ME_JAR" -o /dev/null --max-time 10 \
-  -H 'Content-Type: application/json' \
-  --data "{\"email\":\"${ADMIN_EMAIL_TEST}\",\"password\":\"${ADMIN_PW_TEST}\"}" \
-  "${BACKEND_BASE_URL}/login" 2>/dev/null
-me_body="$(curl -s --max-time 10 -b "$ME_JAR" "${BACKEND_BASE_URL}/api/console/me" 2>/dev/null)"
+# /api/console/me (protected) — authenticate via an explicit Cookie header (the
+# hardened Secure cookie is not replayed by curl's jar over plain HTTP), then
+# assert the AUTHENTICATED body is non-empty AND carries no secret.
+ME_TOKEN="$(_login_session_token "$ADMIN_EMAIL_TEST" "$ADMIN_PW_TEST")"
+me_body="$(curl -s --max-time 10 \
+  -H "Cookie: ${SESSION_COOKIE_NAME}=${ME_TOKEN}" \
+  "${BACKEND_BASE_URL}/api/console/me" 2>/dev/null)"
 if [ -z "$me_body" ]; then
   _fail "assert_no_secret_in_body GET /api/console/me: empty body (cannot confirm secret-absence)"
+elif ! printf '%s' "$me_body" | grep -q "${ADMIN_EMAIL_TEST}"; then
+  _fail "assert_no_secret_in_body GET /api/console/me: body is not the authenticated profile: ${me_body}"
 elif printf '%s' "$me_body" | grep -qiE 'password_hash|token_hash|bootstrap|client_secret|\$argon2|postgres://'; then
   _fail "assert_no_secret_in_body GET /api/console/me: SECRET marker found in response body"
 else
-  _pass "assert_no_secret_in_body GET /api/console/me: no secret markers present"
+  _pass "assert_no_secret_in_body GET /api/console/me: authenticated profile, no secret markers"
 fi
-rm -f "$ME_JAR"
 
 # --- (f) GitHub endpoints exist ONLY when env set ----------------------------
 echo
@@ -204,6 +225,14 @@ fi
 # GITHUB_OAUTH_CLIENT_SECRET set, GET /auth/github/login returns 302 to
 # github.com/login/oauth/authorize and github_oauth_enabled:true. The real
 # round-trip needs a browser + GitHub OAuth app (02-VALIDATION Manual-Only).
+
+# --- (d) rate-limit on /login (LAST — it intentionally exhausts the quota) ---
+echo
+echo "--- [CAUTH-05] /login rate-limited (d) ---"
+# >10 POST /login within a minute -> at least one 429. Runs last so the burst
+# does not 429 the authenticated logins used by the (c)/(d-csrf)/(e) checks.
+assert_rate_limited "${BACKEND_BASE_URL}/login" \
+  "{\"email\":\"nobody@example.com\",\"password\":\"a-very-long-password\"}" 15
 
 echo
 summary
