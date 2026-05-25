@@ -58,6 +58,123 @@ to a strong, stable value before first boot and never change it.
 
 ---
 
+## Console authentication (Phase 2)
+
+Phase 2 turns the backend into the single authenticated API layer with its own
+`console` database (admins, sessions, first-run state) and production-grade
+console auth. Day-one operator flow:
+
+### First run — the bootstrap setup token
+
+On first boot, when no admin exists yet, the backend generates a one-time
+high-entropy **setup token**, persists only its hash, and prints the raw token
+to stdout exactly once. Read it from the backend logs:
+
+```bash
+docker compose logs backend | grep 'FIRST-RUN SETUP TOKEN'
+# -> FIRST-RUN SETUP TOKEN: <token>
+```
+
+Complete first-run setup by POSTing the token plus your admin name/email/password
+(password must be **at least 12 characters**) to `/setup`:
+
+```bash
+curl -X POST http://localhost:8080/setup \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"You","email":"you@example.com","password":"a-strong-passphrase","token":"<token>"}'
+```
+
+Notes:
+- The token is **regenerated on every uninitialized boot** — if you restart
+  before completing setup, copy the newest line from the logs. A stale token is
+  invalidated.
+- Once the admin exists, `/setup` returns **404** (single-use; server-side
+  `initialized` flag). `GET /api/console/state` reports `{"initialized":true}`.
+- The token may also be supplied via an `X-Setup-Token` header instead of the
+  body field.
+
+### GitHub OAuth login (optional, link-to-existing-admin only)
+
+GitHub OAuth is **off by default** and is mounted ONLY when both env vars are
+present. To enable it:
+
+1. Create a GitHub OAuth App (Settings → Developer settings → OAuth Apps). Set
+   the **Authorization callback URL** to `http(s)://<your-host>/auth/github/callback`.
+2. Set the env vars (e.g. in `.env`, then re-up the backend):
+
+   ```bash
+   GITHUB_OAUTH_CLIENT_ID=<your client id>
+   GITHUB_OAUTH_CLIENT_SECRET=<your client secret>
+   GITHUB_OAUTH_REDIRECT_URL=http://localhost:8080/auth/github/callback
+   ```
+
+3. `GET /api/console/state` now reports `github_oauth_enabled:true` and
+   `GET /auth/github/login` 302-redirects to GitHub.
+
+**Policy — no open self-registration.** On callback the console links the GitHub
+identity to an **existing** admin: first by a previously-linked `github_user_id`,
+then by the GitHub account's **verified primary email** matching an admin's
+email. If no admin matches, the login is **denied (403)** — a GitHub login never
+auto-creates an account. The OAuth `state` is verified constant-time against a
+dedicated short-lived nonce cookie (CSRF defense), and all GitHub HTTP calls use
+a redirect-disabled client (SSRF guard). The GitHub client secret and access
+token are never logged or returned in any response.
+
+### Why `SameSite=Lax` (not `Strict`)
+
+The session cookie (`__Host-console_session`) is `SameSite=Lax`, not `Strict`.
+The GitHub OAuth callback is a **top-level GET navigation** arriving from
+github.com; `Lax` cookies are delivered on top-level GETs, so the session
+survives the round-trip. `Strict` has historically been dropped on
+cross-site-initiated redirects in some browser engines, which would intermittently
+break login from external links. The OAuth `state` is carried in its OWN
+short-lived cookie (never in the session cookie), so the session cookie's
+SameSite mode does not affect CSRF protection of the OAuth flow.
+
+### Dev escape hatch — `CONSOLE_INSECURE_COOKIES`
+
+The hardened session cookie uses the `__Host-` prefix, which browsers honor only
+over HTTPS (it requires the `Secure` attribute). Over plain-HTTP `localhost`,
+a **browser** silently drops a `__Host-`/`Secure` cookie, causing a 401 loop
+after an apparently successful login. For local browser dev, set:
+
+```bash
+CONSOLE_INSECURE_COOKIES=true
+```
+
+This drops the `__Host-` prefix and the `Secure` attribute (cookie name becomes
+`console_session`) so the cookie survives plain HTTP. **Residual risk:** without
+`Secure`, the cookie can be sent over a non-TLS connection — acceptable only on a
+trusted local host. Production must keep this **unset** (hardened default) and
+terminate TLS at the edge. (The acceptance harness intentionally runs with the
+hardened default so it can assert the `__Host-` + `Secure` flags; `curl` receives
+the `Set-Cookie` header verbatim because those attributes are browser-enforced,
+not transport-enforced.)
+
+### Pre-session origin allowlist (`CONSOLE_ALLOWED_ORIGINS`)
+
+`POST /setup` and `/login` happen before a per-session CSRF token can exist, so
+they are additionally guarded by an optional `Origin`/`Referer` allowlist
+(comma-separated `CONSOLE_ALLOWED_ORIGINS`). An empty/unset list disables the
+check (dev posture). Set it to your console origin(s) in production for
+defense-in-depth against cross-site form posts.
+
+### Verifying Phase 2
+
+```bash
+docker compose down -v && docker compose up -d --wait
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase2-acceptance.sh   # Git Bash on Windows
+docker compose down -v
+```
+
+The harness exits `0` only when every criterion passes: the `/setup` token gate
+and 404-after-init, the hardened login cookie flags, the 401 on an unauthenticated
+protected route, the `/login` rate limit (429), the CSRF guard (403 without
+`X-CSRF-Token`, 200 with it), secret-absence in every response body, and the
+GitHub env-gating (404 + `github_oauth_enabled:false` when unconfigured).
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
