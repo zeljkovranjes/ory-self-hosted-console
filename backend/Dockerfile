@@ -9,7 +9,9 @@
 # the bind address (and future config) come from env at runtime.
 
 # ---- Stage 1: builder ----
-FROM rust:1.85-slim-bookworm AS builder
+# salvo 0.93 (and its time/* transitive deps) require rustc >= 1.92, so the
+# builder toolchain is pinned to 1.92 (rust:1.85 fails to compile salvo_core).
+FROM rust:1.92-slim-bookworm AS builder
 
 WORKDIR /app
 

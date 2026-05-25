@@ -59,3 +59,33 @@ GRANT ALL PRIVILEGES ON DATABASE kratos  TO kratos;
 GRANT ALL PRIVILEGES ON DATABASE hydra   TO hydra;
 GRANT ALL PRIVILEGES ON DATABASE keto    TO keto;
 GRANT ALL PRIVILEGES ON DATABASE console TO console;
+
+-- ---------------------------------------------------------------------------
+-- 4. Per-database `public` schema ownership (REQUIRED on Postgres 15+).
+--
+-- Since PostgreSQL 15, the `public` schema is owned by the bootstrap super-user
+-- and non-owner roles no longer have CREATE on it by default — so an Ory migrate
+-- run as the per-DB role fails with "permission denied for schema public"
+-- (SQLSTATE 42501). Granting the service role OWNERSHIP of its own database's
+-- `public` schema (scoped to that DB only) gives it full DDL rights there while
+-- keeping least-privilege isolation between databases.
+--
+-- `ALTER SCHEMA ... OWNER TO` must run INSIDE the target database, so we switch
+-- with the psql \connect meta-command (this file is executed by psql in the
+-- official postgres entrypoint, which understands \connect).
+-- ---------------------------------------------------------------------------
+\connect kratos
+ALTER SCHEMA public OWNER TO kratos;
+GRANT ALL ON SCHEMA public TO kratos;
+
+\connect hydra
+ALTER SCHEMA public OWNER TO hydra;
+GRANT ALL ON SCHEMA public TO hydra;
+
+\connect keto
+ALTER SCHEMA public OWNER TO keto;
+GRANT ALL ON SCHEMA public TO keto;
+
+\connect console
+ALTER SCHEMA public OWNER TO console;
+GRANT ALL ON SCHEMA public TO console;
