@@ -105,6 +105,77 @@ fn service_schema_str(service: &str) -> Option<&'static str> {
     }
 }
 
+/// Validate an OPERATOR-SUPPLIED identity schema (IDENT-03, Pitfall 5 / A3).
+///
+/// This is DISTINCT from the service-config path ([`validator_for`] /
+/// [`validate_full`]): there, the operator JSON is validated AGAINST a fixed Ory
+/// service-config schema. Here, the operator JSON IS the schema — Kratos loads it
+/// at boot to drive identity traits — so we validate it as a JSON Schema in two
+/// layers, refusing anything Kratos would reject (a malformed schema crashes
+/// Kratos on restart; the engine health-poll + rollback is only the backstop):
+///
+/// - **Layer 1 (draft-07 metaschema):** validate `candidate` against the built-in
+///   draft-07 metaschema via [`jsonschema::draft7::meta`]. A value that is not a
+///   valid JSON Schema (e.g. `{"type": 123}`) yields one [`FieldError`] per
+///   violation, using the SAME `instance_path()` -> JSON-Pointer mapping
+///   [`validate_full`] uses; messages are schema-derived and value-free (BACK-07 /
+///   T-04-03).
+/// - **Layer 2 (Kratos structural requirement, A3):** Kratos requires the schema
+///   to define `properties.traits` as an object. If `properties` is absent/not an
+///   object, or `properties.traits` is absent/not an object, push a single
+///   `FieldError` at `/properties/traits`.
+///
+/// Returns `Ok(())` only when BOTH layers pass; otherwise `Err(non-empty Vec)`
+/// with every collected violation. No offending value is ever included.
+pub fn validate_identity_schema(candidate: &Value) -> Result<(), Vec<FieldError>> {
+    let mut errors: Vec<FieldError> = Vec::new();
+
+    // --- Layer 1: the candidate must itself be a valid draft-07 JSON Schema ---
+    // `jsonschema::draft7::meta::validator()` returns the built-in draft-07
+    // metaschema validator (a `MetaValidator`, which Derefs to `Validator` so it
+    // exposes the same `iter_errors` we use in `validate_full`). NOTE: the concrete
+    // `MetaValidator` type is NOT publicly nameable in jsonschema 0.46.5 (its
+    // module is private), so unlike the per-service `validator_for` cache we cannot
+    // hold it in a `OnceLock`; we build it per call instead. Identity-schema PUTs
+    // are rare operator actions, so the per-call metaschema build is acceptable.
+    let meta = jsonschema::draft7::meta::validator();
+    for e in meta.iter_errors(candidate) {
+        errors.push(FieldError {
+            // The JSON-Pointer instance path (value-free). Unlike `validate_full`,
+            // we use `e.masked()` for the message: the default `Display` echoes the
+            // offending instance VALUE (e.g. "123 is not valid under ..."), and an
+            // operator-supplied schema must produce a value-free message (BACK-07 /
+            // T-04-03). `MaskedValidationError`'s Display replaces the value with a
+            // "{}" placeholder, keeping the schema-derived reason only.
+            path: e.instance_path().to_string(),
+            message: e.masked().to_string(),
+        });
+    }
+
+    // --- Layer 2: Kratos requires properties.traits to be an object (A3) ------
+    // Run regardless of Layer-1 outcome so the operator sees the traits
+    // requirement even if other metaschema errors are present. The check is a
+    // pure structural inspection — no value is read into the message.
+    let traits_is_object = candidate
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|props| props.get("traits"))
+        .map(Value::is_object)
+        .unwrap_or(false);
+    if !traits_is_object {
+        errors.push(FieldError {
+            path: "/properties/traits".to_string(),
+            message: "identity schema must define properties.traits as an object".to_string(),
+        });
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Per-service compiled-`Validator` cache. The compile (parse + ref resolution)
 /// is paid once per service for the process lifetime.
 fn validator_cache() -> &'static RwLock<HashMap<&'static str, &'static Validator>> {
@@ -437,6 +508,114 @@ mod tests {
         let ok_in = json!({});
         let ok_eff = effective_for_validation("oathkeeper", &ok_in);
         assert_eq!(ok_eff, ok_in, "oathkeeper overlay must be a no-op");
+    }
+
+    // --- IDENT-03: identity-schema metaschema + properties.traits (Pitfall 5/A3) ---
+
+    /// The SHIPPED active identity schema text, embedded so the unit test pins the
+    /// real `config/kratos/identity.schema.json` against the validator (a future
+    /// edit that breaks draft-07 validity or drops properties.traits fails here).
+    const SHIPPED_IDENTITY_SCHEMA: &str =
+        include_str!("../../../config/kratos/identity.schema.json");
+
+    /// A minimal, draft-07-valid identity schema WITH a properties.traits object.
+    fn valid_identity_schema() -> Value {
+        json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "traits": {
+                    "type": "object",
+                    "properties": { "email": { "type": "string", "format": "email" } },
+                    "required": ["email"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn shipped_identity_schema_validates_ok() {
+        // Pin the shipped active schema: it must be a valid draft-07 schema AND
+        // carry properties.traits as an object.
+        let shipped: Value =
+            serde_json::from_str(SHIPPED_IDENTITY_SCHEMA).expect("shipped schema is JSON");
+        assert!(
+            validate_identity_schema(&shipped).is_ok(),
+            "the shipped config/kratos/identity.schema.json must validate"
+        );
+    }
+
+    #[test]
+    fn minimal_valid_identity_schema_ok() {
+        assert!(
+            validate_identity_schema(&valid_identity_schema()).is_ok(),
+            "a draft-07-valid schema with properties.traits must validate"
+        );
+    }
+
+    #[test]
+    fn layer1_rejects_non_schema_value() {
+        // `{"type": 123}` is NOT a valid JSON Schema (`type` must be a string or an
+        // array of strings) — Layer 1 (metaschema) must reject it.
+        let bad = json!({ "type": 123, "properties": { "traits": { "type": "object" } } });
+        let errs = validate_identity_schema(&bad).expect_err("non-schema must be rejected");
+        assert!(!errs.is_empty(), "expected at least one metaschema field error");
+        // Value-free: the offending value (123) must not appear in any message.
+        for e in &errs {
+            assert!(
+                !e.message.contains("123"),
+                "metaschema message must not echo the offending value: {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn layer2_rejects_missing_properties_traits() {
+        // A draft-07-VALID schema that omits properties.traits must be rejected by
+        // Layer 2 at the /properties/traits pointer (Kratos requires it, A3).
+        let no_traits = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": { "not_traits": { "type": "string" } }
+        });
+        let errs =
+            validate_identity_schema(&no_traits).expect_err("missing properties.traits rejected");
+        assert!(
+            errs.iter().any(|e| e.path == "/properties/traits"),
+            "expected a /properties/traits field error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn layer2_rejects_traits_not_an_object() {
+        // properties.traits present but NOT an object (a string) -> Layer 2 rejects.
+        let traits_string = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": { "traits": "not-an-object" }
+        });
+        let errs = validate_identity_schema(&traits_string)
+            .expect_err("non-object traits must be rejected");
+        assert!(
+            errs.iter().any(|e| e.path == "/properties/traits"),
+            "expected a /properties/traits field error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn no_properties_object_is_rejected() {
+        // `properties` absent entirely -> the Layer-2 traits check fails too.
+        let no_props = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object"
+        });
+        let errs = validate_identity_schema(&no_props).expect_err("no properties -> rejected");
+        assert!(
+            errs.iter().any(|e| e.path == "/properties/traits"),
+            "missing properties must surface the traits requirement; got {errs:?}"
+        );
     }
 
     #[test]
