@@ -67,6 +67,39 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     sqlx::migrate!("./migrations").run(pool).await
 }
 
+// --- Live Ory client helper (Phase 3 BACK-02) --------------------------------
+
+use ory_console_backend::ory::clients::OryClients;
+
+/// Build an [`OryClients`] whose per-service `base_path`s come from the same env
+/// vars the production `Config` reads (`KRATOS_ADMIN_URL`, `HYDRA_ADMIN_URL`,
+/// `KETO_READ_URL`, `KETO_WRITE_URL`, `OATHKEEPER_API_URL`), each falling back to
+/// the internal-network default. Live tests (`ORY_LIVE_TESTS=1`) use this to talk
+/// to the running compose stack — e.g. to SEED one Kratos identity directly via
+/// the typed admin crate so the wrapper read is non-empty.
+///
+/// Thin reuse of `OryClients::from_config`: it builds a `Config` from the same
+/// env defaults so there is ONE source of truth for the admin URLs. Under
+/// `docker compose`, `KRATOS_ADMIN_URL=http://kratos:4434` etc. are set; from a
+/// host-side `cargo test` the defaults resolve to the internal DNS names, so the
+/// caller is expected to either run inside the network or override the env to
+/// `http://localhost:<port>` if the admin ports were temporarily published.
+pub fn ory_clients_from_env() -> OryClients {
+    fn url(key: &str, default: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| default.to_string())
+    }
+    let cfg = default_test_cfg();
+    let cfg = ory_console_backend::config::Config {
+        kratos_admin_url: url("KRATOS_ADMIN_URL", &cfg.kratos_admin_url),
+        hydra_admin_url: url("HYDRA_ADMIN_URL", &cfg.hydra_admin_url),
+        keto_read_url: url("KETO_READ_URL", &cfg.keto_read_url),
+        keto_write_url: url("KETO_WRITE_URL", &cfg.keto_write_url),
+        oathkeeper_api_url: url("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url),
+        ..cfg
+    };
+    OryClients::from_config(&cfg)
+}
+
 // --- Fixtures (implemented in 02-02; CSRF helper remains a 02-03 stub) -------
 
 use ory_console_backend::auth::password;
