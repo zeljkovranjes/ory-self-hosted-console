@@ -24,3 +24,10 @@ yarn-error.log*
 *.swp
 .DS_Store
 Thumbs.db
+
+# --- Phase 1 (compose convergence) — reaffirm secrets + build artifacts ---
+# .env is the operator's filled-in secrets file; only .env.example is committed.
+.env
+backend/target
+frontend/node_modules
+frontend/.next
