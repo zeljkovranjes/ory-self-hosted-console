@@ -204,18 +204,27 @@ assert_broker_allowed() {
 }
 
 # --- assert_broker_denied <method> <path> ------------------------------------
-# Negative security assertion (BACK-05). PASS ONLY on an explicit 403 (the
-# proxy's default-deny verdict). Any 2xx (the call went through) is a FAIL.
-# A connection error returns empty code -> FAIL (we will not green on absence).
+# Negative security assertion (BACK-05). PASS ONLY on an EXPLICIT default-deny
+# verdict from the proxy. wollomatic/socket-proxy distinguishes two deny codes:
+#   - 403 Forbidden          -> path/source not in the allowlist
+#   - 405 Method Not Allowed -> the HTTP method has no allow rule at all
+# Both are explicit rejections by the default-deny proxy (the request never
+# reaches the Docker socket). We accept either. Any 2xx (the call went THROUGH)
+# is a FAIL, and an empty code (connection error) is a FAIL — we never green on
+# absence of output (threat T-03-false-green).
 assert_broker_denied() {
   local method="$1" path="$2" code
   code="$(_broker_status "$method" "$path")"
-  if [ "$code" = "403" ]; then
-    _pass "assert_broker_denied $method $path: 403 (denied)"
-    return 0
-  fi
-  _fail "assert_broker_denied $method $path: got '$code' (want 403 default-deny)"
-  return 1
+  case "$code" in
+    403|405)
+      _pass "assert_broker_denied $method $path: $code (denied)"
+      return 0
+      ;;
+    *)
+      _fail "assert_broker_denied $method $path: got '$code' (want explicit deny 403/405)"
+      return 1
+      ;;
+  esac
 }
 
 # --- assert_no_socket_mount <service> ----------------------------------------

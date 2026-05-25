@@ -99,13 +99,22 @@ Per-service strategy:
   distroless image and probes `/health/alive` + `/health/ready`). No shell or
   curl needed.
 - **Hydra / Keto / Oathkeeper** — have **no equivalent `remote status`
-  subcommand**, so each gets a tiny **`curlimages/curl` healthcheck sidecar**
-  that shares the service's network namespace (`network_mode: "service:<svc>"`)
-  and curls the service's `/health/ready` admin endpoint over loopback (Hydra
-  4445, Keto 4469, Oathkeeper 4456). `docker compose up -d --wait` gates on these
-  sidecars' health, so a successful `--wait` genuinely proves all four Ory
-  services are ready (chosen over a no-healthcheck approach for a true
-  compose-level health gate, per the production-grade mandate).
+  subcommand** (Hydra in particular ships no in-image health CLI), so each is
+  built from a thin wrapper (`docker/ory-healthcheck/Dockerfile`) that vendors a
+  single **statically-linked curl** binary into the pinned distroless base. The
+  **service container itself** then carries an in-image `HEALTHCHECK` that curls
+  its own admin `/health` endpoint over loopback: Hydra `/health/ready` (4445),
+  Keto `/health/ready` (4469), and Oathkeeper `/health/alive` (4456). This makes
+  `docker compose up -d --wait` gate on each service directly and lets the
+  acceptance harness assert `healthy` on the service container itself — a truer
+  compose-level health gate than a separate sidecar, with distroless hardening
+  preserved (one static binary, still no shell / package manager, non-root).
+
+  Oathkeeper uses `/health/alive` rather than `/health/ready` because, for this
+  stateless empty-ruleset configuration, its `/health/ready` reporter returns
+  503 with no satisfiable dependency to report on; `/health/alive` is the
+  meaningful liveness signal. Real access rules arrive in Phase 9, at which point
+  `/health/ready` can be revisited.
 
 The **backend** image vendors a single static `curl` binary copied from
 `curlimages/curl` into the distroless runtime so it can self-healthcheck its own
@@ -169,6 +178,14 @@ also supports `-proxysocketendpoint` for alternate socket locations).
 
 Run the verification harness and any compose commands from a bash shell
 (Git Bash or WSL) so `docker compose`, `curl`, and `node` resolve as expected.
+On **Git Bash**, prefix the harness with `MSYS_NO_PATHCONV=1` so MSYS does not
+rewrite POSIX path arguments (e.g. `/etc/config`) into Windows paths:
+
+```bash
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase1-acceptance.sh
+```
+
+Under WSL this is unnecessary.
 
 ---
 

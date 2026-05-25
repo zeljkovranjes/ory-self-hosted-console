@@ -155,10 +155,28 @@ services:
       start_period: 30s
     networks: [internal]
 
+  # NOTE on Hydra/Keto/Oathkeeper healthchecks (Pitfall 1 — distroless has no
+  # shell/curl, and only Kratos ships an in-image `remote status`): each of these
+  # three services is built from a thin wrapper (docker/ory-healthcheck/Dockerfile)
+  # that vendors ONE static curl binary into the pinned distroless base, so the
+  # SERVICE CONTAINER ITSELF carries an in-image HEALTHCHECK curling its own
+  # /health endpoint over loopback. This makes `docker compose up --wait` gate on
+  # each service AND lets the acceptance harness assert `healthy` on the service
+  # container directly (no separate sidecar). The BASE_IMAGE build-arg is passed
+  # via the YAML image anchor so the pinned tag literal still appears exactly four
+  # times in this file (INFRA-04 grep gate). Distroless hardening is preserved:
+  # one static binary added, still no shell / package manager, non-root.
   hydra:
-    image: *hydra-image
+    build:
+      context: ./docker/ory-healthcheck
+      args:
+        BASE_IMAGE: *hydra-image
     container_name: ory-hydra
-    command: ["serve", "all", "--config", "/etc/config/hydra/hydra.yml"]
+    # --dev: this Phase-1 infra bring-up serves Hydra over plain HTTP on the
+    # internal-only network (no public port is published; TLS termination is a
+    # reverse-proxy concern out of scope here). Without --dev, Hydra refuses a
+    # non-HTTPS `urls.self.issuer`. Production behind TLS would drop --dev.
+    command: ["serve", "all", "--dev", "--config", "/etc/config/hydra/hydra.yml"]
     environment:
       DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@postgres:5432/hydra?sslmode=disable
       SECRETS_SYSTEM: ${HYDRA_SECRETS_SYSTEM:?set HYDRA_SECRETS_SYSTEM (immutable after first migration)}
@@ -167,10 +185,20 @@ services:
     depends_on:
       hydra-migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # Hydra admin /health/ready on 4445 (returns 200 once ready).
+      test: ["CMD", "/usr/local/bin/curl", "-sf", "http://127.0.0.1:4445/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 25s
     networks: [internal]
 
   keto:
-    image: *keto-image
+    build:
+      context: ./docker/ory-healthcheck
+      args:
+        BASE_IMAGE: *keto-image
     container_name: ory-keto
     command: ["serve", "-c", "/etc/config/keto/keto.yml"]
     environment:
@@ -180,77 +208,42 @@ services:
     depends_on:
       keto-migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # Keto metadata/health port is 4469 (returns 200 once ready).
+      test: ["CMD", "/usr/local/bin/curl", "-sf", "http://127.0.0.1:4469/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 25s
     networks: [internal]
 
   oathkeeper:
-    image: *oathkeeper-image
+    build:
+      context: ./docker/ory-healthcheck
+      args:
+        BASE_IMAGE: *oathkeeper-image
     container_name: ory-oathkeeper
     # Stateless: no DB, no migrate dependency — serve only.
     command: ["serve", "--config", "/etc/config/oathkeeper/config.yaml"]
     volumes:
       - ./config/oathkeeper:/etc/config/oathkeeper:ro
+    healthcheck:
+      # Oathkeeper api/health port is 4456. NOTE: unlike Hydra/Keto, Oathkeeper's
+      # /health/ready returns 503 ("resource could not be found") for this
+      # stateless, empty-ruleset configuration — its readiness reporter has no
+      # satisfiable dependency to report on. /health/alive (200) is the meaningful
+      # liveness signal for a from-file stateless service. Real access rules arrive
+      # in Phase 9; revisit /health/ready then.
+      test: ["CMD", "/usr/local/bin/curl", "-sf", "http://127.0.0.1:4456/health/alive"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 25s
     networks: [internal]
 
   # ===========================================================================
   # SECURITY-CRITICAL LAYER (Task 2)
   # ===========================================================================
-
-  # ---------------------------------------------------------------------------
-  # Healthcheck SIDECARS (Pitfall 1 — distroless has no curl/shell).
-  # Hydra/Keto/Oathkeeper have NO in-image `remote status` (only Kratos does),
-  # so each gets a tiny curl sidecar sharing its service's network namespace
-  # (network_mode: service:<svc>) that curls the service's /health/ready admin
-  # endpoint over loopback. `docker compose up --wait` gates on the sidecar's
-  # service_healthy, which genuinely proves the underlying Ory service is ready.
-  # The sidecar idles (sleep) and exists only to carry the healthcheck.
-  # ---------------------------------------------------------------------------
-  hydra-health:
-    image: curlimages/curl:8.11.1
-    container_name: hydra-health
-    # Share hydra's netns so 127.0.0.1:4445 is hydra's admin port.
-    network_mode: "service:hydra"
-    command: ["sleep", "infinity"]
-    depends_on:
-      hydra:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4445/health/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 18
-      start_period: 20s
-
-  keto-health:
-    image: curlimages/curl:8.11.1
-    container_name: keto-health
-    network_mode: "service:keto"
-    command: ["sleep", "infinity"]
-    depends_on:
-      keto:
-        condition: service_started
-    healthcheck:
-      # Keto metadata/health port is 4469.
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4469/health/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 18
-      start_period: 20s
-
-  oathkeeper-health:
-    image: curlimages/curl:8.11.1
-    container_name: oathkeeper-health
-    network_mode: "service:oathkeeper"
-    command: ["sleep", "infinity"]
-    depends_on:
-      oathkeeper:
-        condition: service_started
-    healthcheck:
-      # Oathkeeper api/health port is 4456.
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:4456/health/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 18
-      start_period: 20s
 
   # ---------------------------------------------------------------------------
   # Restart broker (Pattern 2 — wollomatic/socket-proxy, BACK-05).
@@ -263,10 +256,23 @@ services:
   restart-broker:
     image: wollomatic/socket-proxy:1.12.1
     container_name: restart-broker
+    # Run as a non-root uid (nobody) but in the root GROUP (gid 0) so the process
+    # can read the Docker socket, which is owned root:root mode srw-rw---- on
+    # Docker Desktop/WSL2 (group-readable). This keeps the broker process
+    # non-root while granting only the group access the socket actually needs;
+    # combined with read_only + no-new-privileges + the scoped allowlist it
+    # stays least-privilege. (On a host whose socket has a different group, set
+    # the gid to match that group instead.)
+    user: "65534:0"
     command:
       - "-loglevel=info"
       - "-listenip=0.0.0.0"
       - "-allowfrom=backend"
+      # Enable the proxy's built-in HEAD /health on localhost:55555 so the
+      # container can self-report healthy (the image bundles a /healthcheck
+      # binary that probes it). This does NOT widen the Docker-API allowlist —
+      # it is a separate internal health endpoint, not a proxied socket route.
+      - "-allowhealthcheck"
       - '-allowPOST=/v1\..{1,2}/containers/(ory-kratos|ory-hydra|ory-keto|ory-oathkeeper)/restart'
     volumes:
       # ONLY container with the socket — mounted read-only.
@@ -274,6 +280,13 @@ services:
     read_only: true
     security_opt:
       - "no-new-privileges:true"
+    healthcheck:
+      # Bundled helper binary probes HEAD http://localhost:55555/health.
+      test: ["CMD", "/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
     networks: [internal]
     # NO host ports — reachable only from the backend over the internal network.
 
@@ -301,16 +314,16 @@ services:
       # Read-WRITE config mount (the ONLY rw config mount) — Phase 4 edit subsystem.
       - ./config:/etc/config:rw
     depends_on:
-      # Gate the backend (and therefore `--wait`) on Kratos's own healthcheck and
-      # on the three curl sidecars proving Hydra/Keto/Oathkeeper are ready, so a
-      # successful `up -d --wait` genuinely means all four Ory services are up.
+      # Gate the backend (and therefore `--wait`) on all four Ory services'
+      # in-image healthchecks, so a successful `up -d --wait` genuinely means
+      # every Ory service is up before the backend (and the harness) probe them.
       kratos:
         condition: service_healthy
-      hydra-health:
+      hydra:
         condition: service_healthy
-      keto-health:
+      keto:
         condition: service_healthy
-      oathkeeper-health:
+      oathkeeper:
         condition: service_healthy
       restart-broker:
         condition: service_started
