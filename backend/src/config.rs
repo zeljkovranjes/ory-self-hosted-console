@@ -55,6 +55,19 @@ const DEFAULT_POLIS_ADMIN_URL: &str = "http://polis:5225";
 /// internal network. NON-SECRET (carries no credential) — cleartext in `Debug`.
 const DEFAULT_RESTART_BROKER_URL: &str = "http://restart-broker:2375";
 
+/// Internal-network defaults for the opt-in `observability` profile services
+/// (Phase 16, OBS-03/04/05). The backend is the SOLE client of these endpoints
+/// (BACK-01) — the frontend never reaches Prometheus/Loki/Grafana directly. All
+/// three live ONLY on the `internal` network with NO host-published port
+/// (INFRA-05), so they are NON-SECRET (carry no credential — cleartext in
+/// `Debug`) but must NEVER be serialised into any frontend-facing response
+/// (T-16-13). Server-defined; never client input (no SSRF surface). bare
+/// `scheme://host:port` (the `/api/v1/...` paths are appended by the query
+/// clients).
+const DEFAULT_PROMETHEUS_URL: &str = "http://prometheus:9090";
+const DEFAULT_LOKI_URL: &str = "http://loki:3100";
+const DEFAULT_GRAFANA_URL: &str = "http://grafana:3000";
+
 /// Default base directory of the mounted service-config tree. Phase 1 INFRA-07
 /// bind-mounts `./config` into the backend at `/etc/config` (`:rw`). The
 /// per-service YAML lives at `<config_dir>/<service>/<file>`. NON-SECRET — it is
@@ -144,6 +157,24 @@ pub struct Config {
     /// `<config_dir>/<service>/<file>`. NON-SECRET fixed path; never client input.
     pub config_dir: String,
 
+    // --- Phase 16 (OBS-03/04/05): observability-profile internal base URLs ----
+    /// Prometheus base URL (env `PROMETHEUS_URL`, default `http://prometheus:9090`).
+    /// The backend issues parameterized PromQL `query`/`query_range` calls here for
+    /// the Activity dashboard (OBS-03). Internal-only DNS; never host-published
+    /// (INFRA-05). NON-SECRET — cleartext in the redacting `Debug`. Server-defined,
+    /// never frontend-facing (T-16-13).
+    pub prometheus_url: String,
+    /// Loki base URL (env `LOKI_URL`, default `http://loki:3100`). The backend
+    /// issues parameterized LogQL `query_range` calls here for the Logs & events
+    /// search (OBS-04). Internal-only DNS; never host-published. NON-SECRET.
+    pub loki_url: String,
+    /// Grafana base URL (env `GRAFANA_URL`, default `http://grafana:3000`). The
+    /// backend reverse-proxies authenticated console operators to Grafana here,
+    /// injecting `X-WEBAUTH-USER` (OBS-05). Grafana is reachable ONLY through this
+    /// proxy — never host-published, never reached by the browser directly
+    /// (BACK-01 / INFRA-05). NON-SECRET — cleartext in the redacting `Debug`.
+    pub grafana_url: String,
+
     // --- Phase 14 (SSO-02/03/04): Polis SAML connection admin -----------------
     /// Internal Polis ADMIN/OIDC base URL (env `POLIS_ADMIN_URL`, default
     /// `http://polis:5225`). The `sso::polis_admin` client targets
@@ -202,6 +233,10 @@ impl fmt::Debug for Config {
             // Config-edit subsystem URLs/paths are non-secret: print in cleartext.
             .field("restart_broker_url", &self.restart_broker_url)
             .field("config_dir", &self.config_dir)
+            // Observability internal base URLs are non-secret: print in cleartext.
+            .field("prometheus_url", &self.prometheus_url)
+            .field("loki_url", &self.loki_url)
+            .field("grafana_url", &self.grafana_url)
             // Polis admin URL + issuer are non-secret: cleartext. The Polis API
             // key is a SECRET — never print it, even its presence is collapsed to
             // a redaction marker (BACK-07 / T-14-04).
@@ -310,6 +345,16 @@ impl Config {
         let config_dir =
             env::var("CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string());
 
+        // Phase 16 (OBS-03/04/05): the three observability-profile internal base
+        // URLs. Each falls back to its internal-network default; none is required
+        // (they resolve only on the internal Docker network and carry no
+        // credential). Server-defined — never client input (no SSRF surface).
+        let prometheus_url =
+            env::var("PROMETHEUS_URL").unwrap_or_else(|_| DEFAULT_PROMETHEUS_URL.to_string());
+        let loki_url = env::var("LOKI_URL").unwrap_or_else(|_| DEFAULT_LOKI_URL.to_string());
+        let grafana_url =
+            env::var("GRAFANA_URL").unwrap_or_else(|_| DEFAULT_GRAFANA_URL.to_string());
+
         // Phase 14 (SSO-02/04): Polis admin base + the write-only Api-Key + the
         // public issuer URL. The admin base falls back to the internal default;
         // the API key + issuer are optional (the SAML routes 502 if the key is
@@ -344,6 +389,9 @@ impl Config {
             oathkeeper_api_url,
             restart_broker_url,
             config_dir,
+            prometheus_url,
+            loki_url,
+            grafana_url,
             polis_admin_url,
             polis_api_key,
             polis_external_url,

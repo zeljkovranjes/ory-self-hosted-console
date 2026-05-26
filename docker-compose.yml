@@ -473,6 +473,16 @@ services:
       WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-}
       # Backend reaches the Docker engine ONLY through the scoped broker.
       RESTART_BROKER_URL: http://restart-broker:2375
+      # Phase 16 (OBS-03/04/05): the opt-in observability-profile internal base
+      # URLs. The backend is the SOLE client (BACK-01) — the frontend never
+      # reaches Prometheus/Loki/Grafana directly. Internal service-name DNS on the
+      # `internal` network ONLY; none of the three publishes a host port
+      # (INFRA-05). Server-defined (never client input — no SSRF surface). These
+      # resolve only when the `observability` profile is up; when it is down the
+      # backend's tolerant health-probe returns profile_not_running (never a 502).
+      PROMETHEUS_URL: http://prometheus:9090
+      LOKI_URL: http://loki:3100
+      GRAFANA_URL: http://grafana:3000
       # Phase 14 (SSO-02/03/04): the backend is the SOLE client of the Polis admin
       # API. POLIS_ADMIN_URL is the INTERNAL admin/OIDC base (never host-published,
       # INFRA-05). POLIS_API_KEY is the write-only `Authorization: Api-Key`

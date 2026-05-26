@@ -17,6 +17,7 @@ pub mod error;
 pub mod features;
 pub mod members;
 pub mod metrics;
+pub mod observability;
 pub mod organizations;
 pub mod overview;
 pub mod ory;

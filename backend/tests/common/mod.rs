@@ -76,6 +76,12 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
         // `Config::from_env`.
         restart_broker_url: "http://restart-broker:2375".to_string(),
         config_dir: "/etc/config".to_string(),
+        // Phase 16 (OBS-03/04/05): observability-profile internal base URLs — same
+        // defaults as `Config::from_env`. The probe/query/proxy tests override
+        // these (e.g. to a mockito base or an unreachable host) on a per-test cfg.
+        prometheus_url: "http://prometheus:9090".to_string(),
+        loki_url: "http://loki:3100".to_string(),
+        grafana_url: "http://grafana:3000".to_string(),
         // Phase 14 (SSO-02/04): Polis admin base + write-only api key + issuer.
         // The router fixtures do not call Polis; defaults mirror `Config::from_env`
         // (the key/issuer are absent so the SAML routes 502 rather than calling
