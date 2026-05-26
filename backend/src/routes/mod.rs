@@ -271,6 +271,29 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
         // enforces `X-CSRF-Token` (403) — deliberately NOT exempted (T-04-11). The
         // `<service>`/`<section>` segments are parsed through the closed allowlist
         // + `Service` enum inside the handlers (SSRF guard, T-04-12).
+        // Phase 8 (OAUTH2-04 secret half): the dedicated write-only Hydra OIDC
+        // `pairwise.salt` setter. Registered BEFORE the generic
+        // `api/config/{service}/{section}` route so the literal `pairwise-salt`
+        // path segment matches this dedicated handler and never falls through to
+        // the generic allowlist dispatch (which would 404 on an unknown section).
+        // A DEDICATED route because the salt is write-only — changing it
+        // invalidates every existing pairwise subject ID, so it is masked exactly
+        // like the SMTP URI (threat T-08-SALT). GET reports `{set:bool}` (never the
+        // salt value, csrf-exempt); PUT sets a real value, preserves on the masked
+        // sentinel, or clears, restarts Hydra ONLY, and rolls back on health
+        // failure. PUT is state-changing so `csrf_guard` enforces `X-CSRF-Token`
+        // (403); both inherit `auth_guard` (401 unauth).
+        .push(
+            Router::with_path("api/config/hydra/pairwise-salt")
+                .get(crate::config_edit::routes::get_pairwise_salt)
+                .put(crate::config_edit::routes::put_pairwise_salt),
+        )
+        // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
+        // allowlisted values; PUT runs the full transactional flow. Both inherit
+        // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`
+        // enforces `X-CSRF-Token` (403) — deliberately NOT exempted (T-04-11). The
+        // `<service>`/`<section>` segments are parsed through the closed allowlist
+        // + `Service` enum inside the handlers (SSRF guard, T-04-12).
         .push(
             Router::with_path("api/config/{service}/{section}")
                 .get(crate::config_edit::routes::get_config)

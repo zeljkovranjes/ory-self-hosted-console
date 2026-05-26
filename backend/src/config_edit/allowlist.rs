@@ -270,11 +270,134 @@ pub const KRATOS_WEBHOOKS: SectionAllowlist = SectionAllowlist {
     ],
 };
 
+// ─── Phase 8 — Hydra (OAuth2/OIDC) server config sections (08-RESEARCH SECTION→ALLOWLIST) ───
+//
+// Every JSON-Pointer below is VERIFIED against the vendored v26.2.0
+// `backend/config/schemas/hydra.config.schema.json` (and the resolved `ory://`
+// serve sub-schema in `backend/config/schemas/ory/serve-config.json` +
+// `cors-config.json` for the General-page `serve.public.*` keys — Assumption A2,
+// RESOLVED: `/serve/public/{host,port,cors/enabled}` all exist). All six sections
+// are SCALAR (no array-of-objects), so none uses the array merge/mask pipeline.
+//
+// `dsn`, `secrets.*` (covers cookie secrets at `/secrets/cookie`), `serve.admin.*`
+// and `serve.public.tls` are NEVER listed here — they stay on the hard
+// `SENSITIVE_PREFIXES` denylist (INFRA-05 / Pitfall 5). `oidc.pairwise.salt` IS
+// listed in `HYDRA_OIDC` for engine routing but is treated WRITE-ONLY via the
+// dedicated handler in `routes.rs` (mask on GET, preserve-on-blank PUT).
+
+/// OAUTH2-03 — General / Issuer page (08-RESEARCH Page 1, schema lines 115–147
+/// serve.public via the `ory://serve-config` + `ory://cors-config` refs; 480 issuer).
+///
+/// NO top-level `issuer` key exists — the issuer is `urls.self.issuer`.
+/// `serve.admin.*` and `serve.public.tls` stay DENYLISTED (INFRA-05).
+pub const HYDRA_GENERAL: SectionAllowlist = SectionAllowlist {
+    service: "hydra",
+    section: "general",
+    allowed_paths: &[
+        "/urls/self/issuer",
+        "/urls/self/public",
+        "/serve/public/host",
+        "/serve/public/port",
+        "/serve/public/cors/enabled",
+    ],
+};
+
+/// OAUTH2-04 — OIDC page (08-RESEARCH Page 2, schema lines 397–470).
+///
+/// `supported_types` enum=[public,pairwise]. `pairwise/salt` is WRITE-ONLY: it is
+/// listed here for engine ROUTING only — the dedicated `routes.rs` salt handler is
+/// the actual reader/writer (mask on GET, preserve-on-blank PUT), exactly like the
+/// SMTP connection_uri pattern.
+pub const HYDRA_OIDC: SectionAllowlist = SectionAllowlist {
+    service: "hydra",
+    section: "oidc",
+    allowed_paths: &[
+        "/oidc/subject_identifiers/supported_types",
+        "/oidc/subject_identifiers/pairwise/salt",
+        "/oidc/dynamic_client_registration/enabled",
+        "/oidc/dynamic_client_registration/default_scope",
+    ],
+};
+
+/// OAUTH2-05 — URLs page (08-RESEARCH Page 3, schema lines 480–571).
+///
+/// All strings. `urls.self.issuer`/`urls.self.public` are shared with the General
+/// page — both allowlists may list them harmlessly (the engine merges one doc);
+/// the canonical UI editor for the issuer is the General page.
+pub const HYDRA_URLS: SectionAllowlist = SectionAllowlist {
+    service: "hydra",
+    section: "urls",
+    allowed_paths: &[
+        "/urls/login",
+        "/urls/consent",
+        "/urls/logout",
+        "/urls/error",
+        "/urls/post_logout_redirect",
+        "/urls/self/issuer",
+        "/urls/self/public",
+    ],
+};
+
+/// OAUTH2-06 — Token Lifespans page (08-RESEARCH Page 4, schema lines 648–700).
+///
+/// All duration strings (e.g. `"1h"`).
+pub const HYDRA_TTL: SectionAllowlist = SectionAllowlist {
+    service: "hydra",
+    section: "ttl",
+    allowed_paths: &[
+        "/ttl/access_token",
+        "/ttl/refresh_token",
+        "/ttl/id_token",
+        "/ttl/auth_code",
+        "/ttl/login_consent_request",
+    ],
+};
+
+/// OAUTH2-07 — Token Strategies & PKCE page (08-RESEARCH Page 5, schema lines
+/// 631–656 strategies, 817–828 pkce, 878–889 grant.jwt).
+///
+/// `access_token` enum=[opaque,jwt]; `scope` enum=[exact,wildcard];
+/// `jwt/scope_claim` enum=[list,string,both]. Enum-value validity is the schema
+/// validator's job (live gate); the allowlist only gates the POINTERS.
+pub const HYDRA_STRATEGIES: SectionAllowlist = SectionAllowlist {
+    service: "hydra",
+    section: "strategies",
+    allowed_paths: &[
+        "/strategies/access_token",
+        "/strategies/scope",
+        "/strategies/jwt/scope_claim",
+        "/oauth2/pkce/enforced",
+        "/oauth2/pkce/enforced_for_public_clients",
+        "/oauth2/grant/jwt/jti_optional",
+        "/oauth2/grant/jwt/iat_optional",
+        "/oauth2/grant/jwt/max_ttl",
+    ],
+};
+
+/// OAUTH2-08 — Cookies page (08-RESEARCH Page 6, schema lines 151–207).
+///
+/// `same_site_mode` enum=[Strict,Lax,None]. Cookie SECRETS live under
+/// `/secrets/cookie` (denylisted), NOT here — only behavior keys are editable.
+pub const HYDRA_COOKIES: SectionAllowlist = SectionAllowlist {
+    service: "hydra",
+    section: "cookies",
+    allowed_paths: &[
+        "/serve/cookies/same_site_mode",
+        "/serve/cookies/same_site_legacy_workaround",
+        "/serve/cookies/domain",
+        "/serve/cookies/secure",
+        "/serve/cookies/names/login_csrf",
+        "/serve/cookies/names/consent_csrf",
+        "/serve/cookies/names/device_csrf",
+        "/serve/cookies/names/session",
+    ],
+};
+
 /// Code-defined registry of every shipped section allowlist. The lookup is the
 /// ONLY way to obtain an allowlist — it is never assembled from client input.
 ///
 /// Phase-4 proof (`KRATOS_SESSION`) + the 10 Phase-7 Kratos auth sections (7
-/// scalar + 3 array-root).
+/// scalar + 3 array-root) + the 6 Phase-8 Hydra config sections (all scalar).
 const REGISTRY: &[&SectionAllowlist] = &[
     &KRATOS_SESSION,
     &KRATOS_METHODS,
@@ -287,6 +410,12 @@ const REGISTRY: &[&SectionAllowlist] = &[
     &KRATOS_OIDC,
     &KRATOS_SMS,
     &KRATOS_WEBHOOKS,
+    &HYDRA_GENERAL,
+    &HYDRA_OIDC,
+    &HYDRA_URLS,
+    &HYDRA_TTL,
+    &HYDRA_STRATEGIES,
+    &HYDRA_COOKIES,
 ];
 
 /// Look up the allowlist for a `(service, section)` pair.
@@ -771,5 +900,130 @@ mod tests {
             filter(&KRATOS_WEBHOOKS, &hook_index),
             Err(AppError::Forbidden)
         ));
+    }
+
+    // ─── Phase 8 — Hydra config-section allowlist behaviors (08-03 Task 1) ───
+
+    /// The six Phase-8 Hydra config sections each resolve via `lookup`, and a
+    /// non-existent hydra section is NotFound (no permissive fall-through).
+    #[test]
+    fn all_six_hydra_sections_resolve() {
+        for section in ["general", "oidc", "urls", "ttl", "strategies", "cookies"] {
+            assert!(
+                lookup("hydra", section).is_ok(),
+                "hydra section `{section}` must resolve via the registry"
+            );
+        }
+        assert!(matches!(lookup("hydra", "nope"), Err(AppError::NotFound)));
+        // `lookup("hydra","ttl")` resolves (explicit per the plan behavior).
+        assert!(lookup("hydra", "ttl").is_ok());
+    }
+
+    /// Every hydra section accepts each of its allowlisted pointers and rejects an
+    /// out-of-scope pointer (default-deny, full-pointer match).
+    #[test]
+    fn each_hydra_section_accepts_all_allowlisted_rejects_out_of_scope() {
+        let sections: &[&SectionAllowlist] = &[
+            &HYDRA_GENERAL,
+            &HYDRA_OIDC,
+            &HYDRA_URLS,
+            &HYDRA_TTL,
+            &HYDRA_STRATEGIES,
+            &HYDRA_COOKIES,
+        ];
+        for al in sections {
+            // EVERY allowlisted pointer is accepted.
+            for ptr in al.allowed_paths {
+                let ok = vec![((*ptr).to_string(), json!("v"))];
+                assert!(
+                    filter(al, &ok).is_ok(),
+                    "hydra/{}: `{ptr}` must be accepted",
+                    al.section
+                );
+            }
+            // An out-of-scope pointer no hydra section owns is rejected.
+            let oos = vec![("/identity/default_schema_id".to_string(), json!("evil"))];
+            assert!(
+                matches!(filter(al, &oos), Err(AppError::Forbidden)),
+                "hydra/{}: out-of-scope pointer must be Forbidden",
+                al.section
+            );
+        }
+    }
+
+    /// Every sensitive pointer is rejected for EVERY hydra section regardless of
+    /// allowlist membership (the denylist wins). Covers `/dsn`, `/secrets/cookie/0`,
+    /// `/serve/admin/host`, `/serve/public/tls/key/path`.
+    #[test]
+    fn sensitive_pointers_denied_for_every_hydra_section() {
+        let sections: &[&SectionAllowlist] = &[
+            &HYDRA_GENERAL,
+            &HYDRA_OIDC,
+            &HYDRA_URLS,
+            &HYDRA_TTL,
+            &HYDRA_STRATEGIES,
+            &HYDRA_COOKIES,
+        ];
+        let sensitive = [
+            "/dsn",
+            "/secrets/cookie/0",
+            "/secrets/system/0",
+            "/serve/admin/host",
+            "/serve/public/tls/key/path",
+        ];
+        for al in sections {
+            for p in sensitive {
+                let patch = vec![(p.to_string(), json!("x"))];
+                assert!(
+                    matches!(filter(al, &patch), Err(AppError::Forbidden)),
+                    "hydra/{}: `{p}` must be denied by the sensitive denylist",
+                    al.section
+                );
+            }
+            // No hydra allowlist lists a sensitive pointer.
+            for sp in SENSITIVE_PREFIXES {
+                assert!(
+                    !al.allowed_paths.iter().any(|p| p.starts_with(sp)),
+                    "hydra/{} must not list a sensitive pointer ({sp})",
+                    al.section
+                );
+            }
+        }
+    }
+
+    /// The General page exposes ONLY the schema-valid `serve.public` sub-keys
+    /// (A2: host/port/cors.enabled exist) and never the admin listener or TLS.
+    #[test]
+    fn hydra_general_serve_public_only_no_admin_no_tls() {
+        assert!(HYDRA_GENERAL.allowed_paths.contains(&"/serve/public/host"));
+        assert!(HYDRA_GENERAL.allowed_paths.contains(&"/serve/public/port"));
+        assert!(HYDRA_GENERAL
+            .allowed_paths
+            .contains(&"/serve/public/cors/enabled"));
+        assert!(HYDRA_GENERAL.allowed_paths.contains(&"/urls/self/issuer"));
+        // Never the admin listener nor the public TLS private key.
+        assert!(HYDRA_GENERAL
+            .allowed_paths
+            .iter()
+            .all(|p| !p.starts_with("/serve/admin")));
+        assert!(HYDRA_GENERAL
+            .allowed_paths
+            .iter()
+            .all(|p| !p.starts_with("/serve/public/tls")));
+    }
+
+    /// The OIDC section lists `pairwise/salt` for engine routing (the dedicated
+    /// write-only handler is the real reader/writer), and the cookies section
+    /// never lists a cookie secret (those live under the denylisted `/secrets`).
+    #[test]
+    fn hydra_oidc_routes_salt_cookies_have_no_secret() {
+        assert!(HYDRA_OIDC
+            .allowed_paths
+            .contains(&"/oidc/subject_identifiers/pairwise/salt"));
+        // The cookies section edits only behavior keys, never `/secrets/cookie`.
+        assert!(HYDRA_COOKIES
+            .allowed_paths
+            .iter()
+            .all(|p| !p.contains("secret") && !p.starts_with("/secrets")));
     }
 }

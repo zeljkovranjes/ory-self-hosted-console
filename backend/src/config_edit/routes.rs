@@ -58,6 +58,16 @@ use crate::error::AppError;
 /// the schema file (Pitfall 2 / threat T-07-07).
 const SMTP_CONNECTION_URI_POINTER: &str = "/courier/smtp/connection_uri";
 
+/// The single fixed JSON-Pointer the dedicated Hydra `pairwise.salt` write-only
+/// handler may touch (OAUTH2-04). The salt derives pairwise OIDC subject
+/// identifiers; changing it invalidates every existing pairwise subject ID, so it
+/// is treated WRITE-ONLY exactly like the SMTP connection_uri: GET reports only
+/// `{set:bool}` (the value is never echoed/logged), a blank/masked PUT preserves,
+/// `{clear:true}` removes, and a real value flows through the engine restarting
+/// Hydra ONLY. It is listed in `HYDRA_OIDC` for engine ROUTING only — this
+/// dedicated handler is the sole reader/writer (threat T-08-SALT).
+const HYDRA_PAIRWISE_SALT_POINTER: &str = "/oidc/subject_identifiers/pairwise/salt";
+
 /// How long to wait for a restarted service to report healthy before rolling
 /// back (RESEARCH Pitfall 6: services briefly 503; allow ample boot time).
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -702,6 +712,171 @@ pub async fn put_smtp_connection(
     Err(AppError::HealthFailed)
 }
 
+/// `GET /api/config/hydra/pairwise-salt` — report ONLY whether an OIDC
+/// `pairwise.salt` is currently set. The salt value is NEVER serialised, logged,
+/// or echoed — not even a substring (threat T-08-SALT).
+///
+/// Returns `{ "set": true }` when `/oidc/subject_identifiers/pairwise/salt` is
+/// present and a non-empty string, else `{ "set": false }`. Mirrors the SMTP
+/// dedicated path: a fixed target file (`hydra.yml`), NOT the
+/// `{service}/{section}` allowlist. On the protected subtree: `auth_guard` (401).
+/// GET is csrf-exempt.
+#[handler]
+pub async fn get_pairwise_salt(
+    _req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    let cfg = config_from(depot)?;
+    let path = config_file_path(&cfg.config_dir, restart::Service::Hydra);
+    let doc = yaml::load(&path)?;
+
+    // "set" iff present AND a non-empty string. The value itself is never bound to
+    // a variable that could reach the body or a log line.
+    let set = matches!(
+        doc.pointer(HYDRA_PAIRWISE_SALT_POINTER),
+        Some(Value::String(s)) if !s.is_empty()
+    );
+    Ok(Json(serde_json::json!({ "set": set })))
+}
+
+/// `PUT /api/config/hydra/pairwise-salt` — dedicated write-only setter for the
+/// OIDC `pairwise.salt`, reusing the Phase-4 transactional engine (lock ->
+/// validate -> backup -> atomic-write -> restart Hydra ONLY -> health-poll ->
+/// rollback). Mirrors [`put_smtp_connection`] exactly.
+///
+/// Body: `{ "salt": "<value>" }` (+ optional `clear`).
+///   - value == [`secret_merge::MASKED`] OR empty/absent (and not `clear`) =>
+///     "unchanged": idempotent NO-OP if a value is stored (preserve), else 422
+///     (`salt required`).
+///   - `clear: true` => REMOVE the stored salt (returns pairwise IDs to underived).
+///   - a real value => single-pointer engine flow through the Hydra restart.
+///
+/// This dedicated handler is the authorization: it can only EVER touch the one
+/// fixed pointer, so it deliberately does NOT route through `allowlist::filter`.
+/// The salt value never appears in any response body or tracing line (T-08-SALT).
+///
+/// On the protected subtree: `auth_guard` (401) + `csrf_guard` (403 without
+/// `X-CSRF-Token`, since this is state-changing).
+#[handler]
+pub async fn put_pairwise_salt(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    #[derive(serde::Deserialize)]
+    struct SaltBody {
+        salt: Option<String>,
+        /// Explicit removal. When `true`, the stored salt is REMOVED (distinct
+        /// from a blank/masked PUT which preserves).
+        #[serde(default)]
+        clear: bool,
+    }
+
+    let cfg = config_from(depot)?;
+    let svc = restart::Service::Hydra;
+
+    // Parse the body up front (malformed -> 400 before the lock). The value is
+    // never logged.
+    let body: SaltBody = req
+        .parse_json()
+        .await
+        .map_err(|_| AppError::BadRequest("invalid JSON body".into()))?;
+    let incoming = body.salt.unwrap_or_default();
+    let clear = body.clear;
+    // "unchanged": the masked sentinel or empty value, but ONLY when not clearing.
+    let unchanged = !clear && (incoming.is_empty() || incoming == secret_merge::MASKED);
+
+    // --- Step 1: hydra write lock (busy -> 409 config_busy) ------------------
+    // Shares the per-service lock with put_config so a salt edit and a config edit
+    // for hydra can never interleave.
+    let _guard = locks::try_acquire("hydra").await?;
+    tracing::info!(service = svc.key(), "pairwise-salt put: lock acquired");
+
+    let path = config_file_path(&cfg.config_dir, svc);
+
+    // Write-only-preserve: a masked/empty PUT must NEVER overwrite a stored value.
+    if unchanged {
+        let doc = yaml::load(&path)?;
+        let already_set = matches!(
+            doc.pointer(HYDRA_PAIRWISE_SALT_POINTER),
+            Some(Value::String(s)) if !s.is_empty()
+        );
+        if already_set {
+            tracing::info!(
+                service = svc.key(),
+                status = "unchanged",
+                "pairwise-salt put: masked/empty with a stored value — preserved (no write)"
+            );
+            return Ok(Json(serde_json::json!({ "status": "healthy" })));
+        }
+        // Nothing stored to preserve -> a value is required. Value-free 422.
+        return Err(AppError::Validation(vec![schema::FieldError {
+            path: HYDRA_PAIRWISE_SALT_POINTER.to_string(),
+            message: "salt required".to_string(),
+        }]));
+    }
+
+    // --- Real value OR explicit clear: single-pointer engine flow ------------
+    let mut merged = yaml::load(&path)?;
+    if clear {
+        // REMOVE the salt key entirely. The remaining pairwise/oidc keys are
+        // preserved. The pointer is the fixed dedicated one; this handler is the
+        // authorization (T-08-SALT).
+        if let Some(Value::Object(pairwise)) =
+            merged.pointer_mut("/oidc/subject_identifiers/pairwise")
+        {
+            pairwise.remove("salt");
+        }
+        tracing::info!(service = svc.key(), status = "clearing", "pairwise-salt put: removing stored salt (explicit clear)");
+    } else {
+        // Single fixed-pointer patch — NOT via allowlist::filter (this dedicated
+        // handler IS the authorization, T-08-SALT).
+        let patch = vec![(
+            HYDRA_PAIRWISE_SALT_POINTER.to_string(),
+            Value::String(incoming),
+        )];
+        yaml::apply_patch(&mut merged, &patch)?;
+    }
+
+    // --- VALIDATE the env-overlaid effective doc ----------------------------
+    let validator = schema::validator_for("hydra").map_err(|e| {
+        tracing::error!(error = %e, service = svc.key(), "schema compile failed");
+        AppError::Internal("config schema unavailable".into())
+    })?;
+    let effective = schema::effective_for_validation("hydra", &merged);
+    if let Err(fields) = schema::validate_full(validator, &effective) {
+        tracing::debug!(service = svc.key(), count = fields.len(), "pairwise-salt put: validation failed");
+        return Err(AppError::Validation(fields));
+    }
+
+    // --- BACKUP + WR-02 assert ----------------------------------------------
+    yaml::backup(&path)?;
+    if !yaml::backup_exists(&path) {
+        tracing::error!(service = svc.key(), "pairwise-salt put: backup missing after backup(); refusing reversible write");
+        return Err(AppError::Internal("config backup missing".into()));
+    }
+
+    // --- ATOMIC WRITE the merged doc (no env overlay) ------------------------
+    let serialized = yaml::serialize(&merged)?;
+    yaml::write_atomic(&path, &serialized)?;
+    tracing::info!(service = svc.key(), status = "applied", "pairwise-salt put: written");
+
+    // --- RESTART hydra ONLY + health-poll + rollback ------------------------
+    let http = restart::restart_client()?;
+    tracing::info!(service = svc.key(), status = "restarting", "pairwise-salt put: restarting");
+    if let Err(e) = restart::restart(&http, &cfg.restart_broker_url, svc).await {
+        tracing::warn!(service = svc.key(), "pairwise-salt put: broker restart failed; restoring disk (no re-restart)");
+        restore_only(&path, svc);
+        return Err(e);
+    }
+    if restart::wait_healthy(&http, svc, HEALTH_TIMEOUT, None).await {
+        tracing::info!(service = svc.key(), status = "healthy", "pairwise-salt put: healthy");
+        return Ok(Json(serde_json::json!({ "status": "healthy" })));
+    }
+    tracing::warn!(service = svc.key(), "pairwise-salt put: health failed; rolling back");
+    rollback_and_restart(&http, &path, &cfg, svc).await;
+    Err(AppError::HealthFailed)
+}
+
 /// WR-03 broker-failure rollback: restore the last-known-good `.bak` ONLY (no
 /// restart — the broker just failed and the service never left its old config).
 /// Surfaces the restore outcome distinctly (WR-02): a missing backup or a
@@ -925,6 +1100,73 @@ mod tests {
             .ends_with("kratos/kratos.yml"));
         assert!(config_file_path("/etc/config", restart::Service::Oathkeeper)
             .ends_with("oathkeeper/config.yaml"));
+        // Hydra config maps to hydra/hydra.yml (the salt + six config sections).
+        assert!(config_file_path("/etc/config", restart::Service::Hydra)
+            .ends_with("hydra/hydra.yml"));
+    }
+
+    // ─── Phase 8 Task 1: pairwise.salt write-only GET shape (T-08-SALT) ───
+
+    /// The pure presence-only core of `get_pairwise_salt`: returns ONLY a `{set}`
+    /// boolean, never the salt value. Mirrors the handler's read logic so the
+    /// "never echo the value" guarantee is unit-testable without a filesystem.
+    fn salt_set_response(doc: &Value) -> Value {
+        let set = matches!(
+            doc.pointer(HYDRA_PAIRWISE_SALT_POINTER),
+            Some(Value::String(s)) if !s.is_empty()
+        );
+        serde_json::json!({ "set": set })
+    }
+
+    #[test]
+    fn pairwise_salt_get_returns_only_set_bool_never_value() {
+        // A doc with a REAL salt -> {set:true}, and the salt value never appears.
+        let doc = json!({
+            "oidc": { "subject_identifiers": { "pairwise": { "salt": "REAL-SALT-VALUE-XYZ" } } }
+        });
+        let resp = salt_set_response(&doc);
+        assert_eq!(resp, json!({ "set": true }));
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !serialized.contains("REAL-SALT-VALUE-XYZ"),
+            "the salt value must NEVER appear in the GET response: {serialized}"
+        );
+        // The response shape carries exactly one key: `set`.
+        assert_eq!(resp.as_object().unwrap().len(), 1);
+        assert!(resp.as_object().unwrap().contains_key("set"));
+
+        // Absent or empty salt -> {set:false}.
+        assert_eq!(salt_set_response(&json!({})), json!({ "set": false }));
+        let empty = json!({
+            "oidc": { "subject_identifiers": { "pairwise": { "salt": "" } } }
+        });
+        assert_eq!(salt_set_response(&empty), json!({ "set": false }));
+    }
+
+    #[test]
+    fn pairwise_salt_clear_removes_only_salt_key() {
+        // Mirror the `clear` branch: removing `salt` keeps sibling pairwise/oidc
+        // keys intact (supported_types untouched).
+        let mut merged = json!({
+            "oidc": {
+                "subject_identifiers": {
+                    "supported_types": ["public", "pairwise"],
+                    "pairwise": { "salt": "to-be-removed" }
+                }
+            }
+        });
+        if let Some(Value::Object(pairwise)) =
+            merged.pointer_mut("/oidc/subject_identifiers/pairwise")
+        {
+            pairwise.remove("salt");
+        }
+        assert!(merged
+            .pointer("/oidc/subject_identifiers/pairwise/salt")
+            .is_none());
+        assert_eq!(
+            merged.pointer("/oidc/subject_identifiers/supported_types"),
+            Some(&json!(["public", "pairwise"]))
+        );
     }
 
     // ─── Task 3: array-section selection + GET-mask/decode, PUT-merge/encode ───
