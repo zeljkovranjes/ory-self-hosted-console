@@ -129,6 +129,31 @@ describe("SettingsForm (FE-03)", () => {
     expect(JSON.parse(init.body)).toMatchObject({ from_name: "Ory Console" });
   });
 
+  it("WR-01: PUTs ONLY the dirty field, leaving untouched pointers out of the body", async () => {
+    // Regression guard for the data-loss-shaped WR-01: the branding config pages
+    // bind a FLAT pointer-keyed value object whose untouched fields fall back to a
+    // `""`/`[]` default. If SettingsForm PUT the WHOLE `values` object, editing one
+    // field would re-send every OTHER field as its blank default — the backend
+    // would write `""` (or an empty `base64://` body) over pointers the operator
+    // never touched, and 422 the ui-urls save against `format:uri`. The fix sends
+    // only RHF's `dirtyFields`, so the patch carries EXACTLY the changed pointer.
+    apiMock.mockResolvedValueOnce({ status: "healthy" });
+    render(<Harness />);
+    // Edit ONLY `from_name`; `smtp_host` keeps its default and stays pristine.
+    await userEvent.clear(screen.getByLabelText("From name"));
+    await userEvent.type(screen.getByLabelText("From name"), "Ory Console");
+    await userEvent.click(screen.getByRole("button", { name: /save/i }));
+
+    await waitFor(() => expect(apiMock).toHaveBeenCalledTimes(1));
+    const [, init] = apiMock.mock.calls[0];
+    const body = JSON.parse(init.body) as Record<string, unknown>;
+    // The body is the dirty field ONLY — the untouched `smtp_host` is ABSENT, so
+    // the backend never receives (and never writes) the unedited pointer.
+    expect(Object.keys(body)).toEqual(["from_name"]);
+    expect(body.from_name).toBe("Ory Console");
+    expect(body).not.toHaveProperty("smtp_host");
+  });
+
   it("maps a backend 422 to inline field errors via setError(type:'server')", async () => {
     apiMock.mockRejectedValueOnce(
       new ApiError(422, [

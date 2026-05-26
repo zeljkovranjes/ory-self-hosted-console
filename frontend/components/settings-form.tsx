@@ -162,12 +162,32 @@ export function SettingsForm<TSchema extends FieldSchema>({
 
   const submit = form.handleSubmit(async (values) => {
     setStatus("restarting");
+    // WR-01: PUT ONLY the fields the operator actually edited. The config pages
+    // bind a FLAT pointer-keyed value object whose untouched fields fall back to
+    // their schema default (`""` for a string, `[]` for an array). PUTting the
+    // WHOLE `values` object would write those defaults over the on-disk values
+    // the operator never touched — blanking every other email-template pointer
+    // (the backend turns `""` into an empty `base64://` body) and 422-ing the
+    // ui-urls save (an empty `""` violates `format:uri`). We mirror the Phase-8
+    // CR-01 philosophy: merge the operator's edits over what is stored, never
+    // blank an unspecified field. RHF's `dirtyFields` marks each changed key
+    // (truthy: `true` for a scalar, an array of booleans/objects for an array
+    // field), so the patch carries exactly the changed pointers. The custom
+    // `onSubmit` override still receives the full validated output.
+    const dirty = form.formState.dirtyFields as Record<string, unknown>;
+    const valuesRecord = values as Record<string, unknown>;
+    const patch = Object.fromEntries(
+      Object.keys(valuesRecord).filter((k) => Boolean(dirty[k])).map((k) => [
+        k,
+        valuesRecord[k],
+      ]),
+    );
     try {
       const res = (await (onSubmit
         ? onSubmit(values)
         : api<ConfigSaveResponse>(submitPath, {
             method: "PUT",
-            body: JSON.stringify(values),
+            body: JSON.stringify(patch),
           }))) as ConfigSaveResponse;
 
       const next: ConfigStatus = res?.status ?? "healthy";
