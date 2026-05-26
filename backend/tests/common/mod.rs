@@ -82,8 +82,8 @@ use ory_console_backend::ory::clients::OryClients;
 
 /// Build an [`OryClients`] whose per-service `base_path`s come from the same env
 /// vars the production `Config` reads (`KRATOS_ADMIN_URL`, `HYDRA_ADMIN_URL`,
-/// `KETO_READ_URL`, `KETO_WRITE_URL`, `OATHKEEPER_API_URL`), each falling back to
-/// the internal-network default. Live tests (`ORY_LIVE_TESTS=1`) use this to talk
+/// `KETO_READ_URL`, `KETO_WRITE_URL`, `KETO_OPL_URL`, `OATHKEEPER_API_URL`), each
+/// falling back to the internal-network default. Live tests (`ORY_LIVE_TESTS=1`) use this to talk
 /// to the running compose stack — e.g. to SEED one Kratos identity directly via
 /// the typed admin crate so the wrapper read is non-empty.
 ///
@@ -104,6 +104,7 @@ pub fn ory_clients_from_env() -> OryClients {
         hydra_public_url: url("HYDRA_PUBLIC_URL", &cfg.hydra_public_url),
         keto_read_url: url("KETO_READ_URL", &cfg.keto_read_url),
         keto_write_url: url("KETO_WRITE_URL", &cfg.keto_write_url),
+        keto_opl_url: url("KETO_OPL_URL", &cfg.keto_opl_url),
         oathkeeper_api_url: url("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url),
         ..cfg
     };
