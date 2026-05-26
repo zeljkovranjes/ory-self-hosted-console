@@ -8,7 +8,6 @@ import {
   Link2,
   Mail,
   MonitorSmartphone,
-  Palette,
   RefreshCw,
   Route,
   RotateCcw,
@@ -273,16 +272,31 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Console",
+    // Phase 10 — the "Branding" group (10-UI-SPEC §G). Plan 02 ships the two
+    // kratos-config branding pages (Email Templates, UI URLs); Plan 03 appends
+    // Console Logo + the three gated pages (Localization, Custom Domains,
+    // Theming) without re-touching these two. Both `built: true`.
+    label: "Branding",
     items: [
       {
-        slug: "branding",
-        label: "Branding",
-        href: "/branding",
-        icon: Palette,
-        built: false,
-        comingIn: "Phase 10",
+        slug: "branding-email-templates",
+        label: "Email Templates",
+        href: "/branding/email-templates",
+        icon: Mail,
+        built: true,
       },
+      {
+        slug: "branding-ui-urls",
+        label: "UI URLs",
+        href: "/branding/ui-urls",
+        icon: Link2,
+        built: true,
+      },
+    ],
+  },
+  {
+    label: "Console",
+    items: [
       {
         slug: "project",
         label: "Project",

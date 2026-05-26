@@ -53,8 +53,9 @@ const Editor = dynamic(
   },
 );
 
-/** The languages the console's editors use this phase. OPL rides on plaintext. */
-export type MonacoLanguage = "json" | "yaml" | "plaintext";
+/** The languages the console's editors use this phase. OPL rides on plaintext.
+ *  `html` is used by the Phase-10 email-template HTML body editor (BRAND-01). */
+export type MonacoLanguage = "json" | "yaml" | "plaintext" | "html";
 
 export interface MonacoEditorProps {
   /** Editor language mode. OPL (P9) uses "plaintext" until a token provider lands. */
