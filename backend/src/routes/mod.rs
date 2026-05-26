@@ -178,6 +178,60 @@ fn pre_auth_limiter() -> impl Handler {
     )
 }
 
+/// Per-minute cap on hint lookups FOR A SINGLE DOMAIN (WR-01). Generous enough
+/// that a legitimate login screen (one lookup per typed email) never trips it,
+/// tight enough that a scripted probe of any one domain is throttled.
+const HINT_PER_DOMAIN_PER_MINUTE: usize = 20;
+
+/// Rate limiter for the PUBLIC `GET /api/sso/hint` route, keyed on the SUBMITTED
+/// DOMAIN rather than the connection IP (WR-01 fix).
+///
+/// WHY a domain key (not the connection IP): every hint request reaches the
+/// backend through the AX *server route* (`account-experience/app/api/sso-lookup`),
+/// which fetches `backend:8080` over the edge network. The backend therefore
+/// ALWAYS observes the single AX container IP as the peer for hint traffic, so an
+/// IP-keyed limiter (`pre_auth_limiter`) collapses ALL hint traffic into ONE
+/// shared bucket: a scripted attacker could (a) exhaust that bucket and deny SSO
+/// resolution to every legitimate user, and (b) get no per-target throttle for
+/// domain enumeration. Keying on the normalized `?domain=` / `?email=` host gives
+/// a per-target bucket — enumeration across many domains no longer shares one
+/// counter, and hammering ONE domain cannot starve lookups for the others.
+///
+/// The key is normalized HERE (lowercased host, `@`-split for `email=`) so it
+/// matches regardless of case/whitespace; a request with neither param keys to a
+/// single `"-"` sentinel bucket (it 400s in the handler anyway). This is keyed on
+/// a CLIENT-SUPPLIED value, which is acceptable for this route: the worst an
+/// attacker can do by varying the key is spread their OWN traffic across more
+/// buckets — i.e. it cannot be used to deny service to a victim domain, and the
+/// per-domain cap still bounds enumeration timing per target. The route remains
+/// `organizations`-flag-gated and returns value-free 404s (no enumeration).
+fn hint_domain_limiter() -> impl Handler {
+    let store: MokaStore<String, FixedGuard> = MokaStore::default();
+    RateLimiter::new(
+        FixedGuard::default(),
+        store,
+        |req: &mut Request, _: &Depot| {
+            // Derive the same domain the handler will look up, normalized to a
+            // stable bucket key. `email=` takes the host after the last '@';
+            // otherwise `domain=`. Lowercased + trimmed. No param -> "-" sentinel.
+            let raw = req
+                .query::<String>("email")
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|e| e.rsplit_once('@').map(|(_, h)| h.to_string()))
+                .or_else(|| {
+                    req.query::<String>("domain")
+                        .filter(|s| !s.trim().is_empty())
+                });
+            let key = raw
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            Some(key)
+        },
+        BasicQuota::per_minute(HINT_PER_DOMAIN_PER_MINUTE),
+    )
+}
+
 /// GitHub OAuth route extension point (CAUTH-04). Conditionally pushes
 /// `GET /auth/github/login` + `GET /auth/github/callback` onto the public
 /// subtree ONLY when `cfg.github.is_some()`. When GitHub is unconfigured the
@@ -255,11 +309,18 @@ pub fn build(
         // hint 404s when the Organizations feature is OFF (matching the protected
         // lookup's gate), and it returns ONLY the linked SSO provider tenant —
         // a domain with no org OR no linked connection BOTH 404 (no org-existence
-        // enumeration, T-15-16). It is GET (read-only, csrf-exempt) and carries
-        // the pre-auth rate limiter (attacker-reachable, Pitfall 7) to bound
-        // domain-probing volume.
+        // enumeration, T-15-16). It is GET (read-only, csrf-exempt).
+        //
+        // WR-01: it carries TWO complementary limiters. `pre_auth_limiter()` keys
+        // on the connection IP — but ALL hint traffic arrives from the single AX
+        // server-route container, so that bucket is effectively global (a volume
+        // cap, not per-attacker). `hint_domain_limiter()` adds a PER-DOMAIN bucket
+        // so hammering one domain cannot starve lookups for others, and probing
+        // many domains no longer shares one counter. The domain limiter runs FIRST
+        // (cheapest, most specific) then the global IP cap, then the feature gate.
         .push(
             Router::with_path("api/sso/hint")
+                .hoop(hint_domain_limiter())
                 .hoop(pre_auth_limiter())
                 .hoop(crate::features::FeatureFlagHoop::new("organizations"))
                 .get(crate::organizations::routes::sso_hint),
