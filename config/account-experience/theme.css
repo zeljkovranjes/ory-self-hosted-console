@@ -1,0 +1,19 @@
+/*
+ * Account Experience theming override (AX-02).
+ *
+ * This file is OWNED BY THE CONSOLE: the backend's
+ * PUT /api/account-experience/theme route is the sole writer (server-defined
+ * canonical path {config_dir}/account-experience/theme.css). The AX reads it at
+ * boot and injects its contents as a :root{...} <style> AFTER the Elements theme
+ * styles, so the override custom properties win. An AX broker RESTART re-reads
+ * this file (no rebuild required).
+ *
+ * Declare the Elements CSS custom properties to override the stock theme, e.g.:
+ *
+ *   :root {
+ *     --ui-brand: #6c47ff;
+ *     --button-primary-background-default: #6c47ff;
+ *   }
+ *
+ * Empty / comment-only (the seed default) means the stock Elements theme applies.
+ */

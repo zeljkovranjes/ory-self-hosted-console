@@ -1,5 +1,6 @@
 import type { OryClientConfiguration } from "@ory/elements-react"
 import { AccountExperienceConfigurationLocaleBehaviorEnum } from "@ory/client-fetch"
+import { readTranslationsOverride } from "@/lib/overrides"
 
 // =============================================================================
 // Account Experience (AX) Ory client configuration (AX-01 / AX-05).
@@ -21,10 +22,17 @@ import { AccountExperienceConfigurationLocaleBehaviorEnum } from "@ory/client-fe
 // to the AX origin; the middleware proxies the Kratos API calls). They MUST match
 // the rebound Kratos `selfservice.flows.*.ui_url` keys in config/kratos/kratos.yml.
 //
-// `intl.customTranslations` is intentionally absent here (Plan 02 wires the
-// console-written translations override). The `intl` object is structured so a
-// later `customTranslations` import slots in without restructuring (AX-03).
+// `intl.customTranslations` (AX-03) is read at MODULE INIT from the console-
+// written `translations.json` on the mounted override volume (lib/overrides.ts,
+// server-only `fs` read). Because Next re-imports this module when the AX server
+// process starts, a console edit + AX broker RESTART applies the new catalog
+// with NO rebuild (15-RESEARCH A3 / Pitfall 6). A missing/empty/malformed file
+// falls back to Elements' built-in catalog (`undefined`).
 // =============================================================================
+
+// AX-03: load the console-written customTranslations catalog at boot. Evaluated
+// once at module init; an AX restart re-reads the file.
+const customTranslations = readTranslationsOverride()
 
 const config: OryClientConfiguration = {
   // sdk.url is an ALTERNATIVE to the ORY_SDK_URL env var. We rely on the env var
@@ -33,7 +41,9 @@ const config: OryClientConfiguration = {
   // the value out of any bundled module graph that a client import might drag in.
   intl: {
     locale: "en",
-    // customTranslations: <wired in Plan 02 — console-written translations.json>
+    // AX-03: the console-written catalog (read at boot). `undefined` when no
+    // override file exists → Elements uses its built-in translations.
+    customTranslations,
   },
   project: {
     name: "Account Experience",

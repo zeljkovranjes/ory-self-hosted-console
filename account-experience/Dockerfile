@@ -42,6 +42,11 @@ ENV HOSTNAME=0.0.0.0
 USER node
 
 # Standalone output: server.js + a pruned node_modules. Copy static + public too.
+# NOTE (AX-02/AX-03): the theming/translations override files are NOT copied here.
+# They live on the host at ./config/account-experience (OUTSIDE this build context,
+# which is ./account-experience) and are bind-mounted READ-ONLY at runtime by
+# docker-compose. They are purely console-owned, mounted state — never baked into
+# the image — so a console edit + AX restart applies without a rebuild (A3).
 COPY --from=builder --chown=node:node /app/.next/standalone ./
 COPY --from=builder --chown=node:node /app/.next/static ./.next/static
 COPY --from=builder --chown=node:node /app/public ./public

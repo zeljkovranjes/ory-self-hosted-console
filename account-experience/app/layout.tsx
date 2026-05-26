@@ -1,6 +1,7 @@
 import type { Metadata } from "next"
 import localFont from "next/font/local"
 import "./globals.css"
+import { readThemeOverride } from "@/lib/overrides"
 
 // =============================================================================
 // AX root layout.
@@ -31,9 +32,32 @@ export const metadata: Metadata = {
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
+  // AX-02: read the console-written CSS-variable override at boot (server-only
+  // `fs` read — lib/overrides.ts). It is injected as a `<style>` at the END of
+  // <body> so it cascades AFTER the Elements theme styles (imported in the
+  // nested auth/settings layouts), letting the override `--ui-*`/`--button-*`
+  // custom properties win. Because the AX server re-reads this on process start,
+  // a console edit + AX broker RESTART applies the new theme with NO rebuild
+  // (15-RESEARCH A3 / Pitfall 6). A missing/empty file → no injection (stock
+  // theme). The content is CSS placed inside <style>; it is never executed as
+  // script, and the backend already rejects binary on write (T-15-06).
+  const themeOverride = readThemeOverride()
+
   return (
     <html lang="en" className={geist.variable}>
-      <body>{children}</body>
+      <body>
+        {children}
+        {themeOverride ? (
+          <style
+            id="ax-theme-override"
+            // eslint-disable-next-line react/no-danger -- CSS custom-property
+            // override read from the console-owned override file; placed in a
+            // <style> element (never executed as script). The sole writer is the
+            // backend, which rejects binary content (T-15-06).
+            dangerouslySetInnerHTML={{ __html: themeOverride }}
+          />
+        ) : null}
+      </body>
     </html>
   )
 }

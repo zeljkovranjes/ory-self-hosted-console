@@ -560,6 +560,13 @@ services:
       # never reaches the client bundle. ORY_PROJECT_API_TOKEN is intentionally
       # UNSET (Network-only; harmless when absent for self-hosted).
       ORY_SDK_URL: http://ory-kratos:4433
+      # AX-02/AX-03 override files (theming + localization). The AX reads
+      # theme.css + translations.json from this READ-ONLY mounted dir at BOOT
+      # (lib/overrides.ts). The backend's PUT /api/account-experience/* routes are
+      # the sole writers (host ./config/account-experience). A console edit applies
+      # on the next AX RESTART (the server re-reads the files at process start —
+      # no rebuild, 15-RESEARCH A3). Server-side fs read only; never bundled.
+      AX_OVERRIDES_DIR: /etc/account-experience-config
     healthcheck:
       # Next standalone server has global fetch; probe over loopback with
       # redirect:'manual' (same node-fetch shape as the frontend/Polis services).
@@ -582,6 +589,16 @@ services:
         condition: service_healthy
     ports:
       - "${ACCOUNT_EXPERIENCE_PORT:-3001}:3000"
+    volumes:
+      # AX-02/AX-03: the console-owned theming + localization override files,
+      # mounted READ-ONLY (`:ro`). The same host dir is the backend's
+      # {config_dir}/account-experience (config_dir=/etc/config), so a console PUT
+      # write is visible here; the AX reads theme.css + translations.json at boot
+      # (AX_OVERRIDES_DIR). READ-ONLY: the AX is a consumer, never a writer — only
+      # the backend writes these files. The files are NOT baked into the image
+      # (the Dockerfile copies only the standalone build output), so they are
+      # purely console-owned, mounted state.
+      - ./config/account-experience:/etc/account-experience-config:ro
     # ax-public: reach Kratos PUBLIC :4433 server-side (NOT the broad `internal`
     # network, so no route to Hydra/Keto/Oathkeeper admin — INFRA-05/T-15-01).
     # edge: host-publish the AX origin for the browser.
