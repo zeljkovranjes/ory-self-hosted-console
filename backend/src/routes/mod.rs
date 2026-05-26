@@ -295,10 +295,27 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
             Router::with_path("api/hydra/oauth2/logout")
                 .get(crate::ory::hydra::get_logout_request), // OAUTH2-02 flow lookup (read-only)
         )
+        // Phase 9 (PERM-02 / PERM-03) Keto relation-tuple data path. All inherit
+        // `auth_guard` (401 unauth); GET (list/query) is csrf-exempt, while
+        // POST (create) / DELETE (delete) require `X-CSRF-Token` via `csrf_guard`
+        // (T-9-csrf — `lib/api.ts` echoes it, no new wiring). Replaces the Phase-3
+        // first-page proof slice with cursor + server-side filters. Create/delete
+        // route to keto_write (:4467); list routes to keto_read (:4466).
         .push(
             Router::with_path("api/keto/relationships")
-                .get(crate::ory::keto::list_relationships),
+                .get(crate::ory::keto::list_relationships) // PERM-02/03 list+query (READ :4466)
+                .post(crate::ory::keto::create_relationship) // PERM-02 create (WRITE :4467)
+                .delete(crate::ory::keto::delete_relationship), // PERM-02 delete (WRITE :4467)
         )
+        // PERM-03 check + expand — READ path (keto_read :4466), GET (csrf-exempt,
+        // read-only). check uses check_permission (200+{allowed}, never the
+        // deny-as-error variant — T-9-deny-vs-error).
+        .push(Router::with_path("api/keto/check").get(crate::ory::keto::check_permission))
+        .push(Router::with_path("api/keto/expand").get(crate::ory::keto::expand_permission))
+        // PERM-01 OPL syntax-validate passthrough — OPL path (keto_opl :4469),
+        // POST (csrf-guarded). Validate ONLY; never writes a file. The 09-02
+        // Permission-Model editor calls this before the gated file write.
+        .push(Router::with_path("api/keto/opl/validate").post(crate::ory::keto::validate_opl))
         // Optional bonus (CONTEXT): exercises the 4th crate end-to-end.
         .push(Router::with_path("api/oathkeeper/rules").get(crate::ory::oathkeeper::list_rules))
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
