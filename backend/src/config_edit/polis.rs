@@ -309,6 +309,20 @@ pub async fn put_polis_settings(
     }
     let serialized = serialize_env(&pairs);
 
+    // --- Step 3b: ENSURE the parent dir exists (SSO-01 first-edit) -----------
+    // The server-built path is `<config_dir>/polis/settings.env`. Unlike the four
+    // Ory services, Polis ships NO seeded config directory, so on the very FIRST
+    // console edit the `polis/` subdir does not exist yet and `write_atomic`'s
+    // `NamedTempFile::new_in(<dir>)` would fail (500). Create the parent dir
+    // (idempotent) before the backup/write. The path is fully server-built (fixed
+    // segments, no client input — T-13-06), so this introduces no traversal risk.
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::error!(error = %e, service = svc.key(), "polis put: could not create the polis config dir");
+            return Err(AppError::Internal("polis settings dir create failed".into()));
+        }
+    }
+
     // --- Step 4: BACKUP + WR-02 assert ---------------------------------------
     // If the file does not exist yet there is nothing to back up; in that case a
     // rollback target is the "remove the file" state. We only `backup` (and assert
