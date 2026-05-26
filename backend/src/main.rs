@@ -73,6 +73,15 @@ async fn main() -> Result<(), AppError> {
     let flags = ory_console_backend::features::FeatureFlags::load(&pool).await?;
     tracing::info!("feature-flag cache loaded");
 
+    // Phase 16 (OBS-02): install the process-global Prometheus recorder ONCE,
+    // AFTER the flag cache load and BEFORE serve, so the `GET /metrics` handler
+    // (mounted internal-only in `routes::build`) has a live render handle the
+    // moment the listener binds. Idempotent/re-entrant (tolerates an already-set
+    // recorder). The endpoint is scraped container-to-container by the opt-in
+    // `observability` Prometheus on the INTERNAL network — never host-published.
+    ory_console_backend::metrics::install_recorder();
+    tracing::info!("prometheus metrics recorder installed");
+
     // WR-07: background session reaper. A detached tokio task periodically
     // deletes sessions past their absolute `expires_at` so the table cannot grow
     // without bound from abandoned (never-logged-out) sessions. Runs one sweep

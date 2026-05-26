@@ -139,6 +139,19 @@ ipnet = "2.12"
 psl = "2"
 
 # --- Phase 14: SAML metadata signing-cert pre-flight (SSO-02 / WR-01) ---------
+# --- Phase 16: backend /metrics exporter (OBS-02) ----------------------------
+# `metrics` is the instrumentation FACADE; `metrics-exporter-prometheus` renders
+# the Prometheus text-exposition format from it. Pinned per 16-RESEARCH
+# (Package Legitimacy Audit — both first-party metrics-rs crates, [VERIFIED]
+# against crates.io 2026-05): metrics 0.24.6 + exporter 0.18.3 (the exporter
+# requires `metrics ^0.24.5`, which 0.24.6 satisfies). NOT the stale ~0.16
+# STACK.md figure. The exporter's default features pull `tokio`/`hyper` for a
+# push-gateway/HTTP-listener mode we do NOT use — the recorder we build is rendered
+# by the EXISTING Salvo `/metrics` handler (scraped container-to-container on the
+# internal network), so we disable defaults to keep the surface minimal.
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+
 # A real, namespace-aware XML pull-parser for the IdP-metadata signing-cert
 # pre-flight. The previous string-scan heuristic (find("keydescriptor") + a
 # 20-char close-tag proximity guess) was bypassable by crafted metadata: a

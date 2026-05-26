@@ -158,6 +158,10 @@ pub async fn setup(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
     .await?;
     session::set_session_cookie(res, &minted.raw_token, cfg.session_absolute_secs, &cfg);
 
+    // OBS-02: count the successful first-run setup completion (global aggregate,
+    // no per-identity label — T-16-04).
+    crate::metrics::record_setup_completion();
+
     res.status_code(StatusCode::CREATED);
     res.render(Json(AdminDto {
         id: admin_id.to_string(),

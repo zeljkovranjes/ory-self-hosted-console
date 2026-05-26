@@ -56,7 +56,11 @@ pub async fn login(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
     // credential endpoint (T-02-11), so we do not surface a 400 here.
     let email = match validate_email(&body.email) {
         Ok(e) => e,
-        Err(_) => return Err(AppError::Unauthorized),
+        // OBS-02: aggregate failure counter (no per-identity label, T-16-04).
+        Err(_) => {
+            crate::metrics::record_login_attempt(false);
+            return Err(AppError::Unauthorized);
+        }
     };
 
     // Look up the admin. A missing admin and a wrong password both collapse to
@@ -64,7 +68,10 @@ pub async fn login(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
     let admin = queries::get_admin_by_email(&pool, &email).await?;
     let admin = match admin {
         Some(a) => a,
-        None => return Err(AppError::Unauthorized),
+        None => {
+            crate::metrics::record_login_attempt(false);
+            return Err(AppError::Unauthorized);
+        }
     };
 
     // OAuth-only admins have no password_hash; password login then fails 401.
@@ -73,6 +80,7 @@ pub async fn login(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
         None => false,
     };
     if !ok {
+        crate::metrics::record_login_attempt(false);
         return Err(AppError::Unauthorized);
     }
 
@@ -91,6 +99,9 @@ pub async fn login(req: &mut Request, depot: &mut Depot, res: &mut Response) -> 
     )
     .await?;
     session::set_session_cookie(res, &minted.raw_token, cfg.session_absolute_secs, &cfg);
+
+    // OBS-02: aggregate success counter (no per-identity label, T-16-04).
+    crate::metrics::record_login_attempt(true);
 
     res.status_code(StatusCode::OK);
     res.render(Json(AdminDto {

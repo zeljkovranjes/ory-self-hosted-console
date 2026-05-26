@@ -273,6 +273,19 @@ pub fn build(
     // PUBLIC subtree — no auth hoop (CAUTH-06 public set).
     let mut public = Router::new()
         .push(Router::with_path("health").get(health))
+        // Phase 16 (OBS-02): the Prometheus scrape target. Mounted on the
+        // ROOT/public subtree with NO auth_guard, NO csrf_guard, and NO
+        // FeatureFlagHoop — a Prometheus scrape carries no console session, and the
+        // endpoint is internal-only BY TOPOLOGY: the opt-in `observability`
+        // Prometheus scrapes `backend:8080/metrics` container-to-container on the
+        // INTERNAL network, and the backend publishes ONLY :8080 to the edge for
+        // the frontend (INFRA-05 — no admin/metrics port is host-published as a
+        // distinct route; the scrape stays inside the docker network). The body is
+        // COUNTS/BUCKETS only, NEVER a per-identity label (T-16-04) — asserted by
+        // backend/tests/metrics.rs. It is NOT a feature-gated console route: the
+        // `observability` flag gates the CONSOLE surfaces (Activity/Logs/Grafana,
+        // later plans), not this raw scrape target.
+        .push(Router::with_path("metrics").get(crate::metrics::metrics_text))
         .push(
             // WR-06: the first-run `initialized` signal is needed by the frontend
             // redirect, so the endpoint stays public and the body stays minimal
