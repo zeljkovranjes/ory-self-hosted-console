@@ -63,6 +63,20 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// probes across the 60s budget by a 10s per-attempt stall.
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// WR-03: per-request timeout for the broker `POST .../restart` itself, applied
+/// independently of the short 2s [`HEALTH_PROBE_TIMEOUT`] the client is built
+/// with. The Docker restart endpoint returns **204 only AFTER** it has issued the
+/// stop+start; with a graceful stop timeout the engine can legitimately hold the
+/// response for several seconds (and Polis is a heavier Node process than the
+/// Ory-Go services). The shared 2s client timeout would surface that normal delay
+/// as a transport error -> `AppError::Upstream` (502) -> a SPURIOUS rollback even
+/// though the restart actually proceeds engine-side. A bounded, restart-
+/// appropriate budget here (a per-request `.timeout()` overrides the builder
+/// default in reqwest) keeps the health poll's tight 2s cadence intact while
+/// giving the restart POST room to complete. Safe for ALL services that reuse
+/// this path — a longer restart-POST budget never shortens any existing behavior.
+const RESTART_POST_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Build the reqwest client used for BOTH the broker restart POST and the
 /// `/health/ready` poll.
 ///
@@ -72,7 +86,10 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// mis-config) must never steer a follow-up request, nor be read as "healthy" by
 /// following it to a 200 elsewhere. WR-05: a short connect/request timeout keeps
 /// the health probe cadence tight; the per-request `.timeout()` in
-/// [`wait_healthy`] bounds each individual probe further.
+/// [`wait_healthy`] bounds each individual probe further. WR-03: the broker
+/// restart POST in [`restart`] overrides this short default with its own longer
+/// [`RESTART_POST_TIMEOUT`] (a graceful 204 can take several seconds), so the
+/// builder default below governs the HEALTH POLL only.
 pub fn restart_client() -> Result<reqwest::Client, AppError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -191,11 +208,21 @@ pub async fn restart(
     svc: Service,
 ) -> Result<(), AppError> {
     let url = restart_url(broker_base, svc);
-    let resp = http.post(url).send().await.map_err(|e| {
-        // Log the transport cause server-side; the client sees only the code.
-        tracing::warn!(error = %e, service = svc.key(), "restart broker transport error");
-        AppError::Upstream("restart broker unreachable".to_string())
-    })?;
+    // WR-03: override the client's short 2s health-probe timeout with a
+    // restart-appropriate per-request budget so a graceful engine-side restart
+    // (204 only after stop+start completes) is not misclassified as a broker
+    // failure. The per-request `.timeout()` takes precedence over the builder
+    // default. Bounded so a truly wedged broker still fails in finite time.
+    let resp = http
+        .post(url)
+        .timeout(RESTART_POST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| {
+            // Log the transport cause server-side; the client sees only the code.
+            tracing::warn!(error = %e, service = svc.key(), "restart broker transport error");
+            AppError::Upstream("restart broker unreachable".to_string())
+        })?;
 
     let status = resp.status();
     if status == reqwest::StatusCode::NO_CONTENT {
@@ -228,11 +255,7 @@ pub async fn wait_healthy(
     // returns 503 for the stateless from-file config (a false-rollback risk). An
     // override base (unit tests) keeps the service's own path so the path-routing
     // is exercised too.
-    let url = format!(
-        "{}{}",
-        base.trim_end_matches('/'),
-        svc.health_path()
-    );
+    let url = format!("{}{}", base.trim_end_matches('/'), svc.health_path());
 
     let poll = async {
         loop {
@@ -487,6 +510,9 @@ mod tests {
             Some(&server.url()),
         )
         .await;
-        assert!(!healthy, "persistent 503 within the timeout must be NOT healthy");
+        assert!(
+            !healthy,
+            "persistent 503 within the timeout must be NOT healthy"
+        );
     }
 }
