@@ -28,11 +28,16 @@ use sqlx::PgPool;
 /// The REQUIRED proof routes asserted unauthenticated-401 on GET (Oathkeeper is
 /// an optional bonus, asserted separately). Phase 8 added the Hydra client item
 /// route (`/api/hydra/clients/{id}`); the collection route is already present.
-const PROOF_ROUTES: [&str; 4] = [
+/// Plan 08-02 added the read-only OAuth2 flow-request lookups
+/// (`/api/hydra/oauth2/{login,consent,logout}`) — GET-only, so they sit here.
+const PROOF_ROUTES: [&str; 7] = [
     "http://127.0.0.1:8080/api/kratos/identities",
     "http://127.0.0.1:8080/api/hydra/clients",
     "http://127.0.0.1:8080/api/hydra/clients/some-client-id",
     "http://127.0.0.1:8080/api/keto/relationships",
+    "http://127.0.0.1:8080/api/hydra/oauth2/login",
+    "http://127.0.0.1:8080/api/hydra/oauth2/consent",
+    "http://127.0.0.1:8080/api/hydra/oauth2/logout",
 ];
 
 // =============================================================================
@@ -80,6 +85,26 @@ async fn ory_routes_require_auth(pool: PgPool) {
         Some(StatusCode::UNAUTHORIZED),
         "unauthenticated POST /api/hydra/clients must be 401 (auth_guard)"
     );
+
+    // T-08-AUTHZ (OAUTH2-02): the token introspect/revoke routes are POST
+    // (state-changing for revoke; introspect is admin-only). An unauthenticated
+    // request is rejected with 401 by auth_guard BEFORE csrf_guard or any handler
+    // runs — a non-401 means the introspect/revoke path is reachable without a
+    // session. T-08-REVOKE-CSRF additionally guards revoke once authenticated.
+    for route in [
+        "http://127.0.0.1:8080/api/hydra/oauth2/introspect",
+        "http://127.0.0.1:8080/api/hydra/oauth2/revoke",
+    ] {
+        let resp = TestClient::post(route)
+            .json(&serde_json::json!({ "token": "some-token" }))
+            .send(&service)
+            .await;
+        assert_eq!(
+            resp.status_code,
+            Some(StatusCode::UNAUTHORIZED),
+            "unauthenticated POST {route} must be 401 (auth_guard)"
+        );
+    }
 }
 
 // =============================================================================
@@ -312,6 +337,72 @@ async fn hydra_clients_live(pool: PgPool) {
         Some(StatusCode::NO_CONTENT),
         "authed DELETE should be 204"
     );
+}
+
+/// OAUTH2-02 live token/flow inspection (gated on `ORY_LIVE_TESTS`):
+///   - introspect an UNKNOWN token via the wrapper -> 200 + `{active:false}`
+///     (Hydra reports an unknown/expired token as inactive, never an error).
+///   - look up a BOGUS challenge via each flow route -> the upstream 404/410 is
+///     mapped CLEANLY through `map_hydra_err` to a 502 (NOT a 500, NOT a panic);
+///     no admin URL leaks.
+/// The grant decision (accept/reject) is deliberately NOT exercised — it is out
+/// of scope (the end-user provider app owns it, T-08-GRANT).
+#[sqlx::test(migrations = "./migrations")]
+async fn hydra_oauth2_inspection_live(pool: PgPool) {
+    if !live_enabled() {
+        println!(
+            "SKIP: hydra_oauth2_inspection_live (set ORY_LIVE_TESTS=1 with the stack up to run)"
+        );
+        return;
+    }
+
+    let service = Service::new(common::build_test_router(pool.clone()));
+    let cookie = authed_cookie(&service, &pool).await;
+    let csrf = common::csrf_for_raw_token(&pool, &cookie).await;
+
+    // 1) INTROSPECT an unknown token -> 200 + {active:false}. POST is
+    //    state-changing-ish (admin endpoint) so a CSRF token is attached.
+    let mut resp = TestClient::post("http://127.0.0.1:8080/api/hydra/oauth2/introspect")
+        .add_header("Cookie", format!("console_session={cookie}"), true)
+        .add_header("X-CSRF-Token", csrf.clone(), true)
+        .json(&serde_json::json!({ "token": "definitely-not-a-real-token" }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        resp.status_code,
+        Some(StatusCode::OK),
+        "authed introspect of an unknown token should be 200 (active:false)"
+    );
+    let text = resp.take_string().await.expect("introspect body");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("introspect body is JSON");
+    assert_eq!(
+        json.get("active"),
+        Some(&serde_json::Value::Bool(false)),
+        "an unknown token must introspect as active:false: {text}"
+    );
+    assert_no_admin_url_leak(&text);
+
+    // 2) A BOGUS flow-challenge lookup maps cleanly (upstream 404/410 -> 502,
+    //    never a 500/panic; no admin URL leak). GET is csrf-exempt.
+    for kind in ["login", "consent", "logout"] {
+        let mut resp = TestClient::get(format!(
+            "http://127.0.0.1:8080/api/hydra/oauth2/{kind}?challenge=bogus-challenge-xyz"
+        ))
+        .add_header("Cookie", format!("console_session={cookie}"), true)
+        .send(&service)
+        .await;
+        let code = resp.status_code.expect("flow lookup status");
+        assert_ne!(
+            code,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a bogus {kind} challenge must map cleanly (no 500): got {code}"
+        );
+        // It is either a mapped upstream error (502) or a 200 with an inactive
+        // request body, depending on how Hydra reports the missing challenge —
+        // both are acceptable; the failure mode we guard against is a 500/panic.
+        let text = resp.take_string().await.unwrap_or_default();
+        assert_no_admin_url_leak(&text);
+    }
 }
 
 /// Criterion 1 (Keto): the authenticated wrapper GET returns 200 + a JSON object
