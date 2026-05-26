@@ -37,7 +37,13 @@ use std::path::{Path, PathBuf};
 use crate::config_edit::yaml::write_atomic;
 use crate::error::AppError;
 
-/// Relax an AX override file to WORLD-READABLE (`0644`) after the atomic write.
+/// The ONLY two AX override files this module ever widens to world-readable. The
+/// contract is enforced by file NAME (the basename must be one of these) so the
+/// world-read widener can NEVER be pointed at a future/secret override file (WR-04).
+const NON_SECRET_WORLD_READABLE_FILES: [&str; 2] = ["theme.css", "translations.json"];
+
+/// Relax a KNOWN NON-SECRET AX override file to WORLD-READABLE (`0644`) after the
+/// atomic write.
 ///
 /// CROSS-SERVICE READ CONTRACT (correctness fix): the backend runs as a distroless
 /// `nonroot` uid (65532) and `write_atomic` persists via `NamedTempFile`, whose
@@ -51,10 +57,31 @@ use crate::error::AppError;
 /// world-read is safe and intended. The dir itself is created `0755` by
 /// `create_dir_all` under the standard umask, so it is already traversable.
 ///
+/// WR-04 (contract hardening): this helper is NO LONGER a generic "world-readable"
+/// widener. It REFUSES to widen any path whose basename is not in
+/// [`NON_SECRET_WORLD_READABLE_FILES`] — so it is structurally impossible to
+/// world-read a future/secret override file by routing it through the same
+/// `write_*` path. A refusal is logged loudly and the file is LEFT at its secure
+/// `0600` (fail-closed: a secret stays owner-only). The two callers below pass the
+/// server-defined canonical theme/translations paths, so the legitimate widen
+/// always proceeds.
+///
 /// Unix-only mode bits; a no-op elsewhere (the deployment target is Linux
-/// containers). Best-effort: a chmod failure is logged, not fatal (the write
-/// already succeeded; the operator can re-trigger).
+/// containers). Best-effort on the legitimate path: a chmod failure is logged, not
+/// fatal (the write already succeeded; the operator can re-trigger).
 fn make_world_readable(path: &Path) {
+    // WR-04: gate on the basename — refuse anything not on the non-secret allowlist.
+    let is_allowlisted = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| NON_SECRET_WORLD_READABLE_FILES.contains(&n))
+        .unwrap_or(false);
+    if !is_allowlisted {
+        tracing::error!(path = %path.display(),
+            "account-experience: REFUSING to world-read a non-allowlisted override file \
+             (WR-04 NON-SECRET-ONLY contract) — left at 0600");
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -529,6 +556,49 @@ mod tests {
         let err = write_translations(&dir, "[1,2,3]").unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(!translations_path(&dir).is_file());
+    }
+
+    // ─── WR-04: world-read widener is allowlist-scoped to the two non-secret files ───
+
+    #[test]
+    fn make_world_readable_only_widens_allowlisted_files() {
+        let tmp = tempfile::tempdir().expect("temp config dir");
+
+        // An allowlisted file (theme.css) IS widened (Unix: to 0644).
+        let ok_path = tmp.path().join("theme.css");
+        std::fs::write(&ok_path, "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ok_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        make_world_readable(&ok_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&ok_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "an allowlisted non-secret file must be widened to 0644");
+        }
+
+        // A NON-allowlisted file (a hypothetical future secret) is REFUSED — it
+        // stays at its secure 0600 (fail-closed; WR-04 contract).
+        let secret_path = tmp.path().join("secrets.json");
+        std::fs::write(&secret_path, "shhh").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        make_world_readable(&secret_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&secret_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "a non-allowlisted file must NOT be world-readable (WR-04 NON-SECRET-ONLY contract)"
+            );
+        }
     }
 
     // ─── AX-04: reverse-proxy snippet generation + host sanitization ───
