@@ -689,6 +689,64 @@ else
   fi
 
   # -------------------------------------------------------------------------
+  # CR-01 (stored-XSS breakout) — NEGATIVE assertions across all THREE layers:
+  #   L1 (write-side): a theme PUT carrying `</style><script>` is REJECTED
+  #       (400/422) with NO disk write — the prior good theme is unchanged.
+  #   L2 (sink): the rendered AX DOM never carries a LITERAL `</style><script`
+  #       breakout sequence from the override (defanged to `\3C`).
+  #   L3 (CSP): the AX response CSP has NO `script-src 'unsafe-inline'`.
+  # This is the anti-false-green proof that the CR-01 stored-XSS is closed.
+  # -------------------------------------------------------------------------
+  echo
+  echo "--- [CR-01] stored-XSS </style><script> breakout is REJECTED on write + neutralized at the sink + killed by CSP ---"
+  # L1: the canonical breakout payload must be rejected with NO write. We first
+  # set a known-good sentinel theme (above, still stored), then attempt the XSS.
+  XSS_PAYLOAD=':root{}</style><script>document.title=String.fromCharCode(88,83,83)</script>'
+  # JSON-encode the payload safely (it contains quotes/slashes) via node.
+  XSS_BODY="$(P="$XSS_PAYLOAD" node -e 'process.stdout.write(JSON.stringify({source:process.env.P}))')"
+  xss_code="$(_auth_mut_code PUT "$THEME_URL" "$XSS_BODY")"
+  if [ "$xss_code" = "400" ] || [ "$xss_code" = "422" ]; then
+    _pass "[CR-01/L1] a theme PUT with </style><script> is REJECTED (${xss_code}) — '<' rejected on write"
+  elif [ "$xss_code" = "200" ]; then
+    _fail "[CR-01/L1] a theme PUT with </style><script> was ACCEPTED (200) — stored-XSS write-guard FAILED"
+  else
+    _fail "[CR-01/L1] theme PUT with </style><script> -> ${xss_code} (want 400/422 reject)"
+  fi
+  # L1 (no-write proof): the stored theme still carries the GOOD sentinel from the
+  # AX-02 PUT above (the XSS reject did not overwrite it).
+  xss_after_body="$(_auth_get_body "$THEME_URL")"
+  if printf '%s' "$xss_after_body" | grep -qF "$THEME_SENTINEL" \
+     && ! printf '%s' "$xss_after_body" | grep -qiF '</style>'; then
+    _pass "[CR-01/L1] the stored theme is unchanged after the XSS reject (no write; no </style> persisted)"
+  else
+    _fail "[CR-01/L1] the stored theme was mutated by the rejected XSS PUT (no-write invariant broken)"
+  fi
+  # L2 (sink): the AX-served DOM must NEVER contain a literal `</style><script`
+  # breakout originating from the override. (The legitimate sentinel theme is
+  # still injected; we assert the absence of the breakout sequence.)
+  ax_dom_xss="$(curl -s -L --max-time 25 "${AX_BASE_URL}/auth/error" 2>/dev/null)"
+  if printf '%s' "$ax_dom_xss" | grep -qiE '</style><script'; then
+    _fail "[CR-01/L2] the AX DOM carries a literal </style><script breakout — sink defang FAILED"
+  else
+    _pass "[CR-01/L2] the AX DOM carries no </style><script breakout (sink defang holds)"
+  fi
+  # L3 (CSP): the AX response CSP must NOT allow script-src 'unsafe-inline'.
+  AX_CSP_XSS="$(curl -s -D - -o /dev/null --max-time 20 "${AX_BASE_URL}/auth/error" 2>/dev/null \
+    | grep -iE '^Content-Security-Policy:' | head -n1)"
+  if [ -z "$AX_CSP_XSS" ]; then
+    _fail "[CR-01/L3] no Content-Security-Policy header on the AX response (cannot confirm script-src hardening)"
+  elif printf '%s' "$AX_CSP_XSS" | grep -qiE "script-src[^;]*'unsafe-inline'"; then
+    _fail "[CR-01/L3] the AX CSP still allows script-src 'unsafe-inline' (an injected inline <script> would execute): $AX_CSP_XSS"
+  else
+    _pass "[CR-01/L3] the AX CSP has NO script-src 'unsafe-inline' (injected inline <script> is refused by the browser)"
+  fi
+  # Restore the good sentinel theme so the AX-02 DOM assertion state is consistent
+  # for any later re-read (best-effort).
+  _auth_mut_code PUT "$THEME_URL" "$THEME_BODY" >/dev/null 2>&1 || true
+  $DC restart account-experience >/dev/null 2>&1 || true
+  wait_container_healthy account-experience 90
+
+  # -------------------------------------------------------------------------
   # AX-03 — set a customTranslations override via the localization route, RESTART
   # the AX, and assert it is loaded. We assert via the backend round-trip (the
   # canonical stored value) PLUS the AX boot consuming it (the AX serves a 200 and

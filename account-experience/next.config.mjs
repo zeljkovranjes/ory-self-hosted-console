@@ -12,32 +12,21 @@
 // IS the Kratos-public proxy. A hand-rolled rewrite would not rewrite Set-Cookie
 // domains and would break CSRF (15-RESEARCH Anti-Patterns / Pitfall 1).
 //
-// CSP (AX-05 / threat T-15-02): the AX surface sets its OWN Content-Security-Policy,
-// DISTINCT from the admin console (which sets none). It is applied to every route
-// via `headers()`. Key differences from a generic console policy:
-//   - `style-src 'self' 'unsafe-inline'` — Elements injects styles; 'unsafe-inline'
-//     is required for the Tailwind v4 / CSS-in-JS theme layer to render.
-//   - `connect-src 'self'` — the middleware keeps every Kratos call same-origin,
-//     so no external connect target is needed.
-//   - `font-src 'self'` — the local vendored font only (next/font/local); no CDN.
-//   - `frame-ancestors 'none'` + `form-action 'self'` + `base-uri 'self'` — clickjacking
-//     / form-hijack / base-tag hardening.
-// `script-src` includes 'unsafe-inline' because Next injects an inline bootstrap
-// script for the App Router; tighten to a nonce in a later hardening pass if the
-// Next runtime supports it without breaking hydration.
+// CSP (AX-05 / threat T-15-02 + CR-01 LAYER 3): the AX surface sets its OWN
+// Content-Security-Policy, DISTINCT from the admin console (which sets none).
+//
+// The CSP is now built PER-REQUEST in `middleware.ts` (a fresh `script-src` nonce
+// each request) rather than as a static header here — a static policy could only
+// carry `script-src 'unsafe-inline'`, which would let an injected inline <script>
+// EXECUTE (the CR-01 stored-XSS payload). The middleware mints a nonce, advertises
+// it on the request header (Next stamps it onto its inline bootstrap scripts), and
+// sets the strict policy on the response: `script-src 'self' 'nonce-…'
+// 'strict-dynamic'` with NO 'unsafe-inline'. `style-src` keeps 'unsafe-inline'
+// (Elements/Tailwind v4 styles; CSS cannot execute script). See middleware.ts.
+//
+// The remaining non-CSP security headers (clickjacking / sniffing / referrer) are
+// static and stay here, applied to every route.
 // =============================================================================
-
-const CSP = [
-  "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data:",
-  "font-src 'self'",
-  "connect-src 'self'",
-  "frame-ancestors 'none'",
-  "form-action 'self'",
-  "base-uri 'self'",
-].join("; ")
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -48,7 +37,7 @@ const nextConfig = {
       {
         source: "/:path*",
         headers: [
-          { key: "Content-Security-Policy", value: CSP },
+          // Content-Security-Policy is set per-request in middleware.ts (nonce).
           { key: "X-Frame-Options", value: "DENY" },
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "Referrer-Policy", value: "same-origin" },
