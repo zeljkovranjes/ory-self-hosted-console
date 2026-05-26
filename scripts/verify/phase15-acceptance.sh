@@ -172,19 +172,25 @@ else
 fi
 
 # =============================================================================
-# WR-03 — BUILD-TIME assertion: the emitted EDGE MIDDLEWARE chunk carries NO Node
-# built-in (`node:fs`/`node:path`/`require("node:`). This is the robust guard the
-# review asked for: the NEXT_RUNTIME runtime guard in lib/overrides.ts is correct
-# but enforced only by convention; a future static `import` of a node built-in
-# into a module reachable from ory.config.ts -> middleware.ts would silently
-# re-bundle it into the edge chunk and 500 every Kratos self-service call (the bug
-# that bit 15-02 + 15-04). We read the AUTHORITATIVE edge-chunk list from
-# .next/server/middleware-manifest.json and grep ONLY those chunks — so this fails
-# fast at build time (not at runtime) if a node built-in ever lands in the edge
-# middleware bundle.
+# WR-03 — BUILD-TIME assertion: the emitted EDGE MIDDLEWARE chunk carries NO
+# `node:fs` / `node:path` reference. This is the robust guard the review asked for:
+# the NEXT_RUNTIME runtime guard in lib/overrides.ts is correct but enforced only
+# by convention; a future static `import` of node:fs/node:path into a module
+# reachable from ory.config.ts -> middleware.ts would silently re-bundle it into
+# the edge chunk and 500 every Kratos self-service call (the bug that bit 15-02 +
+# 15-04). We read the AUTHORITATIVE edge-chunk list from
+# .next/server/middleware-manifest.json and grep ONLY those chunks for node:fs /
+# node:path specifically — so this fails fast at build time (not at runtime).
+#
+# We deliberately scope to node:fs/node:path (NOT a blanket `node:` match):
+# Next's edge-runtime wrapper legitimately references framework polyfills like
+# `node:buffer` / `node:async_hooks` that the edge runtime PROVIDES — those are
+# not the filesystem builtins the override reader could drag in, and matching them
+# would be a false FAIL. node:fs / node:path are the exact 15-02/15-04 regression
+# class, so they are what we forbid.
 # =============================================================================
 echo
-echo "--- [WR-03] the emitted EDGE MIDDLEWARE chunk carries no node:fs/node:path/require(\"node: ---"
+echo "--- [WR-03] the emitted EDGE MIDDLEWARE chunk carries no node:fs / node:path ---"
 AX_DIR="${REPO_ROOT}/account-experience"
 MW_MANIFEST="${AX_DIR}/.next/server/middleware-manifest.json"
 if [ ! -f "$MW_MANIFEST" ]; then
@@ -212,13 +218,15 @@ if [ -f "$MW_MANIFEST" ]; then
       [ -z "$chunk" ] && continue
       cf="${AX_DIR}/.next/${chunk}"
       [ -f "$cf" ] || continue
-      h="$(grep -lE 'node:fs|node:path|require\(["'"'"']node:' "$cf" 2>/dev/null || true)"
+      # Match node:fs / node:path in either the static-import (`"node:fs"`) or the
+      # require (`require("node:fs")`) form. Scoped to fs/path ONLY (see header).
+      h="$(grep -lE 'node:fs|node:path' "$cf" 2>/dev/null || true)"
       [ -n "$h" ] && EDGE_NODE_HITS="${EDGE_NODE_HITS}\n${h}"
     done <<< "$EDGE_CHUNKS"
     if [ -z "$EDGE_NODE_HITS" ]; then
-      _pass "[WR-03] the edge middleware chunk(s) carry no node:fs/node:path/require(\"node: — the NEXT_RUNTIME guard holds at build time"
+      _pass "[WR-03] the edge middleware chunk(s) carry no node:fs / node:path — the NEXT_RUNTIME guard holds at build time"
     else
-      _fail "[WR-03] a node built-in leaked into the EDGE MIDDLEWARE chunk (would 500 every Kratos self-service call):"
+      _fail "[WR-03] node:fs/node:path leaked into the EDGE MIDDLEWARE chunk (would 500 every Kratos self-service call):"
       printf '%b\n' "$EDGE_NODE_HITS"
     fi
   fi
