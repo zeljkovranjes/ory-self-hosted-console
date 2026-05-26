@@ -53,6 +53,13 @@ export type NavItem = {
   built: boolean;
   /** The phase that delivers the real page (for the placeholder copy). */
   comingIn?: string;
+  /**
+   * FLAG-02 — when set, the item is HIDDEN from the sidebar while this feature
+   * flag is OFF (GET /api/console/features). Items with no `requiresFlag` always
+   * render. This is additive cosmetics only; the authoritative gate is the
+   * backend FeatureFlagHoop (T-12-08).
+   */
+  requiresFlag?: string;
 };
 
 export type NavGroup = {
@@ -317,6 +324,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/branding/localization",
         icon: Languages,
         built: true,
+        requiresFlag: "account_experience",
       },
       {
         slug: "branding-custom-domains",
@@ -324,6 +332,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/branding/custom-domains",
         icon: Globe,
         built: true,
+        requiresFlag: "account_experience",
       },
       {
         slug: "branding-theming",
@@ -331,6 +340,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/branding/theming",
         icon: Paintbrush,
         built: true,
+        requiresFlag: "account_experience",
       },
     ],
   },
@@ -384,6 +394,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/project/event-streams",
         icon: Radio,
         built: true,
+        requiresFlag: "event_streams",
       },
       {
         slug: "project-organizations",
@@ -391,6 +402,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/project/organizations",
         icon: Building2,
         built: true,
+        requiresFlag: "organizations",
       },
     ],
   },
@@ -421,6 +433,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/saml",
         icon: ShieldCheck,
         built: true,
+        requiresFlag: "saml",
       },
     ],
   },

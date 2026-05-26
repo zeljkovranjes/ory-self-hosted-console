@@ -11,6 +11,15 @@ vi.mock("next/navigation", () => ({
   usePathname: () => "/users",
 }));
 
+// FLAG-02: the sidebar now reads useFeatures() to hide flag-gated items. This
+// shell test asserts the FULL nav model renders, so stub useFeatures to the
+// PENDING shape (`data: undefined`) — the UI-SPEC §2 contract is that the
+// unfiltered nav renders while the query is pending (no flash, no spinner), so
+// every NAV_ITEMS entry (including the flag-gated ones) is present here.
+vi.mock("@/lib/features", () => ({
+  useFeatures: () => ({ data: undefined }),
+}));
+
 function renderSidebar() {
   return render(
     <SidebarProvider>

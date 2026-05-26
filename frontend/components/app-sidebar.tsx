@@ -14,6 +14,7 @@ import {
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
 import { NAV_GROUPS } from "@/lib/nav";
+import { useFeatures } from "@/lib/features";
 
 // FE-01 — the console grouped sidebar (UI-SPEC §1/§5).
 //
@@ -22,9 +23,17 @@ import { NAV_GROUPS } from "@/lib/nav";
 // `md` (handled by SidebarProvider + the trigger in the topbar). The active
 // route is highlighted via `isActive` (data-active), driven by usePathname().
 // Every item is keyboard-focusable (shadcn renders <a> via asChild + Next Link).
+//
+// FLAG-02 — items carrying `requiresFlag` are HIDDEN when that flag is OFF
+// (GET /api/console/features via useFeatures). While the query is pending
+// (`flags` undefined) the UNFILTERED nav renders so there is no layout flash and
+// no spinner (UI-SPEC §2 / Pitfall 6). This is additive cosmetics only — the
+// authoritative gate is the backend FeatureFlagHoop (T-12-08).
 
 export function AppSidebar() {
   const pathname = usePathname();
+  const { data } = useFeatures();
+  const flags = data?.features;
 
   return (
     <Sidebar>
@@ -40,7 +49,13 @@ export function AppSidebar() {
             <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-                {group.items.map((item) => {
+                {group.items
+                  .filter(
+                    (item) =>
+                      !item.requiresFlag ||
+                      (flags ? flags[item.requiresFlag]?.enabled : true),
+                  )
+                  .map((item) => {
                   const active =
                     pathname === item.href ||
                     pathname.startsWith(`${item.href}/`);
