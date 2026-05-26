@@ -4,8 +4,8 @@
 //
 // The Phase-12 FeatureGate shell is now the REAL feature body: gated on the
 // "saml" flag (OFF → the neutral disabled state rendered by FeatureGate; ON →
-// the connection CRUD below). There is NO "requires Enterprise License" /
-// "requires Ory" copy anywhere — the feature is simply on or off.
+// the connection CRUD below). There is NO licensing/upsell copy anywhere
+// (SSO-07) — the feature is simply on or off.
 //
 // Composes the Phase-5 DataTable: a fetcher calls GET /api/sso/connections?tenant=
 // through @/lib/api (the sole egress — no Polis/Ory host literal). The backend
