@@ -1,16 +1,21 @@
 import type { LucideIcon } from "lucide-react";
 import {
   Activity,
+  Cookie,
   Fingerprint,
   KeyRound,
+  Link2,
   Mail,
   Palette,
   RefreshCw,
   RotateCcw,
+  ScanSearch,
   Settings,
   ShieldCheck,
   ShieldQuestion,
   Smartphone,
+  Sliders,
+  Timer,
   ToggleLeft,
   Users,
   Webhook,
@@ -153,16 +158,73 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Access",
+    // Phase 8 — the grouped "OAuth2" section (08-UI-SPEC §F). Clients is the
+    // data-plane DataTable + CRUD; the Token & Flow Inspector and the six config
+    // SettingsForm pages land in plans 02/03 (same phase) — the nav entries point
+    // at them now so the section shell is complete. All `built: true`.
+    label: "OAuth2",
     items: [
       {
         slug: "oauth2",
-        label: "OAuth2",
-        href: "/oauth2",
+        label: "Clients",
+        href: "/oauth2/clients",
         icon: KeyRound,
-        built: false,
-        comingIn: "Phase 8",
+        built: true,
       },
+      {
+        slug: "oauth2-inspector",
+        label: "Token & Flow Inspector",
+        href: "/oauth2/inspector",
+        icon: ScanSearch,
+        built: true,
+      },
+      {
+        slug: "oauth2-general",
+        label: "General & Issuer",
+        href: "/oauth2/general",
+        icon: Settings,
+        built: true,
+      },
+      {
+        slug: "oauth2-oidc",
+        label: "OIDC",
+        href: "/oauth2/oidc",
+        icon: ShieldCheck,
+        built: true,
+      },
+      {
+        slug: "oauth2-urls",
+        label: "URLs",
+        href: "/oauth2/urls",
+        icon: Link2,
+        built: true,
+      },
+      {
+        slug: "oauth2-lifespans",
+        label: "Token Lifespans",
+        href: "/oauth2/lifespans",
+        icon: Timer,
+        built: true,
+      },
+      {
+        slug: "oauth2-strategies",
+        label: "Token Strategies",
+        href: "/oauth2/strategies",
+        icon: Sliders,
+        built: true,
+      },
+      {
+        slug: "oauth2-cookies",
+        label: "Cookies",
+        href: "/oauth2/cookies",
+        icon: Cookie,
+        built: true,
+      },
+    ],
+  },
+  {
+    label: "Access",
+    items: [
       {
         slug: "permissions",
         label: "Permissions",

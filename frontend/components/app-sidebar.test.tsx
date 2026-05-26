@@ -29,12 +29,11 @@ describe("AppSidebar", () => {
     }
   });
 
-  it("renders the UI-SPEC core section links (Users, OAuth2, Permissions, Branding, Project, Activity)", () => {
+  it("renders the UI-SPEC core section links (Users, Permissions, Branding, Project, Activity)", () => {
     renderSidebar();
     for (const label of [
       "Activity",
       "Users",
-      "OAuth2",
       "Permissions",
       "Branding",
       "Project",
@@ -43,6 +42,26 @@ describe("AppSidebar", () => {
         screen.getByRole("link", { name: new RegExp(label, "i") }),
       ).toBeInTheDocument();
     }
+  });
+
+  it("renders the grouped OAuth2 section (Phase 8, built — Clients + Inspector + 6 config pages)", () => {
+    renderSidebar();
+    // The "OAuth2" group renders as a group label, not a single link.
+    expect(screen.getByText("OAuth2")).toBeInTheDocument();
+
+    // The Clients DataTable page links under /oauth2/clients and is built.
+    expect(
+      screen.getByRole("link", { name: /^clients$/i }),
+    ).toHaveAttribute("href", "/oauth2/clients");
+    expect(
+      screen.getByRole("link", { name: /token & flow inspector/i }),
+    ).toHaveAttribute("href", "/oauth2/inspector");
+    expect(
+      screen.getByRole("link", { name: /general & issuer/i }),
+    ).toHaveAttribute("href", "/oauth2/general");
+    expect(
+      screen.getByRole("link", { name: /cookies/i }),
+    ).toHaveAttribute("href", "/oauth2/cookies");
   });
 
   it("renders the grouped Authentication section (built, not a 'coming in a later phase' placeholder)", () => {
@@ -73,7 +92,8 @@ describe("AppSidebar", () => {
     const usersLink = screen.getByRole("link", { name: /users/i });
     // SidebarMenuButton sets data-active on the rendered anchor (asChild).
     expect(usersLink).toHaveAttribute("data-active", "true");
-    const oauthLink = screen.getByRole("link", { name: /oauth2/i });
-    expect(oauthLink).toHaveAttribute("data-active", "false");
+    // An unrelated route (the OAuth2 Clients page) is NOT active on /users.
+    const clientsLink = screen.getByRole("link", { name: /^clients$/i });
+    expect(clientsLink).toHaveAttribute("data-active", "false");
   });
 });
