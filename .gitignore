@@ -22,6 +22,14 @@
 !/config/polis/settings.env
 /config/polis/settings.env.bak
 
+# --- Config-edit engine .bak rewrites (Phase 4+ transactional writes) ---
+# The YAML/JSON config editor (and the Phase-14 SAML provider write) writes the
+# affected service config atomically and leaves a last-known-good `.bak` alongside
+# it for rollback. Those `.bak` files are operator/runtime state (also produced by
+# the live acceptance gates) — never commit them. The tracked source config stays
+# tracked; only the runtime `.bak` churn is ignored.
+/config/**/*.bak
+
 # --- Rust (backend) ---
 /backend/target/
 # Linux build cache used by the documented ORY_LIVE_TESTS container run

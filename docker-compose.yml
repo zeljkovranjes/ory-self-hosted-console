@@ -559,8 +559,12 @@ services:
       # 32-byte base64; write-only (BACK-07), IMMUTABLE after first boot (Pitfall 5).
       DB_ENCRYPTION_KEY: ${POLIS_DB_ENCRYPTION_KEY:?set POLIS_DB_ENCRYPTION_KEY}
       # Admin-API auth (Authorization: Api-Key) — the backend is the sole client (Phase 14).
-      # Use API_KEYS, NOT the deprecated JACKSON_API_KEYS alias.
-      API_KEYS: ${POLIS_API_KEY:?set POLIS_API_KEY}
+      # BoxyHQ Jackson reads the management-API key from JACKSON_API_KEYS; the bare
+      # API_KEYS name is NOT honoured by the SSO-connection auth middleware (verified
+      # live in Phase 14: API_KEYS alone -> 401 on POST/GET /api/v1/sso). We set BOTH
+      # for forward/backward compatibility; JACKSON_API_KEYS is the authoritative one.
+      JACKSON_API_KEYS: ${POLIS_API_KEY:?set POLIS_API_KEY}
+      API_KEYS: ${POLIS_API_KEY}
       # Single public issuer URL — reachable identically by the browser AND by
       # Kratos server-side (split-horizon, Pattern A). All OIDC/discovery endpoints
       # are derived from this one base.

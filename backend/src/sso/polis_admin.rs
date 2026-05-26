@@ -66,9 +66,17 @@ fn encode_component(s: &str) -> String {
 
 /// Build the redirect-disabled reqwest client for Polis admin calls. Mirrors the
 /// SSRF posture used in `auth/github.rs` (`Policy::none()`).
-fn polis_client() -> Result<reqwest::Client, AppError> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+///
+/// Uses the `reqwest_012` (0.12) alias — the SAME client the Ory typed crates use
+/// (`ory/clients.rs`) — built with the bundled `rustls-tls` webpki roots. The
+/// crate's primary reqwest 0.13 `rustls` feature pulls `rustls-platform-verifier`,
+/// which has NO system trust store on the distroless backend image and therefore
+/// fails `Client::builder().build()` with a "builder error" for EVERY request
+/// (verified live in Phase 14 — the Polis call surfaced as a 502). reqwest 0.12
+/// `rustls-tls` bundles webpki roots, so `build()` succeeds without a system store.
+fn polis_client() -> Result<reqwest_012::Client, AppError> {
+    reqwest_012::Client::builder()
+        .redirect(reqwest_012::redirect::Policy::none())
         .build()
         .map_err(|e| AppError::Internal(format!("build polis admin client: {e}")))
 }
@@ -169,7 +177,7 @@ pub async fn create_connection(
     let url = format!("{}{SSO_PATH}", polis_admin_base.trim_end_matches('/'));
     let resp = polis_client()?
         .post(&url)
-        .header(reqwest::header::AUTHORIZATION, api_key_header(api_key))
+        .header(reqwest_012::header::AUTHORIZATION, api_key_header(api_key))
         .json(&body)
         .send()
         .await
@@ -202,7 +210,7 @@ pub async fn list_connections(
     let url = sso_url_with_query(polis_admin_base, &[("tenant", tenant), ("product", product)]);
     let resp = polis_client()?
         .get(&url)
-        .header(reqwest::header::AUTHORIZATION, api_key_header(api_key))
+        .header(reqwest_012::header::AUTHORIZATION, api_key_header(api_key))
         .send()
         .await
         .map_err(|e| {
@@ -244,7 +252,7 @@ pub async fn delete_connection(
     let url = sso_url_with_query(polis_admin_base, &query);
     let resp = polis_client()?
         .delete(&url)
-        .header(reqwest::header::AUTHORIZATION, api_key_header(api_key))
+        .header(reqwest_012::header::AUTHORIZATION, api_key_header(api_key))
         .send()
         .await
         .map_err(|e| {
