@@ -59,8 +59,8 @@ pub struct OryClients {
     pub oathkeeper: OathCfg,
 }
 
-/// WR-03: validate an admin base URL at startup. The five admin URLs are taken
-/// verbatim from env; a typo (missing scheme, `kratos;4434`, empty) would
+/// WR-03: validate an admin base URL at startup. The six admin/public URLs are
+/// taken verbatim from env; a typo (missing scheme, `kratos;4434`, empty) would
 /// otherwise boot clean and then fail EVERY call to that service with an opaque
 /// 502 at request time — hard to diagnose because the error body is (correctly)
 /// detail-free and never echoes the URL. Given the "zero manual plumbing / just
@@ -97,22 +97,31 @@ impl OryClients {
     /// admin credential and are reachable only on the internal network
     /// (RESEARCH A2).
     ///
-    /// WR-03: each of the five admin URLs is validated first; a malformed/empty
-    /// URL fails the boot with an operator-facing [`AppError::Config`] rather
-    /// than degrading to opaque per-request 502s.
+    /// WR-03: each of the six admin/public URLs is validated first; a
+    /// malformed/empty URL fails the boot with an operator-facing
+    /// [`AppError::Config`] rather than degrading to opaque per-request 502s. The
+    /// URLs are validated from a single iterated list so the count can never
+    /// drift from the comment (WR-01).
     ///
     /// WR-01: a single bounded-timeout reqwest 0.12 client is built and shared
     /// across all `Configuration`s (the client is internally `Arc`-backed, so
     /// the shared connection pool is reused), replacing each crate's UNBOUNDED
     /// `::new()` default client.
     pub fn from_config(cfg: &Config) -> Result<Self, AppError> {
-        // WR-03: fail fast on a malformed admin URL.
-        validate_admin_url("KRATOS_ADMIN_URL", &cfg.kratos_admin_url)?;
-        validate_admin_url("HYDRA_ADMIN_URL", &cfg.hydra_admin_url)?;
-        validate_admin_url("HYDRA_PUBLIC_URL", &cfg.hydra_public_url)?;
-        validate_admin_url("KETO_READ_URL", &cfg.keto_read_url)?;
-        validate_admin_url("KETO_WRITE_URL", &cfg.keto_write_url)?;
-        validate_admin_url("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url)?;
+        // WR-03 + WR-01: fail fast on a malformed admin/public URL. Validate from
+        // a single iterated list so the count can never drift from the docs (the
+        // SIX admin/public URLs — Kratos, Hydra admin, Hydra public, Keto read,
+        // Keto write, Oathkeeper).
+        for (env_key, value) in [
+            ("KRATOS_ADMIN_URL", &cfg.kratos_admin_url),
+            ("HYDRA_ADMIN_URL", &cfg.hydra_admin_url),
+            ("HYDRA_PUBLIC_URL", &cfg.hydra_public_url),
+            ("KETO_READ_URL", &cfg.keto_read_url),
+            ("KETO_WRITE_URL", &cfg.keto_write_url),
+            ("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url),
+        ] {
+            validate_admin_url(env_key, value)?;
+        }
 
         // WR-01: one bounded-timeout reqwest 0.12 client shared by every
         // Configuration. Cloning it shares the underlying Arc'd connection pool.
