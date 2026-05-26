@@ -291,10 +291,11 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     // Phase 10 — the "Branding" group (10-UI-SPEC §G). Plan 02 shipped the two
     // kratos-config branding pages (Email Templates, UI URLs); Plan 03 appends
-    // Console Logo (the console-OWNED asset upload) + the three gated pages
-    // (Localization, Custom Domains, Theming). The gated items route to the
-    // labeled `GatedFeature` page — NOT the "coming in a later phase"
-    // placeholder. All `built: true`.
+    // Console Logo (the console-OWNED asset upload) + the three flag-gated pages
+    // (Localization, Custom Domains, Theming). As of Phase 12 (FLAG-02/03) the
+    // three are tagged requiresFlag "account_experience": they are HIDDEN while
+    // that flag is OFF and render a FeatureGate placeholder when ON.
+    // All `built: true`.
     label: "Branding",
     items: [
       {
@@ -348,9 +349,10 @@ export const NAV_GROUPS: NavGroup[] = [
     // Phase 11 — the "Project" group (11-UI-SPEC §I). Plan 04 ships the Overview
     // health dashboard, the Members (console-operator) list, Console API keys
     // (issue/reveal/revoke), the derived Activity stub, the read-only Logs &
-    // events audit view, and the Event-streams gated stub. The gated item routes
-    // to its labeled `GatedFeature` page — NOT the "coming in a later phase"
-    // placeholder. All `built: true`.
+    // events audit view, and the Event-streams stub. As of Phase 12 the
+    // Event-streams and Organizations items are tagged requiresFlag
+    // ("event_streams" / "organizations"): HIDDEN while OFF, FeatureGate
+    // placeholder when ON. All `built: true`.
     label: "Project",
     items: [
       {
@@ -408,9 +410,9 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     // Phase 11 — the "Actions" group (11-UI-SPEC §I). The console's own webhook
-    // dispatcher (Plan 02: Webhooks CRUD + the Delivery log) plus the gated
-    // Enterprise sign-in entry (SAML, Plan 04). All `built: true`; the gated SAML
-    // item routes to its labeled `GatedFeature` page.
+    // dispatcher (Plan 02: Webhooks CRUD + the Delivery log) plus the SAML
+    // sign-in entry. As of Phase 12 the SAML item is tagged requiresFlag "saml":
+    // HIDDEN while OFF, FeatureGate placeholder when ON. All `built: true`.
     label: "Actions",
     items: [
       {

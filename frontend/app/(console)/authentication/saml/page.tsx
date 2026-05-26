@@ -1,22 +1,23 @@
-// AUTH-05 — SAML Sign-In (GATED). SAML enterprise sign-in is an Ory Enterprise /
-// Network feature, not available in the self-hosted OSS stack (11-UI-SPEC §H).
-// The CTA links to EXTERNAL Ory docs. This is a labeled explanation, never a
-// dead CRUD form.
+// SSO — SAML Sign-In (FLAG-03, gated on the "saml" flag). The real SAML
+// configuration UI lands in Phase 14 (Ory Polis bridge). Until then this is a
+// thin placeholder behind FeatureGate: when the flag is OFF the page shows the
+// neutral "feature disabled" state; when ON it shows the "coming online" body.
 
-import { GatedFeature } from "@/components/gated-feature";
+import { FeatureGate } from "@/components/feature-gate";
 
 export default function SamlSignInPage() {
   return (
-    <GatedFeature
-      title="SAML Sign-In"
-      badgeLabel="Requires Ory Enterprise License"
-      explanation="SAML enterprise sign-in is an Ory Enterprise / Network feature and is not available in the self-hosted OSS stack."
-      recommendation="SAML sign-in requires Ory Enterprise. Read the documentation to learn how enterprise SSO is configured there."
-      cta={{
-        label: "Read about Ory Enterprise SAML",
-        href: "https://www.ory.sh/docs/kratos/social-signin/saml",
-        external: true,
-      }}
-    />
+    <FeatureGate flag="saml" title="SAML Sign-In">
+      <div className="space-y-6">
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            SAML Sign-In
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            SAML enterprise sign-in is coming online in this milestone.
+          </p>
+        </div>
+      </div>
+    </FeatureGate>
   );
 }

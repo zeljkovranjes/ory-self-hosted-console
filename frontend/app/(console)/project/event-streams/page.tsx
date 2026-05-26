@@ -1,21 +1,24 @@
-// PROJ-03 — Event streams (GATED). Streaming events to an external sink is an
-// Ory Network feature; self-hosted has derived Activity + outbound Webhooks
-// instead (11-UI-SPEC §H). The CTA links INTERNALLY to the console's own webhook
-// dispatcher. This is a labeled explanation, never a dead CRUD form.
+// EVT — Event streams (FLAG-03, gated on the "event_streams" flag). The real
+// external-sink streaming UI lands in Phase 17. Until then this is a thin
+// placeholder behind FeatureGate: OFF → neutral "feature disabled"; ON →
+// "coming online".
 
-import { GatedFeature } from "@/components/gated-feature";
+import { FeatureGate } from "@/components/feature-gate";
 
 export default function EventStreamsPage() {
   return (
-    <GatedFeature
-      title="Event streams"
-      badgeLabel="Limited in self-hosted"
-      explanation="Streaming events to an external sink is an Ory Network feature. In self-hosted, derived activity is available under Activity, and outbound delivery is available via Webhooks."
-      recommendation="To deliver events to an external endpoint in self-hosted, configure a webhook in the console's own dispatcher."
-      cta={{
-        label: "Set up a webhook",
-        href: "/project/webhooks",
-      }}
-    />
+    <FeatureGate flag="event_streams" title="Event streams">
+      <div className="space-y-6">
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Event streams
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Streaming events to an external sink is coming online in this
+            milestone.
+          </p>
+        </div>
+      </div>
+    </FeatureGate>
   );
 }

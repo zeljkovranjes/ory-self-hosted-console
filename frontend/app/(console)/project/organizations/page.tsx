@@ -1,22 +1,23 @@
-// ORG-01 — Organizations (GATED). B2B multi-tenancy is an Ory Enterprise /
-// Network feature, not available in the self-hosted OSS stack (11-UI-SPEC §H).
-// The CTA links to EXTERNAL Ory docs. This is a labeled explanation, never a
-// dead CRUD form.
+// SSO — Organizations (FLAG-03, gated on the "organizations" flag). The real
+// B2B multi-tenancy UI lands in Phase 14. Until then this is a thin placeholder
+// behind FeatureGate: OFF → neutral "feature disabled"; ON → "coming online".
 
-import { GatedFeature } from "@/components/gated-feature";
+import { FeatureGate } from "@/components/feature-gate";
 
 export default function OrganizationsPage() {
   return (
-    <GatedFeature
-      title="Organizations"
-      badgeLabel="Requires Ory Enterprise License / Network"
-      explanation="Organizations (B2B multi-tenancy) are an Ory Enterprise / Network feature and are not available in the self-hosted OSS stack."
-      recommendation="Organizations require Ory Enterprise or Ory Network. Read the documentation to learn how multi-tenancy works there."
-      cta={{
-        label: "Read about Ory Organizations",
-        href: "https://www.ory.sh/docs/kratos/organizations",
-        external: true,
-      }}
-    />
+    <FeatureGate flag="organizations" title="Organizations">
+      <div className="space-y-6">
+        <div className="space-y-1">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Organizations
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Organizations (B2B multi-tenancy) are coming online in this
+            milestone.
+          </p>
+        </div>
+      </div>
+    </FeatureGate>
   );
 }
