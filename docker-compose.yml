@@ -521,6 +521,27 @@ services:
   polis:
     image: boxyhq/jackson:26.2.0
     container_name: polis              # MUST match Service::Polis.container() (13-02) + broker regex
+    # IN-02: ingest the console-managed NON-secret settings file. The /api/config/
+    # polis writer persists allowlisted KEY=value pairs to host
+    # `./config/polis/settings.env` (== the backend's `<config_dir>/polis/
+    # settings.env`, with config_dir=/etc/config). Wiring it here is what makes a
+    # console edit actually take effect in Polis: these env vars are read at
+    # container CREATE, so an edited setting is ingested on the next compose
+    # up/recreate. (A bare broker `restart` restarts the EXISTING container and does
+    # NOT re-read the file; the writer's restart proves the file persisted + Polis
+    # returns healthy. Full re-ingestion of an edited value lands on recreate. This
+    # closes the latent gap where the file was written but never consumed.)
+    # `required: false` so the FIRST boot (file may be absent before any edit) does
+    # not abort compose; a committed placeholder `config/polis/settings.env` makes
+    # it present from the start. CRITICAL precedence: the `environment:` block below
+    # is applied AFTER `env_file` and WINS on any duplicate key (Compose merges
+    # env_file first, then `environment` overrides) — so the write-only secrets,
+    # `EXTERNAL_URL`, and `OPENID_REDIRECT_EXACT_MATCH: "true"` hardening stay
+    # authoritative and can NEVER be weakened through the settings file, even though
+    # the writer already rejects those keys (defense in depth).
+    env_file:
+      - path: ./config/polis/settings.env
+        required: false
     environment:
       DB_ENGINE: sql
       DB_TYPE: postgres

@@ -405,6 +405,80 @@ case "$POLIS_NETS" in
 esac
 
 # =============================================================================
+# SSO-01 (4b) — IN-02: the console settings file is actually INGESTED by Polis.
+# Proves the compose `polis` service wires `env_file: ./config/polis/settings.env`
+# AND that a value placed in that file is reflected in the running container's
+# environment at boot (so a console edit is not merely written-to-disk but
+# consumed by Polis). Both assertions are EXPLICIT (anti-false-green).
+# =============================================================================
+echo
+echo "============================================================"
+echo " SSO-01 (4b) — IN-02: settings.env is wired + ingested by Polis"
+echo "============================================================"
+echo
+echo "--- [SSO-01/IN-02] docker-compose.yml: polis service wires env_file -> ./config/polis/settings.env ---"
+# Structural proof the env_file is wired, read from the SOURCE compose file (NOT
+# `docker compose config`, which inlines env_file values into the resolved
+# `environment:` map and emits no `env_file:` key). Parse the YAML, find the polis
+# service, and assert its env_file list references config/polis/settings.env.
+# PASS only on an explicit match (never on a parse miss).
+#
+# CRITICAL (Windows/MSYS): the gate runs under MSYS_NO_PATHCONV=1, so an MSYS
+# `/tmp/...`-style path passed as a node ARGUMENT is NOT translated for the
+# Windows node binary (readFileSync would throw -> empty verdict). Feed the file
+# on STDIN (`cat | node` reading fd 0) exactly like the other assertions, so no
+# path crosses the MSYS->Windows boundary.
+POLIS_ENVFILE_WIRED="$(cat "${REPO_ROOT}/docker-compose.yml" | node -e '
+  const fs = require("fs");
+  const txt = fs.readFileSync(0, "utf8");
+  // Scope to the `polis:` service block (from its 2-space-indented key to the
+  // next sibling service key). Then require an env_file entry pointing at the
+  // settings file. Indentation-based slice keeps it dependency-free (no yaml dep).
+  const lines = txt.split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^  polis:\s*$/.test(lines[i])) { start = i; break; }
+  }
+  if (start < 0) { process.stdout.write("NO_POLIS_SERVICE"); process.exit(0); }
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    // next top-level service key (exactly 2-space indent, "key:")
+    if (/^  [A-Za-z0-9_.-]+:\s*$/.test(lines[i])) { end = i; break; }
+  }
+  const block = lines.slice(start, end).join("\n");
+  const hasEnvFileKey = /^\s*env_file:\s*$/m.test(block);
+  const refsSettings  = /config\/polis\/settings\.env/.test(block);
+  process.stdout.write(hasEnvFileKey && refsSettings ? "WIRED" : "NOT_WIRED");
+' 2>/dev/null)"
+case "$POLIS_ENVFILE_WIRED" in
+  WIRED) _pass "[SSO-01/IN-02] polis service wires env_file -> config/polis/settings.env (console edits are consumed by Polis)";;
+  *)     _fail "[SSO-01/IN-02] polis env_file NOT wired to config/polis/settings.env (verdict='$POLIS_ENVFILE_WIRED') — a console edit would never reach Polis";;
+esac
+
+echo
+echo "--- [SSO-01/IN-02] the running polis container's env reflects a settings.env value (ingested at boot) ---"
+# The committed placeholder ships LOG_LEVEL=info + BOXYHQ_NO_TELEMETRY=1. Those
+# come ONLY from env_file (the compose `environment:` block does NOT set LOG_LEVEL),
+# so finding LOG_LEVEL in the container's resolved Config.Env proves the file was
+# actually ingested (not merely written to disk). PASS only on an explicit verdict.
+POLIS_ENV_INGESTED="$(docker inspect "$POLIS_CONTAINER" 2>/dev/null | node -e '
+  let input = require("fs").readFileSync(0, "utf8").trim();
+  if (!input) { process.stdout.write("INSPECT_EMPTY"); process.exit(0); }
+  let arr; try { arr = JSON.parse(input); } catch (e) { process.stdout.write("BADJSON"); process.exit(0); }
+  const c = Array.isArray(arr) ? arr[0] : arr;
+  const env = (c && c.Config && c.Config.Env) || [];
+  // LOG_LEVEL is set ONLY by the env_file placeholder, never by the compose
+  // `environment:` block — its presence proves settings.env was ingested.
+  const hit = env.find(e => /^LOG_LEVEL=/.test(e));
+  process.stdout.write(hit ? ("INGESTED:" + hit) : "ABSENT");
+' 2>/dev/null)"
+case "$POLIS_ENV_INGESTED" in
+  INGESTED:*) _pass "[SSO-01/IN-02] polis container env carries ${POLIS_ENV_INGESTED#INGESTED:} from settings.env (env_file ingested at boot — the write-then-restart loop now reaches Polis)";;
+  ABSENT)     _fail "[SSO-01/IN-02] polis container env does NOT carry LOG_LEVEL from settings.env — the file is written but NOT ingested (the IN-02 gap is still open)";;
+  *)          _fail "[SSO-01/IN-02] could not read polis container env (verdict='$POLIS_ENV_INGESTED') — cannot confirm settings.env ingestion";;
+esac
+
+# =============================================================================
 # Authenticate a console session (complete /setup + login), mirroring phase12.
 # =============================================================================
 echo

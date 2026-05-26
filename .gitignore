@@ -10,12 +10,17 @@
 /config/oathkeeper/jwks.json
 !/config/oathkeeper/jwks.json.example
 
-# --- Polis console-generated settings (Phase 13, SSO-01) ---
-# The /api/config/polis writer creates <config_dir>/polis/settings.env at runtime
-# (a KEY=value env file of NON-secret allowlisted settings) on the first edit; it
-# is operator runtime state, never a checked-in default. Keep it (and its .bak)
-# out of git.
-/config/polis/
+# --- Polis console-generated settings (Phase 13, SSO-01 / IN-02) ---
+# The /api/config/polis writer rewrites <config_dir>/polis/settings.env at runtime
+# (a KEY=value env file of NON-secret allowlisted settings) on every edit, leaving
+# a .bak alongside. Those rewrites are operator runtime state — keep them out of
+# git. BUT the committed `settings.env` placeholder MUST be tracked: the compose
+# `polis` service wires `env_file: ./config/polis/settings.env` (IN-02), so the
+# file must exist at first boot. Ignore everything in the dir, then re-include the
+# placeholder; the runtime `.bak` (and any other churn) stays ignored.
+/config/polis/*
+!/config/polis/settings.env
+/config/polis/settings.env.bak
 
 # --- Rust (backend) ---
 /backend/target/
