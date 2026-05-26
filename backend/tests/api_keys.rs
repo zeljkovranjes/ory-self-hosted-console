@@ -85,6 +85,47 @@ async fn list_returns_masked_keys_without_raw_or_hash(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn verify_stamps_last_used_at_on_success(pool: PgPool) {
+    // WR-04: a successful verify must write last_used_at (was permanently NULL).
+    let issued = queries::issue_api_key(&pool, "last-used-key", None)
+        .await
+        .expect("issue key");
+
+    // Freshly issued: last_used_at is NULL.
+    let before = sqlx::query!(
+        "SELECT last_used_at FROM console_api_keys WHERE id = $1",
+        issued.view.id
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert!(before.last_used_at.is_none(), "fresh key has NULL last_used_at");
+
+    let matched = queries::verify_api_key(&pool, &issued.raw)
+        .await
+        .expect("verify");
+    assert_eq!(matched, Some(issued.view.id), "raw verifies");
+
+    let after = sqlx::query!(
+        "SELECT last_used_at FROM console_api_keys WHERE id = $1",
+        issued.view.id
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert!(
+        after.last_used_at.is_some(),
+        "a successful verify stamps last_used_at"
+    );
+
+    // WR-04: an unknown prefix returns None and does NOT touch any row.
+    let none = queries::verify_api_key(&pool, "zz-unknown-prefix-key")
+        .await
+        .expect("verify unknown");
+    assert_eq!(none, None, "unknown prefix does not match");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn revoke_flips_state_and_blocks_verify(pool: PgPool) {
     let issued = queries::issue_api_key(&pool, "revoke-key", None)
         .await

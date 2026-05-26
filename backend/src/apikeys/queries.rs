@@ -18,6 +18,15 @@ use super::{ApiKeyRow, ApiKeyView};
 /// Number of leading raw-key chars kept as the non-secret display prefix.
 const PREFIX_LEN: usize = 8;
 
+/// A fixed dummy SHA-256 hex used to flatten the verify timing profile when no
+/// candidate row matches the presented prefix (WR-04). It is `sha256_hex("")`
+/// (the empty-string digest) — a public constant, never a real key hash, so it
+/// can never match a presented key. Running one constant-time compare against it
+/// on the no-candidate path keeps the request-time cost of "unknown prefix"
+/// indistinguishable from "known prefix, wrong key" (both perform >= 1
+/// sha256+ct_eq), removing the prefix-existence timing oracle.
+const DUMMY_HASH_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 /// The freshly issued key: the RAW value (returned to the operator exactly once)
 /// plus the persisted secret-free [`ApiKeyView`]. The raw is NOT stored anywhere.
 pub struct IssuedKey {
@@ -101,8 +110,9 @@ pub async fn revoke_api_key(pool: &PgPool, id: Uuid) -> Result<Option<ApiKeyView
 
 /// Verify a presented raw key against the stored one-way hash, constant-time
 /// (`verify_token_ct`). Returns the key id ONLY when the key matches AND is not
-/// revoked. Provided for a future bearer-auth path; v1 routes stop at issue/
-/// list/revoke. Never logs the presented value (BACK-07).
+/// revoked, and stamps `last_used_at = now()` on a match (WR-04). Provided for a
+/// future bearer-auth path; v1 routes stop at issue/list/revoke. Never logs the
+/// presented value (BACK-07).
 pub async fn verify_api_key(pool: &PgPool, presented: &str) -> Result<Option<Uuid>, AppError> {
     // Match by the non-secret prefix first to bound the candidate set, then
     // constant-time compare the full hash. (Even a single-candidate lookup goes
@@ -119,10 +129,32 @@ pub async fn verify_api_key(pool: &PgPool, presented: &str) -> Result<Option<Uui
     .fetch_all(pool)
     .await?;
 
-    for c in candidates {
+    // WR-04: scan EVERY candidate (no early return) so the per-candidate compare
+    // count does not depend on which row matched, then flatten the no-candidate
+    // path with one dummy compare so "unknown prefix" costs the same >= 1
+    // sha256+ct_eq as "known prefix, wrong key" — removing the prefix-existence
+    // timing oracle.
+    let mut matched: Option<Uuid> = None;
+    for c in &candidates {
         if verify_token_ct(presented, &c.key_hash) {
-            return Ok(Some(c.id));
+            matched = Some(c.id);
         }
     }
-    Ok(None)
+    if matched.is_none() {
+        // Constant work on the no-match path; the result is intentionally discarded.
+        let _ = verify_token_ct(presented, DUMMY_HASH_HEX);
+        return Ok(None);
+    }
+
+    // WR-04: stamp last_used_at on a successful verify so the surfaced column is
+    // live rather than permanently NULL. Best-effort within the verify result —
+    // a write failure surfaces as the query error (the caller decides).
+    let id = matched.expect("matched is Some on this branch");
+    sqlx::query!(
+        "UPDATE console_api_keys SET last_used_at = now() WHERE id = $1",
+        id
+    )
+    .execute(pool)
+    .await?;
+    Ok(Some(id))
 }

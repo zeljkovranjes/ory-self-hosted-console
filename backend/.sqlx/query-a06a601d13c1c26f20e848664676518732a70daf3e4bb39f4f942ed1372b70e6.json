@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE webhook_deliveries SET max_attempts = 3 WHERE id = $1",
+  "query": "UPDATE console_api_keys SET last_used_at = now() WHERE id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "590ae6a2a72f2d695916019623466039ef93ea630679cf0a16d47f649acec1f6"
+  "hash": "a06a601d13c1c26f20e848664676518732a70daf3e4bb39f4f942ed1372b70e6"
 }
