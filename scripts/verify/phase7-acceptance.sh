@@ -488,6 +488,51 @@ if [ "$OIDC_OK" = "1" ] && [ -n "${CAP_SECRET:-}" ]; then
       _fail "[AUTH-04] retyped secret leaked or empty on GET (got '$SEC3')"
     fi
   fi
+
+  # --- CR-01: RENAME the provider id while echoing the masked secret -> 422 ---
+  # The backend keys merge-by-id on `id`. Renaming the provider (acme -> acme2)
+  # while echoing the captured mask leaves the sentinel UNRESOLVABLE — the merge
+  # must FAIL CLOSED (422), never writing the literal sentinel as the real secret.
+  echo
+  echo "--- [AUTH-04] CR-01 fail-closed: rename provider id + masked secret -> 422, no clobber ---"
+  # Re-capture the current masked literal (after the retype leg) to echo verbatim.
+  o_get4="$(_body_of "$(_auth_get "${CFG_URL}/oidc")")"
+  CAP_SECRET4="$(_json_field "$o_get4" '
+    var ps = data["/selfservice/methods/oidc/config/providers"];
+    var p = ps && ps.find(function(x){return x.id==="acme";});
+    p ? p.client_secret : null
+  ')"
+  snapshot_file "$KRATOS_YAML"
+  RENAME_BODY="$(MAPPER="$OIDC_MAPPER_SRC" MASK="$CAP_SECRET4" node -e '
+    const mapper = process.env.MAPPER, mask = process.env.MASK;
+    const body = {
+      "/selfservice/methods/oidc/enabled": true,
+      "/selfservice/methods/oidc/config/providers": [{
+        id: "acme2",
+        provider: "generic",
+        client_id: "acme-client-id",
+        client_secret: mask,
+        mapper_url: mapper,
+        issuer_url: "https://accounts.example.com"
+      }]
+    };
+    process.stdout.write(JSON.stringify(body));
+  ')"
+  rename_resp="$(_auth_mut PUT "${CFG_URL}/oidc" "$RENAME_BODY")"
+  rename_code="$(_code_of "$rename_resp")"; rename_rbody="$(_body_of "$rename_resp")"
+  if [ "$rename_code" = "422" ]; then
+    _pass "[AUTH-04] CR-01 rename + masked secret -> 422 (fail-closed; sentinel never written)"
+  else
+    _fail "[AUTH-04] CR-01 rename + masked secret -> '$rename_code' (want 422; body: $rename_rbody)"
+  fi
+  # No disk write on a 422 (the file is byte-identical).
+  assert_file_unchanged "$KRATOS_YAML"
+  # Backstop: the literal sentinel must NEVER appear in kratos.yml.
+  if grep -Fq "$MASKED_SENTINEL" "$KRATOS_YAML"; then
+    _fail "[AUTH-04] CR-01 the mask sentinel '$MASKED_SENTINEL' leaked into kratos.yml — clobber!"
+  else
+    _pass "[AUTH-04] CR-01 the mask sentinel is absent from kratos.yml (no clobber)"
+  fi
 fi
 
 # --- AUTH-10: SMS channel (array) + base64 body -----------------------------
