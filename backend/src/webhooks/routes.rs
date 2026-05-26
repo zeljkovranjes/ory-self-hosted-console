@@ -28,6 +28,49 @@ fn pool(depot: &mut Depot) -> Result<sqlx::PgPool, AppError> {
         .clone())
 }
 
+/// WR-02 input bounds. The backend is the AUTHORITATIVE validation boundary
+/// (the frontend Zod schema is advisory only), so create/update enforce these
+/// server-side and return 422 with a field-scoped message on violation.
+const MAX_NAME_LEN: usize = 200;
+const MAX_URL_LEN: usize = 2048;
+
+/// WR-02 events allowlist — the set the dispatcher can actually emit. MUST stay
+/// in lockstep with the frontend `WEBHOOK_EVENTS` (frontend/app/(console)/project/
+/// webhooks/types.ts). An event outside this set would silently create a dead
+/// subscription the worker never fires, so it is rejected at the boundary.
+const KNOWN_EVENTS: &[&str] = &[
+    "identity.created",
+    "identity.updated",
+    "identity.deleted",
+    "session.created",
+    "session.revoked",
+    "registration.completed",
+    "login.completed",
+    "recovery.completed",
+    "verification.completed",
+    "settings.completed",
+];
+
+/// Validate webhook `name`/`url`/`events` shape (shared by create + update).
+/// Returns the first violation as a 400/422 `BadRequest`; the caller has already
+/// rejected an empty name / empty events list.
+fn validate_webhook_fields(name: &str, url: &str, events: &[String]) -> Result<(), AppError> {
+    if name.chars().count() > MAX_NAME_LEN {
+        return Err(AppError::BadRequest(format!(
+            "Webhook name must be at most {MAX_NAME_LEN} characters."
+        )));
+    }
+    if url.chars().count() > MAX_URL_LEN {
+        return Err(AppError::BadRequest(format!(
+            "Webhook URL must be at most {MAX_URL_LEN} characters."
+        )));
+    }
+    if let Some(bad) = events.iter().find(|e| !KNOWN_EVENTS.contains(&e.as_str())) {
+        return Err(AppError::BadRequest(format!("Unknown event: {bad}")));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateWebhookBody {
     name: String,
@@ -71,6 +114,9 @@ pub async fn create_webhook(
             "Select at least one event.".into(),
         ));
     }
+    // WR-02: enforce length bounds + the events allowlist before any DB write or
+    // SSRF resolution (cheap reject of oversized/unknown input).
+    validate_webhook_fields(body.name.trim(), &body.url, &body.events)?;
     // Fast-feedback SSRF check at create (the worker re-validates at delivery).
     ssrf::validate_url(&body.url).await?;
 
@@ -133,6 +179,8 @@ pub async fn update_webhook(
     if body.events.is_empty() {
         return Err(AppError::BadRequest("Select at least one event.".into()));
     }
+    // WR-02: same authoritative bounds + allowlist as create.
+    validate_webhook_fields(body.name.trim(), &body.url, &body.events)?;
     // Re-validate the (possibly changed) URL.
     ssrf::validate_url(&body.url).await?;
 
@@ -239,4 +287,57 @@ fn path_id(req: &mut Request) -> Result<Uuid, AppError> {
         .param::<String>("id")
         .ok_or(AppError::NotFound)?;
     Uuid::parse_str(&raw).map_err(|_| AppError::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_events() -> Vec<String> {
+        vec!["identity.created".to_string()]
+    }
+
+    #[test]
+    fn validate_webhook_fields_accepts_valid_input() {
+        assert!(validate_webhook_fields("hook", "https://example.com/h", &ok_events()).is_ok());
+        // Boundary: exactly MAX is allowed.
+        let max_name = "a".repeat(MAX_NAME_LEN);
+        let prefix = "https://e/"; // 10 chars
+        let max_url = format!("{prefix}{}", "x".repeat(MAX_URL_LEN - prefix.len()));
+        assert_eq!(max_url.chars().count(), MAX_URL_LEN);
+        assert!(validate_webhook_fields(&max_name, &max_url, &ok_events()).is_ok());
+    }
+
+    #[test]
+    fn validate_webhook_fields_rejects_overlong_name() {
+        let name = "a".repeat(MAX_NAME_LEN + 1);
+        let err = validate_webhook_fields(&name, "https://example.com/h", &ok_events()).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_webhook_fields_rejects_overlong_url() {
+        let url = format!("https://example.com/{}", "x".repeat(MAX_URL_LEN));
+        let err = validate_webhook_fields("hook", &url, &ok_events()).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_webhook_fields_rejects_unknown_event() {
+        let events = vec!["identity.created".to_string(), "not.a.real.event".to_string()];
+        let err = validate_webhook_fields("hook", "https://example.com/h", &events).unwrap_err();
+        match err {
+            AppError::BadRequest(m) => assert!(m.contains("not.a.real.event"), "msg names the bad event: {m}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_events_matches_frontend_allowlist_size() {
+        // Guard against the backend allowlist drifting from the frontend
+        // WEBHOOK_EVENTS set (10 events as of Phase 11).
+        assert_eq!(KNOWN_EVENTS.len(), 10);
+        assert!(KNOWN_EVENTS.contains(&"session.created"));
+        assert!(KNOWN_EVENTS.contains(&"settings.completed"));
+    }
 }
