@@ -165,6 +165,16 @@ fn parse_host_port(url: &str) -> Result<(String, u16), AppError> {
             ))
         }
     }
+    // WR-03: reject embedded userinfo (`http://user:pass@host`). The resolved-IP
+    // class check is the authoritative defense for internal hostnames (an internal
+    // service name only passes if it resolves to a PUBLIC IP, which the shipped
+    // RFC1918 compose topology never does), but credentials in the URL would be
+    // sent on the wire silently and are never an intended webhook shape — fail fast.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::BadRequest(
+            "Webhook URL must not contain embedded credentials.".to_string(),
+        ));
+    }
     let host = parsed
         .host_str()
         .ok_or_else(|| AppError::BadRequest("Webhook URL has no host.".to_string()))?
@@ -285,5 +295,19 @@ mod tests {
     async fn validate_url_rejects_garbage() {
         let err = validate_url("not a url").await.unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_url_rejects_embedded_credentials() {
+        // WR-03: userinfo in the URL is rejected BEFORE any DNS resolution, so the
+        // reject does not depend on the (public) host resolving.
+        let with_user_pass = validate_url("http://user:pass@example.com/hook")
+            .await
+            .unwrap_err();
+        assert!(matches!(with_user_pass, AppError::BadRequest(_)));
+        let with_user_only = validate_url("https://user@example.com/hook")
+            .await
+            .unwrap_err();
+        assert!(matches!(with_user_only, AppError::BadRequest(_)));
     }
 }
