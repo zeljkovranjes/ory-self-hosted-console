@@ -596,6 +596,33 @@ pub fn build(
                 .get(crate::organizations::routes::list_orgs) // SSO-05 list
                 .post(crate::organizations::routes::create_org), // SSO-05 create (CSRF-guarded, audited)
         )
+        // Phase 15 (AX-02/AX-03): the Account Experience theming + localization
+        // override-file editors — console-OWNED files, NO Ory call (like
+        // branding/webhooks). GATED by `FeatureFlagHoop::new("account_experience")`
+        // (seeded OFF) and mounted INSIDE the protected subtree AFTER the
+        // audit/auth/csrf hoops, so a flag-OFF request 404s even with a valid
+        // session + matching CSRF token (FLAG-01 / T-15-07). Each writer targets a
+        // SERVER-DEFINED canonical path under the mounted config volume
+        // (`{config_dir}/account-experience/{theme.css,translations.json}`, T-15-06)
+        // — there is NO client path component, and these are NOT the
+        // `{service}/{section}` allowlist engine. The translations PUT JSON-parses
+        // the body and 422-rejects malformed input BEFORE any disk write (T-15-08);
+        // the theme PUT stores raw CSS-variable text. GET is csrf-exempt; PUT is
+        // state-changing so `csrf_guard` enforces `X-CSRF-Token` (403); both inherit
+        // `auth_guard` (401). The AX reads both files at boot, so an edit applies on
+        // the next AX restart (A3 — no rebuild).
+        .push(
+            Router::with_path("api/account-experience/theme")
+                .hoop(crate::features::FeatureFlagHoop::new("account_experience"))
+                .get(crate::account_experience::routes::get_theme) // AX-02 read
+                .put(crate::account_experience::routes::put_theme), // AX-02 write (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/account-experience/translations")
+                .hoop(crate::features::FeatureFlagHoop::new("account_experience"))
+                .get(crate::account_experience::routes::get_translations) // AX-03 read
+                .put(crate::account_experience::routes::put_translations), // AX-03 write (CSRF-guarded, 422 on malformed)
+        )
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
         // allowlisted values; PUT runs the full transactional flow. Both inherit
         // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`

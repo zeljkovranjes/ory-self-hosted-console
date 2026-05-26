@@ -4,6 +4,7 @@
 //! tests under `tests/` import these modules (`ory_console_backend::*`) to
 //! exercise the real router/handlers with Salvo `TestClient`.
 
+pub mod account_experience;
 pub mod activity;
 pub mod apikeys;
 pub mod audit;
