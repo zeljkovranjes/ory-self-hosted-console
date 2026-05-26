@@ -23,7 +23,6 @@ WORKDIR /app
 # DOES expose the probe so it can anchor FLAG-01 end-to-end. Any non-empty value
 # enables it; the default empty value ships the hardened production binary.
 ARG TEST_PROBE=
-ENV CARGO_FEATURE_FLAGS=${TEST_PROBE:+--features test-probe}
 
 # SQLX_OFFLINE: the sqlx `query!`/`query_as!` macros verify SQL at compile time
 # against a live DB unless offline metadata is present. The build stage has NO
@@ -62,11 +61,12 @@ COPY src ./src
 COPY config ./config
 # Bust the cached dummy artifacts so BOTH the real lib and bin are recompiled
 # (the bin depends on the lib crate, so a stale stub lib.rs would break it).
-# WR-01: $CARGO_FEATURE_FLAGS is empty for a production build (no probe) and
-# `--features test-probe` when TEST_PROBE was set (the acceptance image). It is
-# unquoted on purpose so an empty value expands to nothing.
+# WR-01: the shell-form `${TEST_PROBE:+--features test-probe}` expands to nothing
+# for a production build (no probe) and to `--features test-probe` when the
+# TEST_PROBE build-arg was set (the acceptance image). Done here in the RUN (sh -c)
+# because Dockerfile `ENV` does NOT support `${VAR:+...}` substitution.
 RUN touch src/lib.rs src/main.rs \
-    && cargo build --release --locked ${CARGO_FEATURE_FLAGS}
+    && cargo build --release --locked ${TEST_PROBE:+--features test-probe}
 
 # ---- curl stage ----
 # The distroless runtime ships no curl. We vendor a single STATICALLY-LINKED
