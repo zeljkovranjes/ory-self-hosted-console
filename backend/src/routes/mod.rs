@@ -458,6 +458,43 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
             Router::with_path("api/kratos/smtp-connection")
                 .get(crate::config_edit::routes::get_smtp_connection)
                 .put(crate::config_edit::routes::put_smtp_connection),
+        )
+        // Phase 11 (HOOK-01/02/03) the webhook dispatcher — console-OWNED state,
+        // NO Ory call (like branding). All inherit `auth_guard` (401 unauth); GET
+        // (list/detail) is csrf-exempt, while every state change (create/update/
+        // delete/rotate-secret/redeliver) requires `X-CSRF-Token` via `csrf_guard`
+        // (403, T-11-10). The signing `secret` is write-only end-to-end: create +
+        // rotate-secret reveal it ONCE; GET/list return the masked `secret_set`
+        // badge only (T-11-05). `create`/`update` SSRF-validate the URL for fast
+        // 422 feedback; the worker re-validates authoritatively at delivery time
+        // (DNS-rebind defense, T-11-01/02). Most specific paths FIRST so the
+        // literal `deliveries` segment is not captured by `{id}`.
+        .push(
+            Router::with_path("api/webhooks/deliveries")
+                .get(crate::webhooks::routes::list_deliveries), // HOOK-03 delivery-log list
+        )
+        .push(
+            Router::with_path("api/webhooks/deliveries/{id}/redeliver")
+                .post(crate::webhooks::routes::redeliver), // HOOK-03 re-enqueue (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/webhooks/deliveries/{id}")
+                .get(crate::webhooks::routes::get_delivery), // HOOK-03 delivery detail
+        )
+        .push(
+            Router::with_path("api/webhooks/{id}/rotate-secret")
+                .post(crate::webhooks::routes::rotate_secret), // HOOK-02 rotate (one-time reveal)
+        )
+        .push(
+            Router::with_path("api/webhooks/{id}")
+                .get(crate::webhooks::routes::get_webhook) // HOOK-03 detail (masked secret)
+                .put(crate::webhooks::routes::update_webhook) // HOOK-03 update (never blanks secret)
+                .delete(crate::webhooks::routes::delete_webhook), // HOOK-03 delete
+        )
+        .push(
+            Router::with_path("api/webhooks")
+                .get(crate::webhooks::routes::list_webhooks) // HOOK-03 list (masked secret)
+                .post(crate::webhooks::routes::create_webhook), // HOOK-02/03 create (one-time secret)
         );
 
     // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is

@@ -105,13 +105,22 @@ pub async fn validate_url(url: &str) -> Result<(), AppError> {
 /// client PINNED to those addresses with redirects OFF. Returns the client and
 /// the validated socket addrs (for diagnostics). A blocked IP is an explicit
 /// reject — never a silent no-op.
+///
+/// `allow_private` is the TEST/CI escape hatch: production callers (the worker
+/// spawned from `main.rs`) pass `false`, fully enforcing the classifier. ONLY the
+/// integration-test harness and the live phase-11 acceptance gate — whose
+/// receivers run on loopback (`mockito`) or the internal docker network — pass
+/// `true`. It relaxes ONLY the public/private classification; the DNS-resolve +
+/// `resolve_to_addrs` PIN (TOCTOU defense) and redirects-off Policy STILL apply,
+/// so even in the relaxed mode the connection cannot be rebound or bounced.
 pub async fn build_pinned_client(
     url: &str,
+    allow_private: bool,
 ) -> Result<(reqwest::Client, Vec<SocketAddr>), AppError> {
     let (host, port) = parse_host_port(url)?;
     let addrs = resolve(&host, port).await?;
     for sa in &addrs {
-        if is_blocked_ip(sa.ip()) {
+        if !allow_private && is_blocked_ip(sa.ip()) {
             return Err(AppError::BadRequest(SSRF_REJECT_MSG.to_string()));
         }
     }

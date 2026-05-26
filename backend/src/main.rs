@@ -18,12 +18,21 @@ use ory_console_backend::auth::setup::ensure_bootstrap_token;
 use ory_console_backend::config::Config;
 use ory_console_backend::db::queries;
 use ory_console_backend::error::AppError;
+use ory_console_backend::webhooks;
 use ory_console_backend::{db, routes};
 
 /// WR-07: how often the background reaper deletes absolutely-expired sessions.
 /// Hourly is ample for a low-concurrency console — it bounds `sessions` growth
 /// from abandoned (never-logged-out) sessions without adding meaningful load.
 const SESSION_REAP_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// HOOK-01: how often the webhook worker claims + delivers due rows. A tight 2s
+/// cadence keeps delivery latency low for a low-volume single-tenant console.
+const WEBHOOK_TICK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// HOOK-03: how often the webhook maintenance task prunes terminal deliveries
+/// and recovers stale 'delivering' rows. Hourly is ample.
+const WEBHOOK_MAINT_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Initialize structured logging. Keeps the Phase-1 default filter ("info").
 fn init_tracing() {
@@ -72,6 +81,44 @@ async fn main() -> Result<(), AppError> {
                     Ok(n) if n > 0 => tracing::info!(reaped = n, "expired sessions reaped"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "session reaper sweep failed"),
+                }
+            }
+        });
+    }
+
+    // HOOK-01: background webhook delivery worker. Mirrors the session reaper —
+    // a detached tokio task that, every tick, claims due deliveries
+    // (FOR UPDATE SKIP LOCKED), SSRF-guards the target, HMAC-signs the body, and
+    // POSTs it, recording delivered | backoff retry | dead. State is durable in
+    // Postgres so the queue survives a restart. A failed tick is logged and
+    // retried next tick — it never panics the loop or blocks request serving.
+    {
+        let worker_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(WEBHOOK_TICK_INTERVAL);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = webhooks::worker::tick(&worker_pool).await {
+                    tracing::warn!(error = %e, "webhook worker tick failed");
+                }
+            }
+        });
+    }
+
+    // HOOK-03: background webhook maintenance — prune terminal deliveries past
+    // the retention window and recover stale 'delivering' rows (a worker that
+    // crashed mid-flight). Hourly; failures logged, never fatal.
+    {
+        let maint_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(WEBHOOK_MAINT_INTERVAL);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = webhooks::worker::prune_tick(&maint_pool).await {
+                    tracing::warn!(error = %e, "webhook pruning tick failed");
+                }
+                if let Err(e) = webhooks::worker::reap_stale_tick(&maint_pool).await {
+                    tracing::warn!(error = %e, "webhook stale-reap tick failed");
                 }
             }
         });

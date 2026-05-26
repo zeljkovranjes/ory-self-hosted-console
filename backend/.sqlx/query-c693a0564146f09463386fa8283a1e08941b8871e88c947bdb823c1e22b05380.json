@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM webhook_deliveries\n        WHERE status IN ('delivered', 'dead') AND updated_at < $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c693a0564146f09463386fa8283a1e08941b8871e88c947bdb823c1e22b05380"
+}
