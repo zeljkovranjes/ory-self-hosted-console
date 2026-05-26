@@ -248,6 +248,78 @@ fn build_list_url(
     url
 }
 
+/// List Hydra OAuth2 clients for ONE page, returning the raw client JSON objects
+/// plus the `page_token` cursor for the NEXT page (`None` on the last page).
+///
+/// This is the second justified reqwest-0.13 fallback (08-RESEARCH Pattern 2 /
+/// Pitfall 2): the typed `o_auth2_api::list_o_auth2_clients` returns only the body
+/// `Vec<OAuth2Client>` and DROPS the `Link` response header that carries the next
+/// `page_token`. Hydra paginates with `page_size` + an OFFSET-style `page_token`
+/// (e.g. `0`, `15`) surfaced via an RFC-8288 `Link` header — the SAME extraction
+/// the Kratos keyset path uses, so [`parse_next_page_token`] is reused verbatim
+/// (the offset-vs-keyset distinction is opaque to the parser).
+///
+/// `base_url` is the FIXED internal Hydra Admin URL from `Config` (never user
+/// input — no SSRF surface, RESEARCH Security Domain). The clients are returned
+/// as `serde_json::Value` (NOT the Ory `OAuth2Client` type) to preserve this
+/// module's isolation invariant — the typed handler in `hydra.rs` shapes them
+/// (stripping `client_secret` + `registration_access_token`, T-08-LEAK) before
+/// they reach the client. On any non-2xx or transport/decode failure the shared
+/// [`AppError::Upstream`] (502) envelope is returned with NO upstream body/host
+/// leaked (BACK-07).
+///
+/// The query string is assembled by the pure [`build_clients_list_url`] helper so
+/// the param-threading (page_size / page_token) is unit-testable WITHOUT a live
+/// Hydra.
+pub async fn list_o_auth2_clients_paged(
+    client: &reqwest::Client,
+    base_url: &str,
+    page_size: i64,
+    page_token: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, Option<String>), AppError> {
+    let url = build_clients_list_url(base_url, page_size, page_token);
+
+    let resp = client.get(url).send().await.map_err(map_fallback_err)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(map_fallback_status(status));
+    }
+
+    // Read the next-page cursor from the Link header BEFORE consuming the body.
+    let next_token = resp
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_next_page_token);
+
+    // Decode the body as a generic JSON array of client objects. A decode failure
+    // is still an upstream problem -> 502, never a body leak.
+    let body: serde_json::Value = resp.json().await.map_err(map_fallback_err)?;
+    let rows = body
+        .as_array()
+        .cloned()
+        .ok_or_else(|| AppError::Upstream("ory upstream returned a non-array list".into()))?;
+
+    Ok((rows, next_token))
+}
+
+/// Build the Hydra `GET /admin/clients` URL with the page_size and an optional
+/// opaque `page_token` cursor (Hydra's offset token). The token is percent-
+/// encoded (belt-and-suspenders; Hydra's offset alphabet is URL-safe). Pure — no
+/// IO — so the param threading is unit-testable without a live Hydra.
+fn build_clients_list_url(base_url: &str, page_size: i64, page_token: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/admin/clients?page_size={}",
+        base_url.trim_end_matches('/'),
+        page_size
+    );
+    if let Some(tok) = page_token {
+        url.push_str("&page_token=");
+        url.push_str(&urlencode(tok));
+    }
+    url
+}
+
 /// Minimal percent-encoding for an opaque page-token cursor placed in a query
 /// string. Encodes the characters that are unsafe in a query value; the Kratos
 /// token alphabet is URL-safe in practice, this is belt-and-suspenders.
@@ -343,6 +415,49 @@ mod tests {
             url.contains("&credentials_identifier=bob"),
             "filter present alongside token; got {url}"
         );
+    }
+
+    /// P8: a Hydra `rel="next"` Link header (offset-style page_token) yields the
+    /// next page_token; the parser is shared with the Kratos keyset path because
+    /// the offset-vs-keyset distinction is opaque to the extraction.
+    #[test]
+    fn link_header_next_token_for_hydra_offset_cursor() {
+        let header = "</admin/clients?page_size=5&page_token=15>; rel=\"next\", \
+                      </admin/clients?page_size=5&page_token=0>; rel=\"first\", \
+                      </admin/clients?page_size=5&page_token=0>; rel=\"prev\"";
+        assert_eq!(parse_next_page_token(header), Some("15".to_string()));
+    }
+
+    /// P8: a Hydra last page (no `rel="next"`) yields None — the cursor is
+    /// exhausted.
+    #[test]
+    fn link_header_no_next_for_hydra_last_page() {
+        let header = "</admin/clients?page_size=5&page_token=0>; rel=\"first\", \
+                      </admin/clients?page_size=5&page_token=10>; rel=\"last\"";
+        assert_eq!(parse_next_page_token(header), None);
+    }
+
+    /// P8 (WR-02 cursor): the Hydra clients list URL threads page_size and an
+    /// optional opaque page_token (percent-encoded), and omits the token entirely
+    /// on the first page.
+    #[test]
+    fn build_clients_list_url_threads_page_token() {
+        let base = "http://hydra:4445";
+
+        // First page: just page_size, no token.
+        let url = build_clients_list_url(base, 20, None);
+        assert_eq!(url, "http://hydra:4445/admin/clients?page_size=20");
+
+        // A subsequent page carries the offset token (percent-encoded).
+        let url = build_clients_list_url(base, 20, Some("15"));
+        assert!(
+            url.contains("&page_token=15"),
+            "offset token must reach Hydra; got {url}"
+        );
+
+        // A trailing slash on the base is normalised away (no `//admin`).
+        let url = build_clients_list_url("http://hydra:4445/", 5, None);
+        assert_eq!(url, "http://hydra:4445/admin/clients?page_size=5");
     }
 
     /// A non-2xx status maps to `Upstream` carrying ONLY the status (log detail),

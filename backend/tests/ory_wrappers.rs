@@ -25,10 +25,13 @@ use salvo::prelude::*;
 use salvo::test::{ResponseExt, TestClient};
 use sqlx::PgPool;
 
-/// The three REQUIRED proof routes (Oathkeeper is an optional bonus, not gated).
-const PROOF_ROUTES: [&str; 3] = [
+/// The REQUIRED proof routes asserted unauthenticated-401 on GET (Oathkeeper is
+/// an optional bonus, asserted separately). Phase 8 added the Hydra client item
+/// route (`/api/hydra/clients/{id}`); the collection route is already present.
+const PROOF_ROUTES: [&str; 4] = [
     "http://127.0.0.1:8080/api/kratos/identities",
     "http://127.0.0.1:8080/api/hydra/clients",
+    "http://127.0.0.1:8080/api/hydra/clients/some-client-id",
     "http://127.0.0.1:8080/api/keto/relationships",
 ];
 
@@ -61,6 +64,21 @@ async fn ory_routes_require_auth(pool: PgPool) {
         resp.status_code,
         Some(StatusCode::UNAUTHORIZED),
         "unauthenticated GET /api/oathkeeper/rules must be 401 (auth_guard)"
+    );
+
+    // T-08-AUTHZ: the Phase-8 state-changing Hydra client routes must reject an
+    // unauthenticated request with 401 BEFORE the handler runs — auth_guard sits
+    // ahead of csrf_guard on the protected subtree, so a missing session is a 401
+    // (not a 403). A non-401 means the create/update/delete path is reachable
+    // without a session.
+    let resp = TestClient::post("http://127.0.0.1:8080/api/hydra/clients")
+        .json(&serde_json::json!({ "client_name": "x" }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        resp.status_code,
+        Some(StatusCode::UNAUTHORIZED),
+        "unauthenticated POST /api/hydra/clients must be 401 (auth_guard)"
     );
 }
 
@@ -165,34 +183,135 @@ async fn kratos_identities_live(pool: PgPool) {
     assert_no_admin_url_leak(&text);
 }
 
-/// Criterion 1 (Hydra): the authenticated wrapper GET returns 200 + a JSON array.
-/// An EMPTY array is a VALID live response on a fresh Hydra (Pitfall 4). Gated.
+/// OAUTH2-01 + T-08-SECRET (#2869) live cycle (gated on `ORY_LIVE_TESTS`):
+/// create a client (capturing the one-time secret) -> wrapper LIST returns the
+/// `{rows,next_token}` envelope -> wrapper GET MASKS the secret -> wrapper PUT a
+/// NON-secret edit (secret omitted) -> the ORIGINAL secret STILL authenticates
+/// against Hydra's token endpoint (the empirical #2869 confirmation, Open Q1) ->
+/// wrapper DELETE returns 204.
 #[sqlx::test(migrations = "./migrations")]
 async fn hydra_clients_live(pool: PgPool) {
+    use ory_hydra_client::apis::o_auth2_api;
+    use ory_hydra_client::models::OAuth2Client;
+
     if !live_enabled() {
         println!("SKIP: hydra_clients_live (set ORY_LIVE_TESTS=1 with the stack up to run)");
         return;
     }
 
+    let clients = common::ory_clients_from_env();
+
+    // 1) CREATE a confidential client via the typed crate so we capture the
+    //    generated one-time secret (the create RESPONSE is the only place it is
+    //    ever returned). client_credentials so we can later mint a token with it.
+    let mut req = OAuth2Client::new();
+    req.client_name = Some("phase8-live-client".to_string());
+    req.grant_types = Some(vec!["client_credentials".to_string()]);
+    req.token_endpoint_auth_method = Some("client_secret_post".to_string());
+    req.scope = Some("offline".to_string());
+    let created = o_auth2_api::create_o_auth2_client(&clients.hydra, req)
+        .await
+        .expect("create oauth2 client");
+    let client_id = created.client_id.clone().expect("created client_id");
+    let original_secret = created.client_secret.clone().expect("one-time client_secret");
+    assert!(!original_secret.is_empty(), "create must surface a one-time secret");
+
     let service = Service::new(common::build_test_router(pool.clone()));
     let cookie = authed_cookie(&service, &pool).await;
+    // The PUT/DELETE are state-changing: mint a CSRF token bound to this session.
+    let csrf = common::csrf_for_raw_token(&pool, &cookie).await;
 
-    let mut resp = TestClient::get("http://127.0.0.1:8080/api/hydra/clients")
+    // 2) LIST via the wrapper -> the {rows, next_token} envelope; no secret leak.
+    let mut resp = TestClient::get("http://127.0.0.1:8080/api/hydra/clients?page_size=50")
         .add_header("Cookie", format!("console_session={cookie}"), true)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK), "authed LIST should be 200");
+    let text = resp.take_string().await.expect("list body");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("list body is JSON");
+    assert!(json.get("rows").map(|r| r.is_array()).unwrap_or(false), "list has rows[]: {text}");
+    assert!(json.get("next_token").is_some(), "list envelope carries next_token: {text}");
+    assert!(!text.contains(&original_secret), "LIST leaked the client_secret: {text}");
+    assert_no_admin_url_leak(&text);
+
+    // 3) GET one via the wrapper -> secret MASKED (T-08-LEAK).
+    let mut resp = TestClient::get(format!("http://127.0.0.1:8080/api/hydra/clients/{client_id}"))
+        .add_header("Cookie", format!("console_session={cookie}"), true)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK), "authed GET one should be 200");
+    let text = resp.take_string().await.expect("get body");
+    assert!(!text.contains(&original_secret), "GET leaked the client_secret: {text}");
+    assert!(!text.contains("registration_access_token"), "GET leaked registration token: {text}");
+    assert_no_admin_url_leak(&text);
+
+    // 4) PUT a NON-secret edit (rename) WITHOUT a secret -> 200; #2869 preserve.
+    let mut resp = TestClient::put(format!("http://127.0.0.1:8080/api/hydra/clients/{client_id}"))
+        .add_header("Cookie", format!("console_session={cookie}"), true)
+        .add_header("X-CSRF-Token", csrf.clone(), true)
+        .json(&serde_json::json!({
+            "client_name": "phase8-live-client-RENAMED",
+            "grant_types": ["client_credentials"],
+            "token_endpoint_auth_method": "client_secret_post",
+            "scope": "offline"
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK), "authed PUT (non-secret edit) should be 200");
+    let text = resp.take_string().await.expect("put body");
+    assert!(!text.contains(&original_secret), "PUT response leaked the client_secret: {text}");
+
+    // 5) THE #2869 EMPIRICAL ASSERTION: the ORIGINAL secret still authenticates
+    //    after the non-secret PUT. Mint a client_credentials token directly
+    //    against Hydra's public token endpoint with the captured secret.
+    let token_url = std::env::var("HYDRA_PUBLIC_URL")
+        .unwrap_or_else(|_| "http://hydra:4444".to_string());
+    let token_url = format!("{}/oauth2/token", token_url.trim_end_matches('/'));
+    // Build the x-www-form-urlencoded body manually (the dev reqwest may not have
+    // the `form` feature). The values are URL-safe Hydra-generated tokens, but
+    // percent-encode the secret defensively.
+    fn enc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+    let body = format!(
+        "grant_type=client_credentials&client_id={}&client_secret={}&scope=offline",
+        enc(&client_id),
+        enc(&original_secret),
+    );
+    let http = reqwest::Client::new();
+    let token_resp = http
+        .post(&token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("token request");
+    assert_eq!(
+        token_resp.status(),
+        reqwest::StatusCode::OK,
+        "the ORIGINAL secret must STILL authenticate after a non-secret PUT (#2869 preserve)"
+    );
+
+    // 6) DELETE via the wrapper -> 204.
+    let resp = TestClient::delete(format!("http://127.0.0.1:8080/api/hydra/clients/{client_id}"))
+        .add_header("Cookie", format!("console_session={cookie}"), true)
+        .add_header("X-CSRF-Token", csrf, true)
         .send(&service)
         .await;
     assert_eq!(
         resp.status_code,
-        Some(StatusCode::OK),
-        "authed GET /api/hydra/clients should be 200 against the live stack"
+        Some(StatusCode::NO_CONTENT),
+        "authed DELETE should be 204"
     );
-    let text = resp.take_string().await.expect("hydra body");
-    let json: serde_json::Value = serde_json::from_str(&text).expect("hydra body is JSON");
-    assert!(
-        json.is_array(),
-        "hydra clients must be a JSON array (empty is valid — Pitfall 4): {text}"
-    );
-    assert_no_admin_url_leak(&text);
 }
 
 /// Criterion 1 (Keto): the authenticated wrapper GET returns 200 + a JSON object

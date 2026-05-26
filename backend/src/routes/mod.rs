@@ -241,7 +241,24 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
                 .put(crate::ory::kratos::update_identity) // IDENT-02 update (state required)
                 .delete(crate::ory::kratos::delete_identity), // IDENT-02 delete
         )
-        .push(Router::with_path("api/hydra/clients").get(crate::ory::hydra::list_clients))
+        // Phase 8 (OAUTH2-01) Hydra OAuth2 client data path. All inherit
+        // `auth_guard` (401 unauth); GET is csrf-exempt, while POST/PUT/DELETE
+        // require `X-CSRF-Token` via `csrf_guard` (T-08-AUTHZ — `lib/api.ts`
+        // echoes it, no new wiring). List replaces the Phase-3 first-page proof
+        // with the Hydra Link-header cursor; update PUTs the full object with
+        // `client_secret=None` so an edit can never blank the stored secret
+        // (#2869 / T-08-SECRET); GET/list strip the secret (T-08-LEAK).
+        .push(
+            Router::with_path("api/hydra/clients")
+                .get(crate::ory::hydra::list_clients) // OAUTH2-01 list (cursor)
+                .post(crate::ory::hydra::create_client), // OAUTH2-01 create (one-time secret)
+        )
+        .push(
+            Router::with_path("api/hydra/clients/{id}")
+                .get(crate::ory::hydra::get_client) // OAUTH2-01 detail (secret masked)
+                .put(crate::ory::hydra::update_client) // OAUTH2-01 update (#2869 preserve)
+                .delete(crate::ory::hydra::delete_client), // OAUTH2-01 delete
+        )
         .push(
             Router::with_path("api/keto/relationships")
                 .get(crate::ory::keto::list_relationships),
