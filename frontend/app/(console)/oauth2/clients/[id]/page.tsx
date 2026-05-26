@@ -25,7 +25,8 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   type OAuth2Client,
-  clientHasSecret,
+  clientAuthMethod,
+  usesSharedSecret,
   clientLabel,
 } from "../../_lib/oauth2-types";
 import { ClientSecretReveal } from "../client-secret-reveal";
@@ -142,26 +143,31 @@ export default function ClientDetailPage() {
             </span>
           </Field>
 
-          <Field label="Secret">
+          {/* WR-02: show the OBSERVABLE token-endpoint auth method instead of an
+              inferred "secret set" claim (the secret value is masked on GET, so
+              its presence cannot be observed). The rotate affordance is only
+              offered for shared-secret methods — rotating makes no sense for a
+              key-based (`private_key_jwt`) or public (`none`) client. */}
+          <Field label="Auth method">
             <span className="flex items-center gap-3">
-              {clientHasSecret(client) ? (
-                <Badge variant="secondary">set</Badge>
-              ) : (
-                <Badge variant="outline">not set</Badge>
-              )}
-              <RotateSecretDialog
-                client={client}
-                onRotated={(secret) => setRevealed(secret)}
-                trigger={
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="text-destructive hover:text-destructive"
-                  >
-                    Rotate secret
-                  </Button>
-                }
-              />
+              <Badge variant="secondary" className="font-mono">
+                {clientAuthMethod(client)}
+              </Badge>
+              {usesSharedSecret(client) ? (
+                <RotateSecretDialog
+                  client={client}
+                  onRotated={(secret) => setRevealed(secret)}
+                  trigger={
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive hover:text-destructive"
+                    >
+                      Rotate secret
+                    </Button>
+                  }
+                />
+              ) : null}
             </span>
           </Field>
 

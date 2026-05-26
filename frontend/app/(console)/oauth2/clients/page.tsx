@@ -36,7 +36,7 @@ import {
 import {
   type OAuth2Client,
   type ClientListResponse,
-  clientHasSecret,
+  clientAuthMethod,
   clientLabel,
 } from "../_lib/oauth2-types";
 import { ClientSecretReveal } from "./client-secret-reveal";
@@ -69,14 +69,15 @@ const columns: ColumnDef<OAuth2Client>[] = [
     ),
   },
   {
-    id: "secret",
-    header: "Secret",
-    cell: ({ row }) =>
-      clientHasSecret(row.original) ? (
-        <Badge variant="secondary">set</Badge>
-      ) : (
-        <Badge variant="outline">not set</Badge>
-      ),
+    // WR-02: show the OBSERVABLE auth method, not an inferred "secret set"
+    // claim (the backend masks the secret value — presence is unobservable).
+    id: "auth_method",
+    header: "Auth method",
+    cell: ({ row }) => (
+      <Badge variant="secondary" className="font-mono">
+        {clientAuthMethod(row.original)}
+      </Badge>
+    ),
   },
   {
     id: "grant_types",

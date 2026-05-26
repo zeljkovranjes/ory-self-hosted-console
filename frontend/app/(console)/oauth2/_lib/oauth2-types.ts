@@ -58,10 +58,34 @@ export const GRANT_TYPES = [
   "implicit",
 ] as const;
 
-/** Whether this client has a secret set (write-only — backend strips the value,
- *  so we infer presence from the auth method: public `none` clients have none). */
-export function clientHasSecret(c: Pick<OAuth2Client, "token_endpoint_auth_method">): boolean {
-  return (c.token_endpoint_auth_method ?? "client_secret_basic") !== "none";
+/**
+ * WR-02: the backend strips `client_secret` on GET (correct — it is write-only
+ * and unrecoverable), so the frontend CANNOT observe whether a shared secret is
+ * actually stored. Inferring a boolean "secret is set" purely from the auth
+ * method was misleading: a `private_key_jwt` client authenticates with a KEY
+ * (no shared secret) yet would show "set", and a secret cleared out-of-band
+ * would still show "set". Instead of asserting an unobservable fact, surface the
+ * OBSERVABLE one — the configured token-endpoint auth method — and let the
+ * operator read the credential model from it.
+ */
+export function clientAuthMethod(
+  c: Pick<OAuth2Client, "token_endpoint_auth_method">,
+): string {
+  return c.token_endpoint_auth_method ?? "client_secret_basic";
+}
+
+/**
+ * Whether the configured auth method is a SHARED-SECRET method
+ * (`client_secret_basic` / `client_secret_post`). This is a statement about the
+ * auth METHOD (observable), NOT a claim that a secret value is currently stored
+ * (unobservable — the backend masks it). `private_key_jwt` (key-based) and
+ * `none` (public) are not shared-secret methods.
+ */
+export function usesSharedSecret(
+  c: Pick<OAuth2Client, "token_endpoint_auth_method">,
+): boolean {
+  const m = clientAuthMethod(c);
+  return m === "client_secret_basic" || m === "client_secret_post";
 }
 
 /** Best-effort display label for the list/detail header. */
