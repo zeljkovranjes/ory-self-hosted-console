@@ -49,6 +49,7 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
         hydra_public_url: "http://hydra:4444".to_string(),
         keto_read_url: "http://keto:4466".to_string(),
         keto_write_url: "http://keto:4467".to_string(),
+        keto_opl_url: "http://keto:4469".to_string(),
         oathkeeper_api_url: "http://oathkeeper:4456".to_string(),
         // Phase 4 (BACK-04 / BACK-05): config-edit subsystem — same defaults as
         // `Config::from_env`.

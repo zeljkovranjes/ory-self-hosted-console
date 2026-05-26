@@ -27,6 +27,7 @@ fn test_cfg() -> Config {
         hydra_public_url: "http://hydra:4444".into(),
         keto_read_url: "http://keto:4466".into(),
         keto_write_url: "http://keto:4467".into(),
+        keto_opl_url: "http://keto:4469".into(),
         oathkeeper_api_url: "http://oathkeeper:4456".into(),
         restart_broker_url: "http://restart-broker:2375".into(),
         config_dir: "/etc/config".into(),
