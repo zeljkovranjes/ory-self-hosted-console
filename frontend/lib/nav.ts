@@ -16,6 +16,7 @@ import {
   Route,
   RotateCcw,
   ScanSearch,
+  Send,
   Settings,
   ShieldCheck,
   ShieldQuestion,
@@ -329,8 +330,26 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
+    // Phase 11 — the "Console" group (11-UI-SPEC §A/§B). Plan 02 ships the two
+    // webhook surfaces (Webhooks CRUD + the Delivery log); the remaining Project
+    // group items (Overview, Members, API Keys, Logs & events, gated pages) land
+    // in Plan 04 — they stay a placeholder here.
     label: "Console",
     items: [
+      {
+        slug: "project-webhooks",
+        label: "Webhooks",
+        href: "/project/webhooks",
+        icon: Webhook,
+        built: true,
+      },
+      {
+        slug: "project-webhooks-deliveries",
+        label: "Delivery log",
+        href: "/project/webhooks/deliveries",
+        icon: Send,
+        built: true,
+      },
       {
         slug: "project",
         label: "Project",
