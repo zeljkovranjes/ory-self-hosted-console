@@ -316,7 +316,41 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
         // POST (csrf-guarded). Validate ONLY; never writes a file. The 09-02
         // Permission-Model editor calls this before the gated file write.
         .push(Router::with_path("api/keto/opl/validate").post(crate::ory::keto::validate_opl))
-        // Optional bonus (CONTEXT): exercises the 4th crate end-to-end.
+        // Phase 9 (PERM-01): the Permission-Model (OPL/namespaces) editor. A
+        // DEDICATED route (NOT the {service}/{section} allowlist) so it can only
+        // read/write the OPL FILE (config/keto/namespaces.ts), never an arbitrary
+        // keto.yml key (config-injection guard, T-9-path-traversal /
+        // T-9-section-bypass). GET returns the current model source (csrf-exempt);
+        // PUT pre-validates the OPL on :4469 (populated errors -> 422, NO disk
+        // touch — Pitfall 4), atomic-writes the RAW text, restarts Keto ONLY via
+        // the broker, and rolls back on health failure. PUT is state-changing so
+        // `csrf_guard` enforces `X-CSRF-Token` (403 — T-9-csrf-file); both inherit
+        // `auth_guard` (401 unauth).
+        .push(
+            Router::with_path("api/keto/permission-model")
+                .get(crate::config_edit::routes::get_permission_model)
+                .put(crate::config_edit::routes::put_permission_model),
+        )
+        // Phase 9 (OATH-01): the Access-Rules editor. A DEDICATED route (NOT the
+        // {service}/{section} allowlist) so it can only read/write the rules FILE
+        // (config/oathkeeper/rules.json), never an arbitrary config.yaml key
+        // (config-injection guard, T-9-path-traversal / T-9-section-bypass). GET
+        // returns the current rules JSON (csrf-exempt); PUT structurally pre-checks
+        // a JSON array (non-array -> 422, NO disk touch — T-9-rules), atomic-writes
+        // pretty JSON, restarts Oathkeeper ONLY, and rolls back on health failure
+        // (polling /health/alive — Pitfall 5/A1). This is DISTINCT from the
+        // read-only `api/oathkeeper/rules` list below (that lists via the api_api;
+        // this edits the file). PUT is state-changing so `csrf_guard` enforces
+        // `X-CSRF-Token` (403 — T-9-csrf-file); both inherit `auth_guard` (401).
+        .push(
+            Router::with_path("api/config/oathkeeper/rules")
+                .get(crate::config_edit::routes::get_oathkeeper_rules)
+                .put(crate::config_edit::routes::put_oathkeeper_rules),
+        )
+        // Optional bonus (CONTEXT): the READ-ONLY rules LIST via the Oathkeeper
+        // api_api (:4456) — exercises the 4th crate end-to-end and is RETAINED for
+        // the 09-04 post-restart list confirmation. Distinct from the file editor
+        // above (`api/config/oathkeeper/rules`), which writes the rules FILE.
         .push(Router::with_path("api/oathkeeper/rules").get(crate::ory::oathkeeper::list_rules))
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
         // allowlisted values; PUT runs the full transactional flow. Both inherit
