@@ -123,6 +123,26 @@ impl Service {
             Service::Oathkeeper => "http://oathkeeper:4456",
         }
     }
+
+    /// The service's health POLL PATH (default `/health/ready`).
+    ///
+    /// 09-RESEARCH Pitfall 5 / Open Q1 / A1 (VERIFIED EMPIRICALLY against the
+    /// compose topology, docker-compose.yml ~lines 287-294): Kratos/Hydra/Keto all
+    /// report a meaningful `/health/ready` (200 once ready), so they poll it. BUT
+    /// **Oathkeeper's `/health/ready` returns 503** for the stateless, from-file
+    /// (empty/small ruleset) configuration this console ships — "its readiness
+    /// reporter has no satisfiable dependency to report on"; the compose
+    /// healthcheck for Oathkeeper deliberately uses `/health/alive` for exactly
+    /// this reason. If the OATH-01 rules write polled `/health/ready`, a perfectly
+    /// good rules write would FALSELY time out and roll back. So Oathkeeper polls
+    /// `/health/alive` (200 = the binary is up and serving the freshly-restarted
+    /// rules), keeping `health_base()` unchanged.
+    fn health_path(self) -> &'static str {
+        match self {
+            Service::Kratos | Service::Hydra | Service::Keto => "/health/ready",
+            Service::Oathkeeper => "/health/alive",
+        }
+    }
 }
 
 /// Build the broker restart URL ENTIRELY from the fixed broker base + the closed
@@ -182,7 +202,16 @@ pub async fn wait_healthy(
     health_base_override: Option<&str>,
 ) -> bool {
     let base = health_base_override.unwrap_or_else(|| svc.health_base());
-    let url = format!("{}/health/ready", base.trim_end_matches('/'));
+    // The poll PATH is per-service (Pitfall 5 / A1): Kratos/Hydra/Keto use
+    // `/health/ready`; Oathkeeper uses `/health/alive` because its `/health/ready`
+    // returns 503 for the stateless from-file config (a false-rollback risk). An
+    // override base (unit tests) keeps the service's own path so the path-routing
+    // is exercised too.
+    let url = format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        svc.health_path()
+    );
 
     let poll = async {
         loop {
@@ -247,6 +276,48 @@ mod tests {
                 "{name} must target {container}"
             );
         }
+    }
+
+    #[test]
+    fn health_path_is_per_service_oathkeeper_uses_alive() {
+        // Pitfall 5 / A1: Kratos/Hydra/Keto poll /health/ready; Oathkeeper polls
+        // /health/alive (its /health/ready 503s for the stateless from-file
+        // config — a false-rollback risk for a good OATH-01 rules write).
+        assert_eq!(Service::Kratos.health_path(), "/health/ready");
+        assert_eq!(Service::Hydra.health_path(), "/health/ready");
+        assert_eq!(Service::Keto.health_path(), "/health/ready");
+        assert_eq!(Service::Oathkeeper.health_path(), "/health/alive");
+    }
+
+    #[tokio::test]
+    async fn oathkeeper_health_poll_uses_alive_path() {
+        // The wait_healthy URL for Oathkeeper must hit /health/alive — a mock that
+        // only serves /health/alive (and NOT /health/ready) returns healthy.
+        let mut server = mockito::Server::new_async().await;
+        let alive = server
+            .mock("GET", "/health/alive")
+            .with_status(200)
+            .with_body(r#"{"status":"ok"}"#)
+            .create_async()
+            .await;
+        // /health/ready intentionally 503s (mirrors the real Oathkeeper behavior);
+        // if wait_healthy polled it, the test would time out instead.
+        let _ready_503 = server
+            .mock("GET", "/health/ready")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let http = reqwest::Client::new();
+        let healthy = wait_healthy(
+            &http,
+            Service::Oathkeeper,
+            Duration::from_secs(5),
+            Some(&server.url()),
+        )
+        .await;
+        assert!(healthy, "Oathkeeper must report healthy via /health/alive");
+        alive.assert_async().await;
     }
 
     #[tokio::test]

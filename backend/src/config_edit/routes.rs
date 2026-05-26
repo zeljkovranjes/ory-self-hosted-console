@@ -748,6 +748,131 @@ pub async fn put_permission_model(
     Err(AppError::HealthFailed)
 }
 
+/// Assert an incoming Oathkeeper-rules body IS a top-level JSON array (OATH-01).
+///
+/// T-9-rules / 09-RESEARCH Open Q2: `rules.json` is a JSON ARRAY of rule objects.
+/// A non-array body (object, string, number, null) is a structural error -> 422
+/// with NO disk touch. Pulled out so the pre-save structural gate is unit-testable
+/// without a router/filesystem. The body VALUE is never echoed.
+fn assert_rules_array(body: &Value) -> Result<(), AppError> {
+    if body.is_array() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(vec![schema::FieldError {
+            path: String::new(),
+            message: "access rules must be a JSON array of rule objects".to_string(),
+        }]))
+    }
+}
+
+/// `GET /api/config/oathkeeper/rules` — return the current access-rules file
+/// content as JSON for the editor (OATH-01).
+///
+/// Reads the server-built [`oathkeeper_rules_path`] and returns the parsed JSON
+/// (the editor renders it; `language="json"`). On the protected subtree:
+/// `auth_guard` (401). GET is csrf-exempt.
+#[handler]
+pub async fn get_oathkeeper_rules(
+    _req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    let cfg = config_from(depot)?;
+    let path = oathkeeper_rules_path(&cfg.config_dir);
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| AppError::Internal(format!("read access rules: {e}")))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|e| AppError::Internal(format!("parse access rules: {e}")))?;
+    Ok(Json(value))
+}
+
+/// `PUT /api/config/oathkeeper/rules` — structural array pre-check + atomic-write
+/// the `rules.json` FILE + restart Oathkeeper + rollback on failure (OATH-01).
+///
+/// REUSES the Phase-4 engine (lock -> validate -> backup -> atomic-write -> restart
+/// -> health-poll -> rollback); mirrors [`put_identity_schema`] with:
+///   1. the target is the FIXED rules file ([`oathkeeper_rules_path`]), NOT a
+///      `{service}/{section}` allowlist lookup (T-9-path-traversal /
+///      T-9-section-bypass);
+///   2. the body is the FULL rules document (a JSON ARRAY of rule objects);
+///   3. validation is a STRUCTURAL pre-check ([`assert_rules_array`]) — a non-array
+///      body is 422 with NO disk touch (T-9-rules). The authoritative validation is
+///      the post-restart `api_api::list_rules` reflecting the rules (09-04 gate);
+///   4. the file is `.json`, so it is serialised with `serde_json::to_string_pretty`
+///      (same precedent as the identity schema), NEVER `yaml::serialize`.
+///
+/// Restarts `Service::Oathkeeper` ONLY (T-9-restart-scope). NOTE (Pitfall 5 / A1):
+/// the engine's `wait_healthy` polls Oathkeeper's `/health/alive` (its
+/// `/health/ready` 503s for the stateless from-file config) — see
+/// `restart::Service::health_path`. On the protected subtree: `auth_guard` (401) +
+/// `csrf_guard` (403 without `X-CSRF-Token`, state-changing — T-9-csrf-file).
+#[handler]
+pub async fn put_oathkeeper_rules(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    let cfg = config_from(depot)?;
+    let svc = restart::Service::Oathkeeper;
+
+    // Parse the body as the FULL candidate rules document (malformed -> 400 before
+    // the lock).
+    let candidate: Value = req
+        .parse_json()
+        .await
+        .map_err(|_| AppError::BadRequest("invalid JSON body".into()))?;
+
+    // --- Step 1: oathkeeper write lock (busy -> 409 config_busy) -------------
+    let _guard = locks::try_acquire("oathkeeper").await?;
+    tracing::info!(service = svc.key(), "oathkeeper-rules put: lock acquired");
+
+    // --- Step 2: STRUCTURAL pre-check — body MUST be a JSON array ------------
+    // T-9-rules: a non-array body 422s BEFORE any disk touch.
+    assert_rules_array(&candidate)?;
+
+    // --- Step 3: BACKUP the live rules file (last-known-good) ----------------
+    let path = oathkeeper_rules_path(&cfg.config_dir);
+    yaml::backup(&path)?;
+    if !yaml::backup_exists(&path) {
+        tracing::error!(
+            service = svc.key(),
+            "oathkeeper-rules put: backup missing after backup(); refusing reversible write"
+        );
+        return Err(AppError::Internal("access rules backup missing".into()));
+    }
+
+    // --- Step 4: ATOMIC WRITE the rules as pretty JSON (NOT YAML) ------------
+    // rules.json IS a JSON array consumed by Oathkeeper as JSON — serialise with
+    // serde_json (same precedent as put_identity_schema; never YAML it).
+    let serialized = serde_json::to_string_pretty(&candidate)
+        .map_err(|e| AppError::Internal(format!("serialize access rules: {e}")))?;
+    yaml::write_atomic(&path, &serialized)?;
+    tracing::info!(service = svc.key(), status = "applied", "oathkeeper-rules put: written");
+
+    // --- Step 5: RESTART oathkeeper via the scoped broker -------------------
+    let http = restart::restart_client()?;
+    tracing::info!(service = svc.key(), status = "restarting", "oathkeeper-rules put: restarting");
+    if let Err(e) = restart::restart(&http, &cfg.restart_broker_url, svc).await {
+        tracing::warn!(
+            service = svc.key(),
+            "oathkeeper-rules put: broker restart failed; restoring disk (no re-restart)"
+        );
+        restore_only(&path, svc);
+        return Err(e);
+    }
+
+    // --- Step 6: HEALTH-POLL until ready or timeout --------------------------
+    // wait_healthy polls Oathkeeper's /health/alive (Pitfall 5 / A1) so a good
+    // rules write is not falsely rolled back by a stateless /health/ready 503.
+    if restart::wait_healthy(&http, svc, HEALTH_TIMEOUT, None).await {
+        tracing::info!(service = svc.key(), status = "healthy", "oathkeeper-rules put: healthy");
+        return Ok(Json(serde_json::json!({ "status": "healthy" })));
+    }
+
+    // --- Step 7: ROLLBACK on health failure ----------------------------------
+    tracing::warn!(service = svc.key(), "oathkeeper-rules put: health failed; rolling back");
+    rollback_and_restart(&http, &path, &cfg, svc).await;
+    Err(AppError::HealthFailed)
+}
+
 /// `GET /api/kratos/smtp-connection` — report ONLY whether an SMTP connection_uri
 /// is currently set, MASKED. The URI value (which carries the SMTP password) is
 /// NEVER serialised, never logged, never echoed — not even a substring (T-07-05).
@@ -1550,6 +1675,23 @@ mod tests {
                 assert!(fields[0].message.contains("column 3"));
             }
             other => panic!("expected Validation 422, got {other:?}"),
+        }
+    }
+
+    // ─── 09-02 Task 2: OATH-01 rules structural pre-check ───
+
+    #[test]
+    fn rules_array_accepts_array_rejects_non_array() {
+        // A JSON array (incl. empty) passes the structural pre-check.
+        assert!(assert_rules_array(&json!([])).is_ok());
+        assert!(assert_rules_array(&json!([{ "id": "r1" }])).is_ok());
+
+        // T-9-rules: a non-array body 422s with no disk touch. An object body is
+        // the headline case (the editor must send the rules ARRAY, not an object).
+        for non_array in [json!({}), json!("rules"), json!(5), json!(null), json!(true)] {
+            let err = assert_rules_array(&non_array)
+                .expect_err("non-array rules body must 422");
+            assert_eq!(err.machine_code(), "validation_failed", "got {err:?}");
         }
     }
 }
