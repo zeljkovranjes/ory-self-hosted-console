@@ -1239,18 +1239,31 @@ console-side and cannot be toggled off**:
 3. **SSRF-guarded `metadataUrl` (SSO-04).** The preferred way to add a connection
    is to **upload the IdP metadata XML** (base64'd into `encodedRawMetadata` — no
    network fetch, no SSRF surface). If you instead supply a **metadata URL**, the
-   backend runs it through the same SSRF guard the webhook dispatcher uses
-   **before any fetch**: a URL whose host resolves to an internal/private/
-   link-local address (`http://kratos:4434`, `http://169.254.169.254`,
-   `127.0.0.1`, …) or that carries **embedded credentials** (`user:pass@…`) is
-   rejected with an explicit **4xx**, and the reject names the *category* — it
-   never echoes the internal IP. DNS-rebind is defended by pinning the resolved
-   address and disabling redirects.
+   **backend fetches that URL itself** through the same address-pinned,
+   redirects-off client the webhook dispatcher uses — Polis is **never** handed the
+   URL, so it is never the fetcher. The guard re-resolves the host, rejects the
+   request if **any** resolved address is internal/private/link-local/
+   cloud-metadata (`http://kratos:4434`, `http://169.254.169.254`, `127.0.0.1`, …)
+   or carries **embedded credentials** (`user:pass@…`), then **pins the connection
+   to exactly the just-validated addresses** so DNS cannot rebind between the check
+   and the connect (TOCTOU/DNS-rebind defense), with **redirects disabled**
+   (`Policy::none()`) so a 3xx to an internal target is never followed. The fetched
+   XML is read under a size cap, runs through the **same signing-cert pre-flight**
+   as uploaded XML, and is then sent to Polis as `encodedRawMetadata`. A blocked
+   host or fetch failure is rejected with an explicit **422** keyed on the metadata
+   URL field, surfaced verbatim in the form, naming the *category* — it never
+   echoes the internal IP.
 
 **Two-sided delete.** Deleting a connection removes **both** the Polis
 `/api/v1/sso` connection **and** the matching Kratos `providers[]` entry
 (`saml-<tenant>`), restarting only Kratos and preserving every other provider's
-stored secret. Neither side is left dangling.
+stored secret. The order is **Kratos-first**: the security-relevant provider entry
+is removed (and Kratos confirmed healthy) **before** the Polis connection is
+deleted, so a partial failure can never leave a `saml-<tenant>` provider pointing
+at a deleted Polis connection. If the Kratos side fails, nothing was destroyed and
+the operator can retry; the Polis delete is **idempotent** (an already-gone
+connection is treated as success), so a retry after a half-finished delete
+completes cleanly. Neither side is left dangling.
 
 **Write-only `clientSecret` (BACK-07).** The OAuth2 `clientSecret` Polis mints is
 written straight into the Kratos provider entry and is **never returned to the
@@ -1361,8 +1374,10 @@ The gate exits `0` only when:
   unconditional `email` mapping — the account-takeover negative; the connection
   list carries **no** `clientSecret` value.
 - **`SSO-04`.** A `metadataUrl` to `http://kratos:4434`, `169.254.169.254`, a
-  credentialed URL, or loopback → explicit **4xx** SSRF reject with **no** fetch
-  and **no** connection created.
+  credentialed URL, or loopback → explicit **422** SSRF reject (backend-fetch
+  guard: re-resolve + address-pin + redirects-off) with **no** connection created;
+  a URL whose fetched metadata lacks a signing cert is also rejected **422** (the
+  signing-cert pre-flight runs on the URL path too).
 - **`SSO-05`.** `corp.com.` collides with `CORP.com` → **`409`**; a
   Cyrillic-homoglyph is a distinct punycode label; `corp.com.attacker.com` is
   distinct → accepted; an audit row exists for `POST /api/organizations`.
