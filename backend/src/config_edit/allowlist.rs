@@ -75,6 +75,150 @@ pub const KRATOS_SESSION: SectionAllowlist = SectionAllowlist {
     ],
 };
 
+// ─── Phase 7 — Kratos authentication config sections (07-RESEARCH SECTION→ALLOWLIST) ───
+//
+// Every JSON-Pointer below is VERIFIED against the vendored v26.2.0
+// `backend/config/schemas/kratos.config.schema.json` at the line numbers cited in
+// 07-RESEARCH.md. All array-of-objects config (OIDC providers, courier channels,
+// flow hooks) is allowlisted at the ARRAY-ROOT pointer ONLY (whole-array replace,
+// Pitfall 4) — never per-index. `courier.smtp.connection_uri` is NEVER listed here
+// (it stays on the hard `SENSITIVE_PREFIXES` denylist; its write path is Plan 02).
+
+/// AUTH-01 — General / Methods page (RESEARCH Page 1, schema lines 1504–1998).
+///
+/// Each supported auth method's `.enabled` boolean. `b2b` (enterprise, lines
+/// 1462–1502) is intentionally EXCLUDED.
+pub const KRATOS_METHODS: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "methods",
+    allowed_paths: &[
+        "/selfservice/methods/password/enabled",
+        "/selfservice/methods/code/enabled",
+        "/selfservice/methods/oidc/enabled",
+        "/selfservice/methods/totp/enabled",
+        "/selfservice/methods/lookup_secret/enabled",
+        "/selfservice/methods/webauthn/enabled",
+        "/selfservice/methods/passkey/enabled",
+        "/selfservice/methods/link/enabled",
+        "/selfservice/methods/profile/enabled",
+    ],
+};
+
+/// AUTH-02 — Passwordless & Passkeys page (RESEARCH Page 2, schema lines
+/// 1786–1963 webauthn/passkey, 1546–1625 code).
+///
+/// Uses `origins` (array), NOT the deprecated singular `origin` (line 1824).
+pub const KRATOS_PASSWORDLESS: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "passwordless",
+    allowed_paths: &[
+        "/selfservice/methods/passkey/config/rp/id",
+        "/selfservice/methods/passkey/config/rp/display_name",
+        "/selfservice/methods/passkey/config/rp/origins",
+        "/selfservice/methods/webauthn/config/passwordless",
+        "/selfservice/methods/webauthn/config/rp/id",
+        "/selfservice/methods/webauthn/config/rp/display_name",
+        "/selfservice/methods/webauthn/config/rp/origins",
+        "/selfservice/methods/code/passwordless_enabled",
+    ],
+};
+
+/// AUTH-03 — Two-Factor / MFA page (RESEARCH Page 3, schema lines 1752–1903
+/// totp/lookup_secret/webauthn, 1235/2801 required_aal, `featureRequiredAal`
+/// def 877–883).
+///
+/// CONTEXT CORRECTION: the `required_aal` enum is `["aal1","highest_available"]`
+/// (schema line 881) — NOT `highest_aal`. The literal `highest_aal` MUST NOT
+/// appear anywhere in this const.
+pub const KRATOS_MFA: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "mfa",
+    allowed_paths: &[
+        "/selfservice/methods/totp/enabled",
+        "/selfservice/methods/totp/config/issuer",
+        "/selfservice/methods/lookup_secret/enabled",
+        "/selfservice/methods/webauthn/enabled",
+        "/selfservice/methods/code/mfa_enabled",
+        "/selfservice/flows/login/required_aal",
+        "/session/whoami/required_aal",
+    ],
+};
+
+/// AUTH-06 — Sessions page (RESEARCH Page 5, schema lines 2792–2904).
+///
+/// The real Sessions page. The Phase-4 proof const `KRATOS_SESSION` (section
+/// `session`) stays untouched and registered; this NEW const owns section
+/// `sessions`. `/session/whoami/required_aal` is shared with the MFA page — the
+/// canonical EDIT owner in the UI is the MFA page (RESEARCH Open Q2 / Pitfall 7);
+/// both backend allowlists may list it harmlessly (the engine merges one doc).
+pub const KRATOS_SESSIONS: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "sessions",
+    allowed_paths: &[
+        "/session/lifespan",
+        "/session/cookie/persistent",
+        "/session/cookie/same_site",
+        "/session/cookie/domain",
+        "/session/cookie/path",
+        "/session/cookie/name",
+        "/session/whoami/required_aal",
+        "/session/earliest_possible_extend",
+    ],
+};
+
+/// AUTH-07 — Account Recovery page (RESEARCH Page 6, schema lines 1394–1440
+/// flow, 1515–1544 link method, 1546+ code method).
+///
+/// `recovery.use` enum is `[link,code]` (line 1431, default `code`). `ui_url`
+/// is OMITTED — owned by BRAND-02/Phase-10 (RESEARCH A4).
+pub const KRATOS_RECOVERY: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "recovery",
+    allowed_paths: &[
+        "/selfservice/flows/recovery/enabled",
+        "/selfservice/flows/recovery/use",
+        "/selfservice/flows/recovery/lifespan",
+        "/selfservice/flows/recovery/notify_unknown_recipients",
+        "/selfservice/methods/code/enabled",
+        "/selfservice/methods/link/enabled",
+    ],
+};
+
+/// AUTH-08 — Account Verification page (RESEARCH Page 7, schema lines 1346–1392).
+///
+/// `verification.use` enum is `[link,code]`. `ui_url` is OMITTED (BRAND-02/P10,
+/// RESEARCH A4).
+pub const KRATOS_VERIFICATION: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "verification",
+    allowed_paths: &[
+        "/selfservice/flows/verification/enabled",
+        "/selfservice/flows/verification/use",
+        "/selfservice/flows/verification/lifespan",
+        "/selfservice/flows/verification/notify_unknown_recipients",
+    ],
+};
+
+/// AUTH-09 (non-secret half) — Email / SMTP page (RESEARCH Page 8, schema lines
+/// 2165–2233).
+///
+/// The non-secret SMTP keys only. `/courier/smtp/connection_uri` is DELIBERATELY
+/// ABSENT — it is on the hard `SENSITIVE_PREFIXES` denylist (Pitfall 2/3) and gets
+/// a dedicated write-only handler in Plan 02. Listing it here would be a no-op
+/// (Gate-1 denylist wins) but the omission keeps intent explicit.
+pub const KRATOS_SMTP: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "smtp",
+    allowed_paths: &[
+        "/courier/smtp/from_address",
+        "/courier/smtp/from_name",
+        "/courier/smtp/headers",
+        "/courier/smtp/local_name",
+        "/courier/smtp/client_cert_path",
+        "/courier/smtp/client_key_path",
+    ],
+};
+
 /// Code-defined registry of every shipped section allowlist. The lookup is the
 /// ONLY way to obtain an allowlist — it is never assembled from client input.
 const REGISTRY: &[&SectionAllowlist] = &[&KRATOS_SESSION];
