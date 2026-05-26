@@ -47,7 +47,7 @@ describe("Authentication / Sessions (/authentication/sessions)", () => {
     await userEvent.click(screen.getByRole("button", { name: /save/i }));
 
     expect(
-      await screen.findByText(/duration like|invalid duration|e\.g\./i),
+      await screen.findByText(/enter a duration, e\.g\. 24h/i),
     ).toBeInTheDocument();
     const putCall = apiMock.mock.calls.find(
       (c) => (c[1] as RequestInit | undefined)?.method === "PUT",

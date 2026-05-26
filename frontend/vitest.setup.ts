@@ -21,6 +21,18 @@ if (typeof window !== "undefined" && !window.matchMedia) {
   }));
 }
 
+// jsdom does not implement `ResizeObserver`, which some Radix UI primitives
+// (via @radix-ui/react-use-size) construct on mount. Provide a no-op class so
+// component tests can render those primitives without a "ResizeObserver is not
+// defined" crash. Resize behavior is not under test here.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+}
+
 // jsdom does not implement the PointerEvent capture API or `scrollIntoView`,
 // which Radix UI primitives (e.g. the shadcn Select used in the schema editor)
 // call on open. Provide no-op shims so component tests can drive a Radix Select
