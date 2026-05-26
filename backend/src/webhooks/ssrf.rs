@@ -54,13 +54,30 @@ fn is_blocked_v4(ip: Ipv4Addr) -> bool {
     ip.is_loopback()            // 127.0.0.0/8
         || ip.is_private()      // 10/8, 172.16/12, 192.168/16 (covers the docker bridge)
         || ip.is_link_local()   // 169.254.0.0/16 — INCLUDES 169.254.169.254 cloud metadata
-        || ip.is_unspecified()  // 0.0.0.0
+        || ip.is_unspecified()  // 0.0.0.0 (also covered by is_this_network_v4 below)
         || ip.is_broadcast()    // 255.255.255.255
         || ip.is_multicast()    // 224/4
         || ip.is_documentation()// 192.0.2/24, 198.51.100/24, 203.0.113/24
         // --- gaps std doesn't classify on STABLE 1.95 ---
+        || is_this_network_v4(ip) // 0.0.0.0/8 (RFC 1122) — is_unspecified() only catches 0.0.0.0
+        || is_reserved_v4(ip)   // 240.0.0.0/4 (RFC 1112 class E) — is_reserved() is nightly-only
         || is_shared_cgnat(ip)  // 100.64.0.0/10 (RFC 6598) — is_shared() is nightly-only
         || is_benchmarking_v4(ip) // 198.18.0.0/15 (RFC 2544) — is_benchmarking() nightly-only
+}
+
+/// 0.0.0.0/8 (RFC 1122 "this network"). `is_unspecified()` matches ONLY the
+/// exact 0.0.0.0; the rest of the /8 (e.g. 0.1.2.3) is a known SSRF bypass
+/// because Linux kernels commonly route 0.x.x.x to the local host. Manual octet
+/// check because std has no stable classifier for the full block.
+fn is_this_network_v4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 0
+}
+
+/// 240.0.0.0/4 (RFC 1112 class E, reserved/future). Manual because
+/// `is_reserved()` is nightly-only on stable 1.95. The broadcast 255.255.255.255
+/// also falls in here but is independently caught by `is_broadcast()`.
+fn is_reserved_v4(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] >= 240
 }
 
 /// 100.64.0.0/10 (RFC 6598 carrier-grade NAT). Manual because `is_shared()` is
@@ -190,7 +207,15 @@ mod tests {
             ("cloud metadata", IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), true),
             ("link-local v4", IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1)), true),
             ("unspecified v4", IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), true),
+            // WR-01: the FULL 0.0.0.0/8 "this network" block, not just 0.0.0.0.
+            ("this-network 0.0.0.1", IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1)), true),
+            ("this-network 0.1.2.3", IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3)), true),
+            ("this-network 0.255.255.255", IpAddr::V4(Ipv4Addr::new(0, 255, 255, 255)), true),
             ("broadcast", IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), true),
+            // WR-01: 240.0.0.0/4 reserved (class E), incl. the 255.255.255.255 edge.
+            ("reserved 240.0.0.1", IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)), true),
+            ("reserved 255.0.0.0", IpAddr::V4(Ipv4Addr::new(255, 0, 0, 0)), true),
+            ("reserved 254.254.254.254", IpAddr::V4(Ipv4Addr::new(254, 254, 254, 254)), true),
             ("multicast v4", IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), true),
             ("documentation", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), true),
             ("CGNAT 100.64/10", IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), true),
