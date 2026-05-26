@@ -949,6 +949,113 @@ The gate exits `0` only when:
 
 ---
 
+## Feature toggles (Phase 12)
+
+Console v2 features are gated by **DB-backed feature flags**, the single
+console-owned source of truth for which optional features are enabled. The flags
+live in the `feature_flags` table (migration `0007`, in the backend's own
+`console` Postgres schema) — one row per known feature: `key`, `enabled`,
+`updated_at`.
+
+### Seeded defaults
+
+The migration seeds the known set idempotently (`ON CONFLICT DO NOTHING`, so a
+re-run or partial-apply on an existing volume leaves operator toggles intact):
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `saml` | **OFF** | External-setup feature (Phase 13/14) |
+| `organizations` | **OFF** | External-setup feature (Phase 14) |
+| `account_experience` | **OFF** | External-setup feature (Phase 15) |
+| `observability` | **OFF** | `requires_runtime` — store-only this phase (see below) |
+| `event_streams` | **OFF** | External-setup feature (Phase 17) |
+| `opl_live_validation` | **ON** | The one in-place enhancement, on by default |
+
+The human **label** and the `requires_runtime` marker are **not** columns — they
+live in a code-side `FEATURE_META` constant map in `backend/src/features/mod.rs`,
+so adding a flag later is a code + seed edit, not a schema migration.
+
+### Management surface + API contract
+
+The operator manages flags from the **`/project/features`** page — a Switch list
+where each toggle fires immediately (optimistic, no Save button). It talks only
+to the backend through `lib/api.ts` (same-origin, CSRF-echoed; no Ory egress).
+
+- `GET /api/console/features` — returns the seeded set joined with metadata:
+  `{ "features": { "<key>": { "enabled": bool, "label": string, "requires_runtime"?: true } } }`.
+  Authenticated (`auth_guard` → `401` unauth); GET, so CSRF-exempt.
+- `PUT /api/console/features/{key}` — body `{ "enabled": bool }`; toggles the flag,
+  refreshes the in-process cache, and returns the new state. State-changing, so it
+  requires `X-CSRF-Token` (`csrf_guard` → `403`) and is **auto-audited** by the
+  response-phase audit hoop (actor read from the **session**, never client input).
+  An **unknown key returns `404`** — the handler never creates an arbitrary row
+  from caller input. These management routes are themselves **never** flag-gated
+  (they manage the flags).
+
+### Enforcement is SERVER-SIDE (the keystone)
+
+Gating is **not** a hidden nav item. Each gated feature's protected route sits
+behind a parameterized `FeatureFlagHoop` mounted **inside** the protected subtree,
+**after** `auth_guard` and `csrf_guard`. When the flag is OFF the hoop returns
+**`404`** (not `403`, so a disabled feature does not advertise its existence) and
+short-circuits — so a flag-OFF route is unreachable **even with a valid session
+cookie and a matching `X-CSRF-Token`**. The cache is **fail-closed**: any miss or
+poisoned lock reads as disabled, and it is loaded at boot (after migrate, before
+serve) so no gated route is ever reachable with an empty cache. The frontend
+nav-hide + `FeatureGate` wrapper are additive cosmetics only; the authoritative
+gate is always the backend hoop.
+
+The previous **`GatedFeature` "requires Enterprise License"** pattern has been
+**retired** (`FLAG-03`): the live acceptance gate asserts no `GatedFeature` /
+`gated-feature` import remains anywhere in the frontend. Its former pages
+(SAML, Organizations, Event streams, and the three branding pages) are now neutral
+`FeatureGate` placeholders that real implementations land into in Phases 13–17.
+
+### `requires_runtime` is store-only this phase
+
+A flag marked `requires_runtime` (currently only `observability`) needs a runtime
+component — a compose profile — to be running. **This phase only STORES that
+marker**: turning such a flag ON persists the toggle and returns `2xx`, and it
+**never `502`s** — there is no health-probe or proxy path here. Phase 16 wires the
+profile health probe for `observability`; until then the marker is purely
+informational (the `/project/features` page shows a hint when a runtime-dependent
+flag is ON).
+
+### Verifying Phase 12 — Feature toggles (`FLAG-01..04`)
+
+A single fail-closed gate brings up the full stack, proves every requirement
+end-to-end, **re-runs the three v1 invariants** (INFRA-05 / BACK-05 / BACK-01),
+and tears the stack down cleanly afterward:
+
+```bash
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase12-acceptance.sh   # Git Bash on Windows
+# (the gate does the full build -> up --wait -> drive -> down -v itself;
+#  pass KEEP_STACK=1 to keep the stack up for debugging)
+```
+
+The gate exits `0` only when:
+
+- **`FLAG-01` (keystone).** With `saml` seeded OFF, a `POST /api/features/_probe`
+  carrying a **valid session cookie AND a matching `X-CSRF-Token`** returns **`404`**
+  (never `401`/`403`/`200`) — server-side enforcement past both guards. Flipping
+  `saml` ON makes the same gated route serve `200`; restoring it OFF re-closes the
+  gate (the toggle is live, not cached-open). `saml` is restored to its seeded
+  default at the end.
+- **`FLAG-02`.** `GET /api/console/features` returns all six seeded keys, each with
+  `enabled` + a `label`; `observability` carries `requires_runtime:true`.
+- **`FLAG-04`.** A `PUT` flips a flag and a re-GET reflects it; an **unknown key →
+  `404`**; `observability=true` returns `2xx` and **never `502`**; the toggle is
+  recorded in the **audit log** with the authenticated admin as the actor.
+- **`FLAG-03`.** No `GatedFeature` / `gated-feature` import remains in the frontend.
+- **v1 invariants.** No Ory Admin port is host-published (`INFRA-05`); restarts
+  route only through the scoped socket-proxy and the backend holds no socket
+  (`BACK-05`); the **bundle-egress** gate is clean (`BACK-01`).
+- **Negatives.** Unauthenticated `GET` is refused `401`; an authenticated `PUT`
+  without `X-CSRF-Token` is refused `403`. Every negative passes ONLY on the
+  explicit refusal.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
