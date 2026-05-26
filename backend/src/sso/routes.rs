@@ -8,11 +8,16 @@
 //! session) — we add NO second audit path.
 //!
 //! ## create_connection (POST api/sso/connections)
-//!   1. (SSO-04) if a `metadataUrl` is supplied, call `ssrf::validate_url` FIRST
-//!      (internal/credentialed host → 422, NO fetch). The PREFERRED path is the
-//!      operator-uploaded XML (base64 `encodedRawMetadata`, no fetch at all).
-//!   2. (SSO-02) `metadata::require_signing_cert` on the uploaded XML BEFORE any
-//!      Polis POST → 422 if no signing cert.
+//!   1. (SSO-04 / CR-01) if a `metadataUrl` is supplied, the BACKEND fetches it
+//!      itself through the authoritative SSRF-guarded client (`ssrf::build_pinned_client`
+//!      — re-resolve + address-pin + redirects OFF) under a byte cap; Polis is NEVER
+//!      handed the URL. A blocked host / fetch failure → value-free 422 on
+//!      `metadata_url`, NO Polis call. The PREFERRED path is operator-uploaded XML
+//!      (base64 `encodedRawMetadata`, no fetch at all). Both paths converge on the
+//!      fetch-free `Encoded` Polis source.
+//!   2. (SSO-02) `metadata::require_signing_cert` on the XML (uploaded OR fetched)
+//!      BEFORE any Polis POST → 422 if no signing cert (WR-03: enforced on the URL
+//!      path too, now that the backend holds the fetched XML).
 //!   3. `POST /api/v1/sso` (Api-Key) → a `Connection { clientID, clientSecret, … }`.
 //!   4. (SSO-03) write a Kratos `provider: generic` entry via the AUTH-04
 //!      `providers[]` array-root path: stable id `saml-<tenant>`, issuer_url = the
