@@ -1,12 +1,13 @@
 import type { LucideIcon } from "lucide-react";
 import {
-  Activity,
   Cookie,
   FileCode2,
   Fingerprint,
+  Inbox,
   KeyRound,
   Link2,
   Mail,
+  MonitorSmartphone,
   Palette,
   RefreshCw,
   Route,
@@ -52,15 +53,25 @@ export type NavGroup = {
 
 export const NAV_GROUPS: NavGroup[] = [
   {
-    label: "Overview",
+    // Phase 10 — the "Activity" group (10-UI-SPEC §G). Sessions is the Kratos
+    // session DataTable (list/filter/detail/revoke); Courier Messages is the
+    // read-only courier delivery-log DataTable. Both `built: true`. (The
+    // Branding group is owned by Plans 02/03 and stays a placeholder here.)
+    label: "Activity",
     items: [
       {
-        slug: "activity",
-        label: "Activity",
-        href: "/activity",
-        icon: Activity,
-        built: false,
-        comingIn: "Phase 10",
+        slug: "activity-sessions",
+        label: "Sessions",
+        href: "/activity/sessions",
+        icon: MonitorSmartphone,
+        built: true,
+      },
+      {
+        slug: "activity-courier",
+        label: "Courier Messages",
+        href: "/activity/courier",
+        icon: Inbox,
+        built: true,
       },
     ],
   },

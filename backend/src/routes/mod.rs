@@ -248,6 +248,30 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
                 .put(crate::ory::kratos::update_identity) // IDENT-02 update (state required)
                 .delete(crate::ory::kratos::delete_identity), // IDENT-02 delete
         )
+        // Phase 10 (ACT-01 / ACT-02) Kratos Activity data path: sessions
+        // (list/detail/single-session revoke) + courier messages (list/detail,
+        // read-only). All inherit `auth_guard` (401 unauth); GET (list/detail) is
+        // csrf-exempt, while the session-revoke DELETE requires `X-CSRF-Token` via
+        // `csrf_guard` (T-10-revoke — `lib/api.ts` echoes it, no new wiring).
+        // Revoke calls `disable_session` (single-session deactivate), NEVER the
+        // all-sessions delete (Pitfall 4). Courier is read-only — list + get only.
+        .push(
+            Router::with_path("api/kratos/sessions")
+                .get(crate::ory::kratos::list_sessions), // ACT-01 list (active filter + cursor)
+        )
+        .push(
+            Router::with_path("api/kratos/sessions/{id}")
+                .get(crate::ory::kratos::get_session) // ACT-01 detail (identity + devices)
+                .delete(crate::ory::kratos::disable_session), // ACT-01 revoke (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/kratos/courier/messages")
+                .get(crate::ory::kratos::list_courier_messages), // ACT-02 list (status/recipient)
+        )
+        .push(
+            Router::with_path("api/kratos/courier/messages/{id}")
+                .get(crate::ory::kratos::get_courier_message), // ACT-02 detail (read-only)
+        )
         // Phase 8 (OAUTH2-01) Hydra OAuth2 client data path. All inherit
         // `auth_guard` (401 unauth); GET is csrf-exempt, while POST/PUT/DELETE
         // require `X-CSRF-Token` via `csrf_guard` (T-08-AUTHZ — `lib/api.ts`
