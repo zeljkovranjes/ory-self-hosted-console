@@ -13,11 +13,17 @@
 -- Mounted via: ./db/init:/docker-entrypoint-initdb.d:ro
 -- Connection:  runs as the super-user defined by POSTGRES_USER.
 --
--- This script creates the five logical databases (INFRA-02) and, as a
+-- This script creates the logical databases (INFRA-02) and, as a
 -- production-grade hardening (RESEARCH Open Question 2 / Assumption A3),
 -- one least-privilege role per DB-backed service database. Each role's
 -- password is a placeholder here; Plan 04 wires the real values via env/.env
 -- so no real secret is committed to git (threat T-01-leastpriv / T-01-secrets).
+--
+-- NOTE on `polis` (Phase 13, SSO-01): Ory Polis (BoxyHQ Jackson) is the
+-- SAML→OAuth2 bridge service. Unlike `oathkeeper`, Polis IS DB-backed
+-- (DB_ENGINE=sql, DB_TYPE=postgres), so it gets a real least-privilege login
+-- role + grants + public-schema ownership, mirroring kratos/hydra/keto/console.
+-- Polis owns its own schema/migrations at boot, so NO table DDL is added here.
 --
 -- NOTE on the `oathkeeper` database (RESEARCH Assumption A4): Oathkeeper is
 -- stateless by default (rules + JWKS come from files), so this DB is created
@@ -29,13 +35,14 @@
 -- migrations. Do NOT add any table DDL for the console database in this script.
 
 -- ---------------------------------------------------------------------------
--- 1. Databases (exactly five — INFRA-02)
+-- 1. Databases (INFRA-02)
 -- ---------------------------------------------------------------------------
 CREATE DATABASE kratos;
 CREATE DATABASE hydra;
 CREATE DATABASE keto;
 CREATE DATABASE oathkeeper;   -- forward-compat only; Oathkeeper is stateless in this milestone
 CREATE DATABASE console;      -- Rust backend's own state (schema owned by Phase 2 sqlx migrations)
+CREATE DATABASE polis;        -- Ory Polis (SAML bridge, Phase 13 SSO-01); Polis self-migrates at boot
 
 -- ---------------------------------------------------------------------------
 -- 2. Per-database least-privilege roles (production-grade hardening — A3)
@@ -50,6 +57,7 @@ CREATE ROLE kratos  WITH LOGIN PASSWORD 'changeme_kratos';
 CREATE ROLE hydra   WITH LOGIN PASSWORD 'changeme_hydra';
 CREATE ROLE keto    WITH LOGIN PASSWORD 'changeme_keto';
 CREATE ROLE console WITH LOGIN PASSWORD 'changeme_console';
+CREATE ROLE polis   WITH LOGIN PASSWORD 'changeme_polis';   -- Phase 13: real value via POLIS_DB_PASSWORD in .env
 -- No role for the oathkeeper database: it is unused (stateless service, A4).
 
 -- ---------------------------------------------------------------------------
@@ -68,6 +76,7 @@ GRANT CONNECT, CREATE ON DATABASE kratos  TO kratos;
 GRANT CONNECT, CREATE ON DATABASE hydra   TO hydra;
 GRANT CONNECT, CREATE ON DATABASE keto    TO keto;
 GRANT CONNECT, CREATE ON DATABASE console TO console;
+GRANT CONNECT, CREATE ON DATABASE polis   TO polis;
 
 -- ---------------------------------------------------------------------------
 -- 4. Per-database `public` schema ownership (REQUIRED on Postgres 15+).
@@ -98,3 +107,7 @@ GRANT ALL ON SCHEMA public TO keto;
 \connect console
 ALTER SCHEMA public OWNER TO console;
 GRANT ALL ON SCHEMA public TO console;
+
+\connect polis
+ALTER SCHEMA public OWNER TO polis;
+GRANT ALL ON SCHEMA public TO polis;
