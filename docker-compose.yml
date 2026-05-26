@@ -334,8 +334,11 @@ services:
       # restart endpoint is normally called with `?t=<seconds>` (graceful stop
       # timeout) and, on newer engines, `?signal=`. wollomatic auto-anchors with
       # ^...$, so without `(\?.*)?` a real `.../restart?t=10` call is denied 403.
-      # Still scoped to ONLY the four ory-* containers + the restart verb.
-      - '-allowPOST=/v1\..{1,2}/containers/(ory-kratos|ory-hydra|ory-keto|ory-oathkeeper)/restart(\?.*)?'
+      # Still scoped to ONLY the allowed containers + the restart verb.
+      # Phase 13 (BACK-05): `polis` appended to the container-name group ONLY —
+      # the verb (/restart) and path scope are unchanged. The backend still holds
+      # NO Docker socket; restarting Polis goes through this scoped allowlist.
+      - '-allowPOST=/v1\..{1,2}/containers/(ory-kratos|ory-hydra|ory-keto|ory-oathkeeper|polis)/restart(\?.*)?'
     volumes:
       # ONLY container with the socket — mounted read-only.
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -490,6 +493,71 @@ services:
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     networks: [edge]
+
+  # ===========================================================================
+  # Ory Polis (SAML→OAuth2 bridge — Phase 13, SSO-01).
+  #
+  # Ory Polis IS BoxyHQ Jackson, re-versioned into the Ory v26.2.0 line. The
+  # `ory/polis` Docker Hub repo is 404 (verified 2026-05-26); the registry-
+  # pullable, v26.2.0-line image is `boxyhq/jackson:26.2.0` (manifest HTTP 200,
+  # re-verified at execution via `docker manifest inspect`). NO :latest (INFRA-04).
+  #
+  # Node/Next image (NOT Go/distroless like the Ory services) — it HAS a shell,
+  # so a node-fetch CMD-SHELL healthcheck on /api/health works (same pattern as
+  # the frontend above). Polis self-migrates at boot, so there is NO polis-migrate
+  # one-shot (unlike the Ory services).
+  #
+  # Dual-homed (D-01): `internal` so Kratos + the backend reach its OIDC/admin
+  # surface server-side, and `edge` so the browser reaches the issuer redirect/
+  # login endpoints (the split-horizon issuer constraint). CRITICAL: NO `ports:`
+  # block — the admin/OIDC port 5225 is NEVER host-published (INFRA-05); the
+  # browser reaches the public issuer through the operator's edge reverse proxy.
+  #
+  # All secrets (DB_ENCRYPTION_KEY, API_KEYS, NEXTAUTH_SECRET, OPENID_RSA_*) are
+  # injected from .env via `${VAR:?}` — never inlined (BACK-07 write-only posture).
+  # DB_ENCRYPTION_KEY + OPENID_RSA_PRIVATE_KEY are IMMUTABLE after first boot
+  # (rotating either strands encrypted rows / invalidates issued tokens).
+  # ===========================================================================
+  polis:
+    image: boxyhq/jackson:26.2.0
+    container_name: polis              # MUST match Service::Polis.container() (13-02) + broker regex
+    environment:
+      DB_ENGINE: sql
+      DB_TYPE: postgres
+      DB_URL: postgres://polis:${POLIS_DB_PASSWORD:?set POLIS_DB_PASSWORD}@postgres:5432/polis?sslmode=disable
+      # 32-byte base64; write-only (BACK-07), IMMUTABLE after first boot (Pitfall 5).
+      DB_ENCRYPTION_KEY: ${POLIS_DB_ENCRYPTION_KEY:?set POLIS_DB_ENCRYPTION_KEY}
+      # Admin-API auth (Authorization: Api-Key) — the backend is the sole client (Phase 14).
+      # Use API_KEYS, NOT the deprecated JACKSON_API_KEYS alias.
+      API_KEYS: ${POLIS_API_KEY:?set POLIS_API_KEY}
+      # Single public issuer URL — reachable identically by the browser AND by
+      # Kratos server-side (split-horizon, Pattern A). All OIDC/discovery endpoints
+      # are derived from this one base.
+      EXTERNAL_URL: ${POLIS_EXTERNAL_URL:?set POLIS_EXTERNAL_URL}
+      NEXTAUTH_URL: ${POLIS_EXTERNAL_URL}
+      NEXTAUTH_SECRET: ${POLIS_NEXTAUTH_SECRET:?set POLIS_NEXTAUTH_SECRET}
+      OPENID_RSA_PRIVATE_KEY: ${POLIS_OPENID_RSA_PRIVATE_KEY:?set POLIS_OPENID_RSA_PRIVATE_KEY}
+      OPENID_RSA_PUBLIC_KEY: ${POLIS_OPENID_RSA_PUBLIC_KEY:?set POLIS_OPENID_RSA_PUBLIC_KEY}
+      OPENID_REDIRECT_EXACT_MATCH: "true"   # hardening (added in v26.2.0)
+      HOST_URL: 0.0.0.0
+      HOSTNAME: 0.0.0.0
+      PORT: "5225"
+      BOXYHQ_NO_TELEMETRY: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Polis is a Node image (has a shell + global fetch); probe /api/health
+      # (200 healthy, 5xx unhealthy) over loopback — same node-fetch shape as the
+      # frontend. If a runtime build lacks global fetch, swap to wget.
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5225/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    # internal: Kratos + backend reach; edge: browser reaches the issuer.
+    networks: [internal, edge]
+    # NO ports: — admin/OIDC port 5225 stays internal-only (INFRA-05).
 
   # ===========================================================================
   # Echo receiver (Phase 11 — TEST/CI ONLY, gated behind the `acceptance`
