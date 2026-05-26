@@ -688,14 +688,18 @@ else
 fi
 
 # =============================================================================
-# SSO-04 — a metadataUrl to an internal host / credentialed URL is SSRF-rejected,
-# with NO fetch. The SSRF guard returns BadRequest (400) — an explicit 4xx
-# refusal (the implementation's status; see the gate note). Anti-false-green:
-# PASS only on an explicit 4xx, FAIL on 2xx or a connection error.
+# SSO-04 (CR-01/WR-02/WR-03 fix-proving) — a metadataUrl is now fetched BY THE
+# BACKEND through the authoritative SSRF-guarded client (re-resolve + address-pin
+# + redirects OFF); Polis is NEVER handed the URL. An internal/credentialed/
+# loopback host is rejected with an explicit **422** (AppError::Validation keyed on
+# metadata_url, so the form surfaces it verbatim — WR-02), and the signing-cert
+# pre-flight now runs on the fetched XML too (WR-03). Anti-false-green: PASS only
+# on an explicit 422, FAIL on 2xx, on a 400 (the OLD pre-fix status — its presence
+# would mean the verbatim-422 remap regressed), or on a connection error.
 # =============================================================================
 echo
 echo "============================================================"
-echo " SSO-04 — metadataUrl SSRF reject (internal / credentialed, no fetch)"
+echo " SSO-04 — metadataUrl SSRF reject via BACKEND fetch (422, no Polis fetch)"
 echo "============================================================"
 
 _make_url_body() {
@@ -712,21 +716,28 @@ _make_url_body() {
 
 _assert_ssrf_reject() {
   # $1=label $2=metadata_url
+  # The fix maps the SSRF/fetch reject to a 422 keyed on metadata_url (WR-02). We
+  # assert 422 SPECIFICALLY: a 400 here would mean the verbatim-422 remap regressed
+  # (the pre-fix behavior), and a 2xx would mean the backend-fetch SSRF guard
+  # leaked. Either is an explicit FAIL (anti-false-green).
   local label="$1" url="$2" body code
   body="$(_make_url_body "ssrf-probe" "$url")"
   code="$(_auth_mut_code POST "$SSO_CONN_URL" "$body")"
   case "$code" in
-    400|422)
-      _pass "[SSO-04] metadataUrl '${label}' -> ${code} (SSRF-rejected, explicit 4xx, no fetch)"
+    422)
+      _pass "[SSO-04] metadataUrl '${label}' -> 422 (BACKEND-fetch SSRF reject, verbatim metadata_url field error; Polis never fetched)"
+      ;;
+    400)
+      _fail "[SSO-04] metadataUrl '${label}' -> 400 (WR-02 regression: SSRF reject must be a verbatim 422, not a generic 400)"
       ;;
     "")
-      _fail "[SSO-04] metadataUrl '${label}' -> no response (connection error; want an explicit 4xx)"
+      _fail "[SSO-04] metadataUrl '${label}' -> no response (connection error; want an explicit 422)"
       ;;
     2*)
-      _fail "[SSO-04] metadataUrl '${label}' -> ${code} (ACCEPTED — the SSRF guard LEAKED)"
+      _fail "[SSO-04] metadataUrl '${label}' -> ${code} (ACCEPTED — the backend-fetch SSRF guard LEAKED)"
       ;;
     *)
-      _fail "[SSO-04] metadataUrl '${label}' -> ${code} (want an explicit 4xx SSRF reject)"
+      _fail "[SSO-04] metadataUrl '${label}' -> ${code} (want an explicit 422 SSRF reject)"
       ;;
   esac
 }
@@ -736,6 +747,16 @@ _assert_ssrf_reject "http://kratos:4434 (internal Ory admin)" "http://kratos:443
 _assert_ssrf_reject "http://169.254.169.254 (cloud metadata)" "http://169.254.169.254/latest/meta-data"
 _assert_ssrf_reject "credentialed userinfo URL" "http://user:pass@idp.example.test/metadata"
 _assert_ssrf_reject "loopback literal" "http://127.0.0.1/metadata"
+# CR-01 fix-proving: a metadataUrl whose host resolves to an internal docker
+# address (the Polis admin itself) — the EXACT SSRF-by-proxy target the old
+# delegate-to-Polis path enabled. The backend's own pinned re-resolve must refuse
+# it BEFORE any fetch, proving Polis is no longer the fetcher.
+_assert_ssrf_reject "http://polis:5225 (internal Polis admin — the by-proxy target)" "http://polis:5225/api/v1/sso"
+
+# CR-01/WR-03 fix-proving: a metadataUrl that points at the backend's OWN internal
+# port (resolves to a private docker IP) is refused by the backend-fetch guard.
+# This is the channel that, pre-fix, Polis would have fetched server-side.
+_assert_ssrf_reject "http://backend:8080 (internal backend port)" "http://backend:8080/health"
 
 # Confirm the SSRF probe never created a connection (no fetch, no side effect).
 ssrf_count="$(_connection_count "ssrf-probe")"
@@ -743,6 +764,41 @@ if [ "$ssrf_count" = "EMPTY" ] || [ "$ssrf_count" = "0" ]; then
   _pass "[SSO-04] no Polis connection exists for the SSRF probe tenant (the reject was before any fetch/create)"
 else
   _fail "[SSO-04] expected NO connection for ssrf-probe (got count='$ssrf_count')"
+fi
+
+# -----------------------------------------------------------------------------
+# WR-03 fix-proving — a URL-sourced metadata document with NO signing cert is
+# rejected (422) and NEVER creates a connection. Pre-fix the URL path was handed
+# straight to Polis and the backend NEVER saw the XML, so there was zero
+# console-side signing-cert enforcement on URL-sourced connections (a reassuring
+# thumbprint could be shown for a connection with no verified signing cert).
+#
+# The SSO create path always uses the PRODUCTION SSRF posture (build_pinned_client
+# with allow_private=false), so to actually reach the signing-cert pre-flight the
+# fetch must target a PUBLIC, fetchable host whose document carries no SAML signing
+# cert. We use https://example.com/ (stable IANA-reserved example host, returns
+# HTML — definitively no <KeyDescriptor use="signing"> X509Certificate).
+#
+# Outcome is deterministic in VERDICT regardless of egress: if the host is
+# reachable, the backend fetches it and the signing-cert pre-flight rejects the
+# CA-less HTML -> 422; if outbound egress is unavailable in the CI sandbox, the
+# backend fetch fails -> also 422 (value-free metadata_url field error). In BOTH
+# cases the result is an explicit 422 and NEVER a created connection. A 2xx would
+# mean a CA-less URL-sourced doc created a connection (the WR-03 hole) -> FAIL.
+echo
+echo "--- [WR-03] a URL-sourced CA-less (public) metadata document is rejected 422; no connection created ---"
+caless_url_body="$(_make_url_body "caless-url-probe" "https://example.com/")"
+caless_url_code="$(_auth_mut_code POST "$SSO_CONN_URL" "$caless_url_body")"
+case "$caless_url_code" in
+  422) _pass "[WR-03] URL-sourced CA-less metadata -> 422 (signing-cert pre-flight / fetch guard reached on the URL path — no longer a CA blind spot)";;
+  2*)  _fail "[WR-03] URL-sourced CA-less metadata -> ${caless_url_code} (ACCEPTED — no signing-cert enforcement on the URL path)";;
+  *)   _fail "[WR-03] URL-sourced CA-less metadata -> '${caless_url_code}' (want an explicit 422 reject)";;
+esac
+caless_url_count="$(_connection_count "caless-url-probe")"
+if [ "$caless_url_count" = "EMPTY" ] || [ "$caless_url_count" = "0" ]; then
+  _pass "[WR-03] no Polis connection exists for the URL-sourced CA-less probe (rejected before any Polis create)"
+else
+  _fail "[WR-03] expected NO connection for caless-url-probe (got count='$caless_url_count')"
 fi
 
 # =============================================================================
@@ -911,6 +967,36 @@ case "$DANGLE_VERDICT" in
   REMOVED)  _pass "[two-sided] the Kratos providers[] entry '${PROVIDER_ID}' is REMOVED (no dangling provider)";;
   DANGLING) _fail "[two-sided] the Kratos providers[] entry '${PROVIDER_ID}' STILL EXISTS after delete (DANGLING provider)";;
   *)        _fail "[two-sided] could not read kratos.yml after delete (verdict='$DANGLE_VERDICT')";;
+esac
+
+# -----------------------------------------------------------------------------
+# CR-02 fix-proving — the two-sided delete is idempotent / retry-safe. After the
+# delete above, the Polis connection is ALREADY GONE — this is exactly the state a
+# retry hits after a partial failure (Kratos cleaned, Polis gone). Pre-fix, a
+# second delete 502'd (Polis 404 -> Upstream) BEFORE the Kratos cleanup ran, so a
+# half-finished delete could never be completed through the endpoint, leaving a
+# dangling provider. Post-fix, the Polis delete treats a 404 as success and the
+# Kratos side runs FIRST, so a retry returns 2xx and leaves NO dangling provider.
+echo
+echo "--- [CR-02] a RETRY of DELETE on the already-gone connection succeeds (idempotent; Polis 404 = success) ---"
+retry_del_code="$(_auth_mut_code DELETE "${SSO_CONN_URL}/${GOOD_TENANT}")"
+case "$retry_del_code" in
+  200|204) _pass "[CR-02] retry DELETE api/sso/connections/${GOOD_TENANT} -> $retry_del_code (idempotent; a Polis 404 is treated as already-deleted)";;
+  502)     _fail "[CR-02] retry DELETE -> 502 (Polis 404 -> Upstream; the partial-failure recovery path is BROKEN — pre-fix behavior)";;
+  *)        _fail "[CR-02] retry DELETE -> '$retry_del_code' (want 2xx idempotent success)";;
+esac
+# After the idempotent retry, the Kratos provider entry must STILL be absent (the
+# retry must not re-introduce or strand a dangling provider).
+KRATOS_YML_RETRY="$(cat "${REPO_ROOT}/config/kratos/kratos.yml" 2>/dev/null || true)"
+RETRY_DANGLE="$(printf '%s' "$KRATOS_YML_RETRY" | PID="$PROVIDER_ID" node -e '
+  const txt = require("fs").readFileSync(0, "utf8");
+  const pid = process.env.PID;
+  if (!txt.trim()) { process.stdout.write("NO_KRATOS_YML"); process.exit(0); }
+  process.stdout.write(txt.includes(pid) ? "DANGLING" : "REMOVED");' 2>/dev/null)"
+case "$RETRY_DANGLE" in
+  REMOVED)  _pass "[CR-02] after the idempotent retry, NO dangling Kratos provider '${PROVIDER_ID}' remains (cleanup completed)";;
+  DANGLING) _fail "[CR-02] after the retry, the Kratos provider '${PROVIDER_ID}' is present (dangling provider stranded)";;
+  *)        _fail "[CR-02] could not read kratos.yml after the retry (verdict='$RETRY_DANGLE')";;
 esac
 
 # =============================================================================
