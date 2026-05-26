@@ -808,6 +808,66 @@ mod tests {
         }
     }
 
+    // --- CLI-01 (Phase 10): bare-array import body matches the `ory import
+    //     identities` field shape `[{schema_id, traits, credentials?}]` -------
+
+    /// The bare-array record the console produces (and the CLI consumes) MUST
+    /// carry `schema_id` (string) + `traits` (object); `credentials` is an
+    /// OPTIONAL object. This asserts the field shape directly on the
+    /// serialized `CreateIdentityBody` — the same model the wrapper round-trips
+    /// through `cli_array_to_patch_body`/`patch_body_to_cli_array`.
+    #[test]
+    fn cli_interchange_import_record_matches_ory_cli_shape() {
+        // A hashed record (carries credentials) and a bare record (no creds).
+        for rec in [hashed_record(), CreateIdentityBody::new(
+            "default".into(),
+            serde_json::json!({ "email": "bare@example.com" }),
+        )] {
+            let v = serde_json::to_value(&rec).unwrap();
+            let obj = v.as_object().expect("import record is a JSON object");
+
+            // schema_id: required string.
+            assert!(
+                obj.get("schema_id").and_then(|s| s.as_str()).is_some(),
+                "import record must carry a string schema_id (ory CLI shape): {v}"
+            );
+            // traits: required object.
+            assert!(
+                obj.get("traits").map(|t| t.is_object()).unwrap_or(false),
+                "import record must carry an object traits (ory CLI shape): {v}"
+            );
+            // credentials, when present, is an object (optional field).
+            if let Some(c) = obj.get("credentials") {
+                assert!(
+                    c.is_object(),
+                    "credentials, when present, must be an object: {v}"
+                );
+            }
+        }
+    }
+
+    /// A FULL bare array (what the console POSTs and `ory import identities`
+    /// consumes) round-trips through the patch-body wrapper and back to the
+    /// bare-array shape with every inner object preserved — the authoritative
+    /// data-plane interchange proof for the identity plane (CLI-01).
+    #[test]
+    fn cli_interchange_bare_array_round_trips_shape_preserving() {
+        let recs = vec![hashed_record(), cleartext_record()];
+        let originals: Vec<serde_json::Value> =
+            recs.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+
+        let body = cli_array_to_patch_body(recs);
+        let back = patch_body_to_cli_array(&body);
+
+        assert_eq!(back.len(), originals.len(), "record count preserved");
+        for (i, rt) in back.iter().enumerate() {
+            assert_eq!(rt, &originals[i], "inner object round-trips unchanged");
+            let obj = rt.as_object().expect("each record is an object");
+            assert!(obj.get("schema_id").and_then(|s| s.as_str()).is_some());
+            assert!(obj.get("traits").map(|t| t.is_object()).unwrap_or(false));
+        }
+    }
+
     // --- IDENT-04: limit enforcement (T-06-02) ------------------------------
 
     #[test]
