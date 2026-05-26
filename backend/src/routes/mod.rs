@@ -509,6 +509,27 @@ pub fn build(
                 .get(crate::config_edit::routes::get_pairwise_salt)
                 .put(crate::config_edit::routes::put_pairwise_salt),
         )
+        // Phase 13 (SSO-01): the dedicated Polis ENV/settings page. Registered
+        // BEFORE the generic `api/config/{service}/{section}` route so the literal
+        // `polis` segment matches this dedicated handler and is NEVER captured by
+        // `{service}` and routed into the YAML schema engine (Polis is
+        // ENV-configured with no JSON-Schema'd mounted YAML — Pitfall 1). It is a
+        // DEDICATED writer (config_edit::polis): a fixed non-secret allowlist,
+        // write-only-secret refusal, and a hard reject of signature/redirect-
+        // weakening values, restarting ONLY Polis with /api/health rollback.
+        //
+        // GATED by `FeatureFlagHoop::new("saml")` (seeded OFF) — mounted INSIDE the
+        // protected subtree AFTER auth/csrf, so a flag-OFF request 404s even with a
+        // valid session + matching CSRF token (FLAG-01 keystone). GET reports the
+        // current non-secret allowlisted values (csrf-exempt); PUT is
+        // state-changing so `csrf_guard` enforces `X-CSRF-Token` (403); both
+        // inherit `auth_guard` (401 unauth).
+        .push(
+            Router::with_path("api/config/polis")
+                .hoop(crate::features::FeatureFlagHoop::new("saml"))
+                .get(crate::config_edit::polis::get_polis_settings)
+                .put(crate::config_edit::polis::put_polis_settings),
+        )
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
         // allowlisted values; PUT runs the full transactional flow. Both inherit
         // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`
