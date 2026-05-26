@@ -1,5 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import {
+  Activity,
+  Building2,
   Cookie,
   FileCode2,
   Fingerprint,
@@ -8,15 +10,18 @@ import {
   Inbox,
   KeyRound,
   Languages,
+  LayoutDashboard,
   Link2,
+  ListChecks,
   Mail,
   MonitorSmartphone,
   Paintbrush,
+  Radio,
   RefreshCw,
   Route,
   RotateCcw,
   ScanSearch,
-  Send,
+  ScrollText,
   Settings,
   ShieldCheck,
   ShieldQuestion,
@@ -330,11 +335,71 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    // Phase 11 — the "Console" group (11-UI-SPEC §A/§B). Plan 02 ships the two
-    // webhook surfaces (Webhooks CRUD + the Delivery log); the remaining Project
-    // group items (Overview, Members, API Keys, Logs & events, gated pages) land
-    // in Plan 04 — they stay a placeholder here.
-    label: "Console",
+    // Phase 11 — the "Project" group (11-UI-SPEC §I). Plan 04 ships the Overview
+    // health dashboard, the Members (console-operator) list, Console API keys
+    // (issue/reveal/revoke), the derived Activity stub, the read-only Logs &
+    // events audit view, and the Event-streams gated stub. The gated item routes
+    // to its labeled `GatedFeature` page — NOT the "coming in a later phase"
+    // placeholder. All `built: true`.
+    label: "Project",
+    items: [
+      {
+        slug: "project-overview",
+        label: "Overview",
+        href: "/project/overview",
+        icon: LayoutDashboard,
+        built: true,
+      },
+      {
+        slug: "project-members",
+        label: "Members",
+        href: "/project/members",
+        icon: Users,
+        built: true,
+      },
+      {
+        slug: "project-api-keys",
+        label: "API keys",
+        href: "/project/api-keys",
+        icon: KeyRound,
+        built: true,
+      },
+      {
+        slug: "project-activity",
+        label: "Activity",
+        href: "/project/activity",
+        icon: Activity,
+        built: true,
+      },
+      {
+        slug: "project-logs",
+        label: "Logs & events",
+        href: "/project/logs",
+        icon: ScrollText,
+        built: true,
+      },
+      {
+        slug: "project-event-streams",
+        label: "Event streams",
+        href: "/project/event-streams",
+        icon: Radio,
+        built: true,
+      },
+      {
+        slug: "project-organizations",
+        label: "Organizations",
+        href: "/project/organizations",
+        icon: Building2,
+        built: true,
+      },
+    ],
+  },
+  {
+    // Phase 11 — the "Actions" group (11-UI-SPEC §I). The console's own webhook
+    // dispatcher (Plan 02: Webhooks CRUD + the Delivery log) plus the gated
+    // Enterprise sign-in entry (SAML, Plan 04). All `built: true`; the gated SAML
+    // item routes to its labeled `GatedFeature` page.
+    label: "Actions",
     items: [
       {
         slug: "project-webhooks",
@@ -347,16 +412,15 @@ export const NAV_GROUPS: NavGroup[] = [
         slug: "project-webhooks-deliveries",
         label: "Delivery log",
         href: "/project/webhooks/deliveries",
-        icon: Send,
+        icon: ListChecks,
         built: true,
       },
       {
-        slug: "project",
-        label: "Project",
-        href: "/project",
-        icon: Settings,
-        built: false,
-        comingIn: "Phase 11",
+        slug: "authentication-saml",
+        label: "SAML Sign-In",
+        href: "/authentication/saml",
+        icon: ShieldCheck,
+        built: true,
       },
     ],
   },
