@@ -620,6 +620,120 @@ the production-mode (https-issuer behind TLS) migration path.
 
 ---
 
+## Permissions (Keto) & Access Rules (Oathkeeper) (Phase 9)
+
+Phase 9 adds four operator surfaces for the permission system and the access proxy,
+all routed through the Rust backend (the frontend never talks to Keto/Oathkeeper
+directly — `FE-05`):
+
+- **Relationships** (`PERM-02`/`PERM-03`) — a server-paged table of relation
+  tuples with namespace / object / relation / subject filters, a create-tuple form,
+  and an exact-tuple delete.
+- **Check & Expand** (`PERM-03`) — enter a namespace / object / relation / subject
+  and get an `allowed` / `denied` verdict, or expand a relation to its subject tree.
+- **Permission Model** (`PERM-01`) — a Monaco editor for the Ory Permission
+  Language (OPL) `namespaces.ts` model, with a pre-save syntax check.
+- **Access Rules** (`OATH-01`) — a Monaco editor for the Oathkeeper `rules.json`
+  access-rule array.
+
+### The Keto three-port split (the correctness model)
+
+Keto serves three **distinct** ports, and the backend routes every call to the
+exact one — routing a write to the read port (or vice-versa) is a `404`/`405`:
+
+| Port    | Purpose                       | Backend operations                         |
+| ------- | ----------------------------- | ------------------------------------------ |
+| `:4467` | **write**                     | create / delete relation tuples            |
+| `:4466` | **read**                      | list / query / **check** / **expand**      |
+| `:4469` | **OPL syntax**                | the Permission-Model pre-save syntax check |
+
+These ports are **internal-only** (`INFRA-05`); the console reaches them only from
+inside the compose network.
+
+### Permission Model editor — pre-save OPL validate, then restart Keto ONLY
+
+The Permission-Model editor runs a **pre-save syntax check against Keto `:4469`**
+and writes `config/keto/namespaces.ts` **only on a clean parse** — an OPL with a
+syntax error is rejected `422` with **no file write** (the byte-identical file is
+the proof). On a clean parse it atomic-writes the raw OPL text and **restarts Keto
+ONLY** (Kratos/Hydra/Oathkeeper `StartedAt` unchanged); if Keto fails to come back
+healthy it **rolls back** to the last-known-good `.bak` and re-restarts. The file is
+written as **raw TypeScript-like OPL text** — never YAML- or JSON-serialised.
+
+### `permits`-function-name-as-relation (OPL permission checks)
+
+For an **OPL-defined permission**, the check API is relation-agnostic: you pass the
+**`permits`-function name** from the model (e.g. `view`) as the `relation` argument
+to Check — there is no separate "permission-by-name" endpoint. This is the one
+Keto behaviour with no code analog; it is **empirically confirmed live** by the
+Phase-9 gate (define a model with a `permits` function, create the backing tuple,
+then check with the function name as the relation → `allowed:true`).
+
+### Access Rules editor — write `rules.json`, then restart Oathkeeper ONLY
+
+The Access-Rules editor structurally pre-checks that the body is a **JSON array**
+(a non-array is `422` with no write), writes `config/oathkeeper/rules.json`, and
+**restarts Oathkeeper ONLY**. The post-restart `api_api` rule list (port `4456`)
+is the authoritative confirmation that the new rules took effect.
+
+> **Oathkeeper readiness finding (`A1`).** The restart health-poll uses
+> **`/health/alive`, not `/health/ready`**, for Oathkeeper. Its `/health/ready`
+> returns `503` for this stateless, from-file configuration ("its readiness
+> reporter has no satisfiable dependency to report on"), so polling `/health/ready`
+> would have **falsely rolled back every valid rules write**. The backend carries a
+> per-service health-path override (`restart::Service::health_path`) so Oathkeeper
+> alone polls `/health/alive`; the other services keep `/health/ready`.
+
+### CLI interchange (`CLI-01`)
+
+Relation tuples and access rules use the **same JSON shapes the `ory`/`keto` CLI
+consumes** (both are generated from the same OpenAPI specs): a tuple carries
+`namespace` / `object` / `relation` + `subject_id` | `subject_set`
+(`namespace:object#relation@subject`); rules are a JSON array of rule objects. The
+console and the CLI can therefore manage the same self-hosted stack without format
+conflict.
+
+### Verifying Phase 9 — Permissions / Access Rules (`PERM-01..03` / `OATH-01`)
+
+A single fail-closed gate proves both Keto planes and the Oathkeeper rules plane
+end-to-end against the real stack and tears it down cleanly afterward (a `trap`
+restores `config/keto/namespaces.ts` + `config/oathkeeper/rules.json` and runs
+`docker compose down -v`):
+
+```bash
+docker compose down -v
+MSYS_NO_PATHCONV=1 docker compose build backend frontend
+MSYS_NO_PATHCONV=1 docker compose up -d --wait
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase9-acceptance.sh   # Git Bash on Windows
+# (the gate runs `docker compose down -v` itself on exit; pass KEEP_STACK=1 to keep it up)
+```
+
+The gate exits `0` only when:
+
+- **`PERM-01`.** An invalid OPL is rejected `422` with `namespaces.ts` **byte-
+  unchanged** (no write); a valid OPL **validates → persists → restarts only
+  Keto** → recovers healthy → `GET` reflects the saved model.
+- **`PERM-02`/`PERM-03`.** A relation tuple is **written** (`:4467`), **read back**
+  (`:4466`, proving the port split), **checked** (`allowed:true`; an absent subject
+  is a normal `200 {allowed:false}`, never a `502`-as-denied), **expanded** (the
+  subject appears in the tree), and **deleted** by the exact filter set — with a
+  sibling tuple confirmed **still present** afterward (an over-broad delete fails
+  the gate).
+- **`PERM-03` permits-as-relation.** A check passing the **`permits`-function
+  name** as the relation returns `allowed:true` for the subject with the backing
+  tuple (and `false` for one without) — the empirical confirmation on the live
+  `oryd/keto:v26.2.0` image.
+- **`OATH-01`.** A valid rules array **persists → restarts only Oathkeeper** →
+  recovers healthy (via `/health/alive`) → the `api_api` rule list reflects the new
+  rule; a non-array body is rejected `422` with `rules.json` **unchanged**.
+- **Negatives.** Unauthenticated reads/writes are refused `401`; authenticated
+  writes without `X-CSRF-Token` are refused `403` (create / delete / validate /
+  model / rules); a sensitive key (`/dsn`) via the generic config route is refused
+  `403` with **no disk write**; and the **bundle-egress** gate stays clean. Every
+  negative passes ONLY on the explicit refusal.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
