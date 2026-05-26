@@ -138,6 +138,17 @@ hmac = "0.12"
 ipnet = "2.12"
 psl = "2"
 
+# --- Phase 14: SAML metadata signing-cert pre-flight (SSO-02 / WR-01) ---------
+# A real, namespace-aware XML pull-parser for the IdP-metadata signing-cert
+# pre-flight. The previous string-scan heuristic (find("keydescriptor") + a
+# 20-char close-tag proximity guess) was bypassable by crafted metadata: a
+# `use="signing"` token inside an XML COMMENT/CDATA was honored, and an
+# encryption-only KeyDescriptor could be misattributed a later bare cert. This
+# is the load-bearing forged-assertion defense, so it gets a vetted parser that
+# ignores comments/CDATA and evaluates KeyDescriptor/@use structurally. Pinned;
+# `default-features = false` (no serde/encoding/async) keeps the surface minimal.
+quick-xml = { version = "0.40", default-features = false }
+
 [dev-dependencies]
 # WR-01: a self-dependency that turns ON the `test-probe` feature whenever the
 # crate is compiled for tests (`cargo test`, `cargo test --test feature_flags`).

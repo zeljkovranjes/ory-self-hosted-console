@@ -19,11 +19,15 @@
 //!
 //! No XML/DSIG library is hand-rolled here (the assertion-signature validation
 //! itself is Polis's job, `@boxyhq/saml20`); this is a conservative structural
-//! pre-flight over the metadata's `KeyDescriptor` shape. There is NO operator
-//! toggle to skip it.
+//! pre-flight over the metadata's `KeyDescriptor` shape, evaluated with a real
+//! namespace-aware XML pull-parser (`quick-xml`, WR-01) that ignores comments
+//! and CDATA — NOT a string scan. There is NO operator toggle to skip it.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use quick_xml::events::Event;
+use quick_xml::name::QName;
+use quick_xml::reader::Reader;
 
 use crate::config_edit::schema::FieldError;
 use crate::error::AppError;
@@ -56,152 +60,147 @@ pub fn require_signing_cert(idp_xml: &str) -> Result<(), AppError> {
     }
 }
 
-/// Conservative structural scan: is there an `<X509Certificate>` under a
-/// signing-usable `<KeyDescriptor>`?
+/// Strip an `{namespace}` Clark-notation prefix and lowercase a local element
+/// name so the structural check is namespace-prefix agnostic (`md:KeyDescriptor`,
+/// `KeyDescriptor`, `ds:X509Certificate` all match). quick-xml already resolves
+/// the bytes to the LOCAL name for us via `QName::local_name`; this just folds
+/// case for the comparison.
+fn local_name_lower(qname: QName<'_>) -> String {
+    String::from_utf8_lossy(qname.local_name().as_ref()).to_ascii_lowercase()
+}
+
+/// Real (namespace-aware) structural pre-flight: is there a non-empty
+/// `<X509Certificate>` under a signing-usable `<KeyDescriptor>`?
 ///
-/// We walk the metadata one `KeyDescriptor` element at a time. For each, we read
-/// its `use` attribute (if any) and whether its body contains an
-/// `<X509Certificate>`. A KeyDescriptor with a non-empty cert qualifies iff its
-/// `use` is `"signing"` or absent. We also handle the (non-spec but seen)
-/// degenerate case of a bare `<X509Certificate>` not wrapped in any KeyDescriptor
-/// by treating an unwrapped cert as signing-usable (absent `use` semantics).
+/// Implemented with a `quick-xml` pull-parser (WR-01) so that — unlike the prior
+/// string scan — comments and CDATA are NEVER honored as markup, the
+/// `KeyDescriptor/@use` attribute is read from the actual element (not a substring
+/// match that could see `keyUse` or a `use=` inside a comment), and an
+/// encryption-only `KeyDescriptor` can never be credited with a cert that lives
+/// in a sibling element.
+///
+/// Decision rule (unchanged from the SSO-02 contract):
+///   - A `<KeyDescriptor>` qualifies iff its `use` is `"signing"` (case-insensitive)
+///     OR absent (absent `use` = valid for both per the SAML metadata spec), AND it
+///     contains a descendant `<X509Certificate>` with a non-whitespace payload.
+///   - A cert that appears ONLY under `use="encryption"` does NOT qualify.
+///   - A bare `<X509Certificate>` with NO enclosing `<KeyDescriptor>` anywhere in
+///     the document is treated as signing-usable (absent-use semantics) so a
+///     minimal but cert-bearing doc still works.
+///
+/// Any XML parse error is fail-CLOSED (returns `false` → the connection is
+/// rejected): malformed metadata can never validate an assertion signature.
 fn has_signing_cert(xml: &str) -> bool {
-    // Lowercase a COPY only for locating the tag boundaries; the original casing
-    // is irrelevant to the structural decision (we never echo the content).
-    let lower = xml.to_ascii_lowercase();
+    let mut reader = Reader::from_str(xml);
+    let config = reader.config_mut();
+    // Tolerate the loose, real-world IdP metadata we see (unquoted edge cases,
+    // mismatched-but-harmless end tags) without crediting comments/CDATA as
+    // markup — quick-xml never surfaces comment/CDATA bytes as Start/Text we act on.
+    config.check_end_names = false;
 
-    // Track whether we ever saw ANY KeyDescriptor at all. If we never see one but
-    // a bare cert exists, fall back to treating the unwrapped cert as signing-
-    // usable (absent-use semantics) so a minimal but cert-bearing doc still works.
+    // Depth at which a signing-usable KeyDescriptor opened (None = not inside one).
+    // We only credit an X509Certificate that is a DESCENDANT of such a descriptor.
+    let mut signing_descriptor_depth: Option<usize> = None;
+    let mut depth: usize = 0;
     let mut saw_key_descriptor = false;
+    // Did we see any KeyDescriptor at all? If not, a bare cert is signing-usable.
+    let mut bare_cert_present = false;
+    // Are we currently inside an <X509Certificate> element (any nesting)? Track the
+    // depth at which it opened plus whether its text payload was non-empty, and
+    // whether that cert is signing-usable (inside a qualifying KeyDescriptor OR,
+    // for the bare-cert fallback, anywhere when no KeyDescriptor exists).
+    let mut cert_open_depth: Option<usize> = None;
+    let mut cert_is_signing_context = false;
+    let mut cert_text_nonempty = false;
 
-    // Scan each <KeyDescriptor ...> ... </KeyDescriptor> region.
-    let mut search_from = 0usize;
-    while let Some(rel_open) = lower[search_from..].find("keydescriptor") {
-        // Find the actual element-open `<` preceding this token so we can read the
-        // attributes of the open tag. Move back to the `<`.
-        let token_pos = search_from + rel_open;
-        let open_lt = match lower[..token_pos].rfind('<') {
-            Some(p) => p,
-            None => {
-                search_from = token_pos + "keydescriptor".len();
-                continue;
-            }
-        };
-        // The open tag ends at the next `>`.
-        let open_gt = match lower[open_lt..].find('>') {
-            Some(rel) => open_lt + rel,
-            None => break, // malformed; stop scanning
-        };
-        saw_key_descriptor = true;
-        let open_tag = &lower[open_lt..=open_gt];
-
-        // Read the `use` attribute of THIS KeyDescriptor open tag (if present).
-        let key_use = extract_use_attr(open_tag);
-
-        // The element body runs from just after the open tag to the matching
-        // closing `</...keydescriptor>` (or end of doc if self-closing/unterminated).
-        let body_start = open_gt + 1;
-        let body_end = lower[body_start..]
-            .find("</")
-            .map(|rel| {
-                // Confirm the close tag is a keydescriptor close; otherwise scan onward.
-                let close_pos = body_start + rel;
-                if lower[close_pos..].starts_with("</")
-                    && lower[close_pos..]
-                        .find("keydescriptor")
-                        .map(|d| d < 20)
-                        .unwrap_or(false)
-                {
-                    close_pos
-                } else {
-                    // Nested or unrelated close: fall back to the rest of the doc.
-                    lower.len()
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let name = local_name_lower(e.name());
+                if name == "keydescriptor" {
+                    saw_key_descriptor = true;
+                    if key_use_is_signing(&e) {
+                        signing_descriptor_depth = Some(depth);
+                    }
+                } else if name == "x509certificate" {
+                    cert_open_depth = Some(depth);
+                    cert_text_nonempty = false;
+                    // Signing context: inside a qualifying KeyDescriptor.
+                    cert_is_signing_context = signing_descriptor_depth.is_some();
                 }
-            })
-            .unwrap_or(lower.len());
-        let body = &lower[body_start..body_end];
-
-        let has_cert = body.contains("x509certificate") && body.contains("</")
-            // require a non-empty cert payload between the open/close cert tags
-            && cert_payload_nonempty(body);
-
-        if has_cert {
-            match key_use.as_deref() {
-                // Signing-usable: explicit "signing" or absent `use`.
-                Some("signing") | None => return true,
-                // Anything else (notably "encryption") does NOT satisfy SSO-02.
-                Some(_) => {}
             }
+            Ok(Event::End(_)) => {
+                // A qualifying KeyDescriptor closes when we pop back above its depth.
+                if let Some(d) = signing_descriptor_depth {
+                    if depth <= d {
+                        signing_descriptor_depth = None;
+                    }
+                }
+                if let Some(d) = cert_open_depth {
+                    if depth <= d {
+                        // The cert element just closed: evaluate it.
+                        if cert_text_nonempty {
+                            bare_cert_present = true;
+                            if cert_is_signing_context {
+                                return true;
+                            }
+                        }
+                        cert_open_depth = None;
+                        cert_is_signing_context = false;
+                        cert_text_nonempty = false;
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            // CDATA is delivered as a separate `CData` event (NOT Text), so a cert
+            // payload smuggled in CDATA is intentionally ignored here.
+            Ok(Event::Text(t)) if cert_open_depth.is_some() => {
+                if let Ok(text) = t.decode() {
+                    if text.chars().any(|c| !c.is_whitespace()) {
+                        cert_text_nonempty = true;
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            // Parse error: fail closed (reject). Malformed metadata cannot prove a
+            // signing cert.
+            Err(_) => return false,
+            _ => {}
         }
-
-        // Continue scanning after this KeyDescriptor open tag.
-        search_from = open_gt + 1;
+        buf.clear();
     }
 
-    // No qualifying KeyDescriptor. If the document never declared a KeyDescriptor
-    // at all but does carry a non-empty bare X509Certificate, treat it as
-    // signing-usable (absent-use semantics for an unwrapped cert).
-    if !saw_key_descriptor && lower.contains("x509certificate") && cert_payload_nonempty(&lower) {
+    // Fallback: a non-empty bare X509Certificate with NO KeyDescriptor anywhere in
+    // the document is signing-usable (absent-use semantics for an unwrapped cert).
+    if !saw_key_descriptor && bare_cert_present {
         return true;
     }
     false
 }
 
-/// Extract the (lowercased) value of a `use="..."` attribute from a KeyDescriptor
-/// open tag, if present. Returns `None` when the attribute is absent.
-fn extract_use_attr(open_tag: &str) -> Option<String> {
-    // Find `use` as a standalone attribute name (avoid matching inside another
-    // token). Look for `use` followed by optional spaces then `=`.
-    let bytes = open_tag.as_bytes();
-    let mut i = 0usize;
-    while let Some(rel) = open_tag[i..].find("use") {
-        let pos = i + rel;
-        // Preceding char must be a boundary (space, quote, or `<`), and the char
-        // after must lead to `=` (allowing whitespace).
-        let prev_ok = pos == 0
-            || matches!(bytes.get(pos - 1), Some(b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\''));
-        let after = &open_tag[pos + 3..];
-        let after_trim = after.trim_start();
-        if prev_ok && after_trim.starts_with('=') {
-            // Parse the quoted value.
-            let val_part = after_trim[1..].trim_start();
-            let quote = val_part.chars().next();
-            if let Some(q @ ('"' | '\'')) = quote {
-                if let Some(end) = val_part[1..].find(q) {
-                    return Some(val_part[1..=end].to_string());
-                }
-            }
-        }
-        i = pos + 3;
-    }
-    None
-}
-
-/// True iff there is at least one non-whitespace character between an
-/// `<...x509certificate>` open and its `</...x509certificate>` close in `body`.
-/// Guards against an empty `<X509Certificate></X509Certificate>` passing the
-/// presence check.
-fn cert_payload_nonempty(body: &str) -> bool {
-    let mut from = 0usize;
-    while let Some(rel) = body[from..].find("x509certificate") {
-        let tag_pos = from + rel;
-        // Move to the `>` that ends this open tag.
-        if let Some(gt_rel) = body[tag_pos..].find('>') {
-            let payload_start = tag_pos + gt_rel + 1;
-            // The payload ends at the next `<` (the close tag).
-            if let Some(lt_rel) = body[payload_start..].find('<') {
-                let payload = &body[payload_start..payload_start + lt_rel];
-                if payload.trim().chars().any(|c| !c.is_whitespace()) {
-                    return true;
-                }
-            }
-            from = payload_start;
-        } else {
-            break;
+/// Read a `<KeyDescriptor>`'s `use` attribute and report whether it is
+/// signing-usable: `use="signing"` (case-insensitive) OR `use` ABSENT (absent =
+/// both signing and encryption per the SAML metadata spec). Any other value
+/// (notably `encryption`) is NOT signing-usable. The attribute is read from the
+/// real element via quick-xml, so it can never match a comment or another token.
+fn key_use_is_signing(e: &quick_xml::events::BytesStart<'_>) -> bool {
+    for attr in e.attributes().flatten() {
+        // Compare on the LOCAL attribute name so a namespaced `md:use` (rare) and a
+        // bare `use` both match; ignore unrelated attrs like `keyUse`.
+        if local_name_lower(attr.key) == "use" {
+            // The `use` value is a plain token (`signing`/`encryption`) with no
+            // XML entities to unescape, so the raw attribute bytes are sufficient
+            // and avoid the version-coupled normalized_value API.
+            let val = String::from_utf8_lossy(attr.value.as_ref())
+                .trim()
+                .to_ascii_lowercase();
+            return val == "signing";
         }
     }
-    false
+    // No `use` attribute → signing-usable (absent-use semantics).
+    true
 }
 
 /// Base64-encode operator-uploaded IdP metadata XML for the Polis
@@ -310,6 +309,56 @@ mod tests {
               </md:IDPSSODescriptor>
             </md:EntityDescriptor>"#;
         require_signing_cert(both).expect("a doc with both certs must pass on the signing one");
+    }
+
+    #[test]
+    fn use_signing_inside_an_xml_comment_does_not_count() {
+        // WR-01 crafted-metadata bypass: the ONLY real KeyDescriptor is
+        // use="encryption"; a `use="signing"` token is smuggled into an XML COMMENT.
+        // The old string scan honored the comment and WRONGLY accepted this. A real
+        // parser never sees the comment as markup → reject.
+        let crafted = r#"
+            <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">
+              <md:IDPSSODescriptor>
+                <!-- <md:KeyDescriptor use="signing"> a decoy in a comment -->
+                <md:KeyDescriptor use="encryption">
+                  <ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                    <ds:X509Data><ds:X509Certificate>MIIDencONLY==</ds:X509Certificate></ds:X509Data>
+                  </ds:KeyInfo>
+                </md:KeyDescriptor>
+              </md:IDPSSODescriptor>
+            </md:EntityDescriptor>"#;
+        let err = require_signing_cert(crafted)
+            .expect_err("a use=signing token hidden in a comment must NOT satisfy SSO-02");
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn cert_in_cdata_under_encryption_descriptor_does_not_count() {
+        // WR-01: a bare-looking <X509Certificate> smuggled in CDATA must not be
+        // credited to the encryption-only descriptor (CDATA is not markup, and the
+        // only KeyDescriptor is encryption-use).
+        let crafted = r#"
+            <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">
+              <md:IDPSSODescriptor>
+                <md:KeyDescriptor use="encryption">
+                  <ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                    <ds:X509Data><ds:X509Certificate><![CDATA[MIIDsmuggled==]]></ds:X509Certificate></ds:X509Data>
+                  </ds:KeyInfo>
+                </md:KeyDescriptor>
+              </md:IDPSSODescriptor>
+            </md:EntityDescriptor>"#;
+        let err = require_signing_cert(crafted)
+            .expect_err("an encryption-only descriptor (even with a CDATA cert) must be rejected");
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn malformed_xml_is_fail_closed() {
+        // Unparseable junk must be rejected (fail-closed), never accepted.
+        let err = require_signing_cert("<md:KeyDescriptor use=\"signing\"><not closed")
+            .expect_err("malformed metadata must fail closed");
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
     #[test]
