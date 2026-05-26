@@ -734,6 +734,98 @@ The gate exits `0` only when:
 
 ---
 
+## Activity, Branding & CLI Compatibility (Phase 10)
+
+Phase 10 adds the Activity surfaces (Kratos **Sessions** + **Courier Messages**),
+the Branding surfaces (**Email Templates**, **UI URLs**, a **Console Logo** upload,
+and three labeled gated pages), and verifies **CLI data-plane interchange**
+(`CLI-01`). It is overwhelmingly a *composition* phase reusing the Phase-3 typed
+Kratos wrappers, the Phase-4 transactional config engine, and the Phase-5/8/9
+frontend primitives.
+
+### Caveats (read before relying on Phase-10 surfaces)
+
+- **The Console Logo is CONSOLE branding only — it is NEVER written to any Ory
+  service or config.** The upload (`POST /api/console/branding/logo`) stores the
+  asset on the mounted console-data volume under a **server-defined canonical
+  path** (the client filename never enters the path — no traversal), accepts a
+  file only after a **magic-byte sniff of the actual bytes** (PNG/JPEG/ICO + an
+  SVG text sniff — the spoofable `Content-Type` header is never the accept gate),
+  caps the size before reading, and serves it back with a pinned content-type and
+  `Content-Security-Policy: sandbox` so a stored SVG can never execute script as
+  console-origin active content. It makes **no Ory call**.
+- **Email templates use an inline `base64://` mechanism.** The Monaco editor edits
+  **raw** template text; the backend base64-encodes it into the Kratos
+  `courier.templates.*` URI value on save and base64-decodes on load, so the
+  editor always shows raw text while `kratos.yml` stores a schema-valid
+  `base64://…` URI. (The alternative `courier.template_override_path` directory
+  mechanism is not used.)
+- **The logout flow has NO `ui_url`.** The UI-URLs allowlist deliberately omits
+  `/selfservice/flows/logout/ui_url` — that key does not exist in the Kratos
+  v26.2.0 schema (`additionalProperties:false`), so including it fails validation
+  and bricks the save. A PUT that includes it is refused `403` (not in the
+  allowlist). If a logout redirect is ever wanted, use
+  `/selfservice/flows/logout/after/default_browser_return_url` instead.
+- **Session revoke is a single-session deactivate.** Revoking a session calls
+  `disable_session(id)` (the session shows `active:false`, data retained), NEVER
+  `delete_identity_sessions` (which would irrecoverably delete **every** session
+  for the identity). Courier messages are **read-only** (a delivery log — no
+  create/update/delete affordance).
+- **`CLI-01` is data-plane only.** The console verifies that the identity
+  import/export bare-array (`[{schema_id, traits, credentials?}]`), the OAuth2
+  client JSON, and the Keto relation-tuple shapes are **interchangeable with the
+  official `ory`/`keto` CLI field shapes**. Because the per-service Ory crate
+  models are generated from the same OpenAPI specs the CLI consumes, **field-shape
+  equality is the authoritative interchange guarantee** and runs with no external
+  binary. A real `ory`/`keto` CLI binary, if present in the gate environment, is
+  used for an OPTIONAL stronger round-trip — it is never required. The CLI's
+  **config**-plane commands target Ory **Network** and are out of scope.
+
+### Verifying Phase 10 — Activity / Branding / CLI (`ACT-01/02` / `BRAND-01..06` / `CLI-01`)
+
+A single fail-closed gate proves the data plane, the Kratos-only config plane, the
+console asset store, the gated pages, and the CLI interchange end-to-end against
+the real stack and tears it down cleanly afterward (a `trap` restores
+`config/kratos/kratos.yml` and runs `docker compose down -v`):
+
+```bash
+docker compose down -v
+MSYS_NO_PATHCONV=1 docker compose build backend frontend
+MSYS_NO_PATHCONV=1 docker compose up -d --wait
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase10-acceptance.sh   # Git Bash on Windows
+# (the gate runs `docker compose down -v` itself on exit; pass KEEP_STACK=1 to keep it up)
+```
+
+The gate exits `0` only when:
+
+- **`ACT-01`.** `GET /api/kratos/sessions?active=active|inactive` returns the
+  `{rows, next_token, total}` envelope; a session (when one exists) is **revoked**
+  via the single-session `disable_session` and re-appears on the inactive page.
+- **`ACT-02`.** `GET /api/kratos/courier/messages?status=…&recipient=…` returns the
+  filtered envelope; the courier surface is **read-only** (a write verb is
+  `404/405`).
+- **`BRAND-01`/`BRAND-02`.** A raw email-template edit and a UI-URL edit each
+  **persist → restart only Kratos** (the other three Ory containers' `StartedAt`
+  are unchanged) → recover healthy → `GET` reflects the change (the template GET
+  returns **raw** text, never a `base64://` blob); a PUT including `logout/ui_url`
+  is refused `403`.
+- **`BRAND-03`.** A valid PNG **uploads** and is **served back** with an `image/*`
+  content-type and `Content-Security-Policy: sandbox`; a content-type-spoofed
+  non-image is **rejected** (`4xx`) and the previously-stored asset is **still
+  served** (the reject wrote nothing).
+- **`BRAND-04/05/06`.** Each gated page carries the **"Not available"** label and a
+  CTA link and has **no CRUD form control** (anti-dead-CRUD).
+- **`CLI-01`.** The frontend + backend **field-shape** suites are green
+  (authoritative); an optional real CLI binary round-trip runs only when a binary
+  is present.
+- **Negatives.** Unauthenticated reads/writes are refused `401`; authenticated
+  writes without `X-CSRF-Token` are refused `403` (revoke / config PUT / logo
+  upload); a sensitive key (`/courier/smtp/connection_uri`) is refused `403` with
+  **no disk write**; and the **bundle-egress** gate stays clean. Every negative
+  passes ONLY on the explicit refusal.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
