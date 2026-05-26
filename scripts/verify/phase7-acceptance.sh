@@ -315,30 +315,26 @@ if put_section_healthy "[AUTH-06]" "sessions" '{"/session/lifespan":"48h"}'; the
 fi
 
 # --- AUTH-03: MFA required_aal=highest_available (Pitfall 1 corrected enum) --
+# The schema-valid AAL enforcement pointer in v26.2.0 is /session/whoami/required_aal
+# (the `flows.login` object is additionalProperties:false with NO required_aal —
+# Plan-05 finding; see SUMMARY deviations). The MFA page owns this edit; the pointer
+# is in both KRATOS_MFA and KRATOS_SESSIONS allowlists. We assert the CORRECTED enum
+# `highest_available` (Pitfall 1: NOT `highest_aal`) writes and reflects.
 echo
-echo "--- [AUTH-03] mfa: set login.required_aal=highest_available -> write/restart/GET ---"
-if put_section_healthy "[AUTH-03]" "mfa" '{"/selfservice/flows/login/required_aal":"highest_available"}'; then
+echo "--- [AUTH-03] mfa: set whoami.required_aal=highest_available -> write/restart/GET ---"
+if put_section_healthy "[AUTH-03]" "mfa" '{"/session/whoami/required_aal":"highest_available"}'; then
   a_get="$(_body_of "$(_auth_get "${CFG_URL}/mfa")")"
-  if [ "$(_json_field "$a_get" 'data["/selfservice/flows/login/required_aal"]')" = "highest_available" ]; then
+  if [ "$(_json_field "$a_get" 'data["/session/whoami/required_aal"]')" = "highest_available" ]; then
     _pass "[AUTH-03] GET /mfa reflects required_aal=highest_available (corrected enum, Pitfall 1)"
   else
     _fail "[AUTH-03] GET /mfa does NOT reflect required_aal (body: $a_get)"
   fi
 fi
 
-# --- AUTH-07: Recovery enabled + use ---------------------------------------
-echo
-echo "--- [AUTH-07] recovery: enabled+use=code (+code method) -> write/restart/GET ---"
-if put_section_healthy "[AUTH-07]" "recovery" \
-   '{"/selfservice/flows/recovery/enabled":true,"/selfservice/flows/recovery/use":"code","/selfservice/methods/code/enabled":true}'; then
-  r_get="$(_body_of "$(_auth_get "${CFG_URL}/recovery")")"
-  if [ "$(_json_field "$r_get" 'data["/selfservice/flows/recovery/enabled"]')" = "true" ] \
-     && [ "$(_json_field "$r_get" 'data["/selfservice/flows/recovery/use"]')" = "code" ]; then
-    _pass "[AUTH-07] GET /recovery reflects enabled=true + use=code"
-  else
-    _fail "[AUTH-07] GET /recovery does NOT reflect the recovery flow config (body: $r_get)"
-  fi
-fi
+# NOTE: AUTH-07 (recovery enabled) is exercised AFTER the SMTP connection_uri is
+# set — the v26.2.0 schema's allOf[0] makes `courier` a REQUIRED top-level property
+# whenever recovery/verification is enabled, so the courier block must exist first
+# (Plan-05 finding; see SUMMARY deviations). It runs in the SMTP group below.
 
 # --- AUTH-04: OIDC provider (array) + masked secret + PRESERVE round-trip ---
 echo
@@ -628,6 +624,22 @@ if grep -Eq 'connection_uri:.*smtps://' "$KRATOS_YAML"; then
   _pass "[AUTH-09] kratos.yml still holds the real smtps:// connection_uri (preserved on disk)"
 else
   _fail "[AUTH-09] kratos.yml connection_uri was clobbered by the no-op PUT (real URI gone)"
+fi
+
+# --- AUTH-07: Recovery enabled + use (after courier/SMTP exists) ------------
+# Runs here (not in section order) because enabling recovery makes `courier` a
+# REQUIRED top-level property (schema allOf[0]); the SMTP write above created it.
+echo
+echo "--- [AUTH-07] recovery: enabled+use=code (+code method) -> write/restart/GET ---"
+if put_section_healthy "[AUTH-07]" "recovery" \
+   '{"/selfservice/flows/recovery/enabled":true,"/selfservice/flows/recovery/use":"code","/selfservice/methods/code/enabled":true}'; then
+  r_get="$(_body_of "$(_auth_get "${CFG_URL}/recovery")")"
+  if [ "$(_json_field "$r_get" 'data["/selfservice/flows/recovery/enabled"]')" = "true" ] \
+     && [ "$(_json_field "$r_get" 'data["/selfservice/flows/recovery/use"]')" = "code" ]; then
+    _pass "[AUTH-07] GET /recovery reflects enabled=true + use=code"
+  else
+    _fail "[AUTH-07] GET /recovery does NOT reflect the recovery flow config (body: $r_get)"
+  fi
 fi
 
 echo
