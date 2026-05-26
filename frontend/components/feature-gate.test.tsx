@@ -6,10 +6,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 //
 // The load-bearing invariant (carried verbatim from the retired license-gate
 // test) is that the OFF state is a calm EXPLANATION with a single navigational
-// link — NEVER a dead/disabled CRUD form. We assert ZERO form controls of any
-// kind (no textbox/combobox/checkbox/spinbutton/switch, no form/input/select/
-// textarea/button[type=submit]) and exactly one link to /project/features. The
-// ON state renders children; the pending state renders nothing.
+// link — NEVER a dead/disabled CRUD form. WR-03: we enforce this with an
+// ALLOWLIST — the ONLY interactive element in the OFF body must be exactly the
+// one link to /project/features — rather than a denylist of forbidden control
+// types (which any new control type would silently slip past). The ON state
+// renders children; the pending state renders nothing.
 
 const featuresMock = vi.fn();
 vi.mock("@/lib/features", () => ({
@@ -40,18 +41,44 @@ describe("FeatureGate", () => {
     expect(screen.queryByText(/enterprise/i)).toBeNull();
     expect(screen.queryByText(/license/i)).toBeNull();
 
-    // ZERO form controls (the child form is gated out entirely).
-    expect(screen.queryByRole("textbox")).toBeNull();
-    expect(screen.queryByRole("combobox")).toBeNull();
-    expect(screen.queryByRole("checkbox")).toBeNull();
-    expect(screen.queryByRole("spinbutton")).toBeNull();
-    expect(screen.queryByRole("switch")).toBeNull();
+    // WR-03 — ALLOWLIST, not a denylist. The hard FLAG-03 invariant is "the OFF
+    // state is a calm explanation whose ONLY interactive element is the single
+    // navigational link." Rather than enumerate specific control types to forbid
+    // (a denylist any new control type — role="slider", a <details> disclosure, a
+    // shadcn Toggle, an <a> styled as a button — would silently pass), we
+    // POSITIVELY assert that EVERY interactive element in the rendered OFF body is
+    // exactly the one expected link to /project/features. Any added control of any
+    // kind makes this length check fail.
+    const interactive = container.querySelectorAll(
+      [
+        "a",
+        "button",
+        "input",
+        "select",
+        "textarea",
+        "[contenteditable='true']",
+        '[role="button"]',
+        '[role="link"]',
+        '[role="textbox"]',
+        '[role="combobox"]',
+        '[role="checkbox"]',
+        '[role="radio"]',
+        '[role="spinbutton"]',
+        '[role="switch"]',
+        '[role="slider"]',
+        '[role="menuitem"]',
+        '[role="tab"]',
+        '[tabindex]:not([tabindex="-1"])',
+      ].join(","),
+    );
+    expect(interactive).toHaveLength(1);
+    expect(interactive[0].tagName).toBe("A");
+    expect(interactive[0]).toHaveAttribute("href", "/project/features");
+
+    // And, specifically, the gated child <form>/<input> are absent entirely (the
+    // body is rebuilt from neutral primitives, never the disabled child controls).
     expect(container.querySelector("form")).toBeNull();
     expect(container.querySelector("input")).toBeNull();
-    expect(container.querySelector("select")).toBeNull();
-    expect(container.querySelector("textarea")).toBeNull();
-    expect(container.querySelector('button[type="submit"]')).toBeNull();
-    expect(container.querySelector("button")).toBeNull();
   });
 
   it("OFF: the only interactive element is a single link to /project/features", () => {
