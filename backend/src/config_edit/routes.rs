@@ -586,6 +586,11 @@ pub async fn put_smtp_connection(
     #[derive(serde::Deserialize)]
     struct SmtpBody {
         connection_uri: Option<String>,
+        /// WR-05: explicit removal. When `true`, the stored connection_uri is
+        /// CLEARED (written empty) — distinct from a blank/masked PUT (which
+        /// preserves). Lets an operator decommission/rotate-to-empty the credential.
+        #[serde(default)]
+        clear: bool,
     }
 
     let cfg = config_from(depot)?;
@@ -598,8 +603,12 @@ pub async fn put_smtp_connection(
         .await
         .map_err(|_| AppError::BadRequest("invalid JSON body".into()))?;
     let incoming = body.connection_uri.unwrap_or_default();
-    // "unchanged" signal: the masked sentinel or an empty value.
-    let unchanged = incoming.is_empty() || incoming == secret_merge::MASKED;
+    // WR-05: an explicit `clear` request writes an empty URI (removal). It is NOT
+    // the "unchanged" path — it proceeds through the engine to persist "".
+    let clear = body.clear;
+    // "unchanged" signal: the masked sentinel or an empty value — but ONLY when the
+    // operator did not explicitly ask to clear.
+    let unchanged = !clear && (incoming.is_empty() || incoming == secret_merge::MASKED);
 
     // --- Step 1: kratos write lock (busy -> 409 config_busy) -----------------
     // Shares the per-service lock with put_config/put_identity_schema.
@@ -631,15 +640,27 @@ pub async fn put_smtp_connection(
         }]));
     }
 
-    // --- Real value: single-pointer engine flow -----------------------------
+    // --- Real value OR explicit clear: single-pointer engine flow ------------
     let mut merged = yaml::load(&path)?;
-    // Single fixed-pointer patch — NOT via allowlist::filter (the pointer is
-    // denylisted; this dedicated handler IS the authorization, T-07-07).
-    let patch = vec![(
-        SMTP_CONNECTION_URI_POINTER.to_string(),
-        Value::String(incoming),
-    )];
-    yaml::apply_patch(&mut merged, &patch)?;
+    if clear {
+        // WR-05: REMOVE the connection_uri key entirely (not set-empty — the schema
+        // pattern `^smtps?://.*` forbids an empty string, so an empty value would
+        // 422). Removing the key returns SMTP to the "not configured" state. The
+        // pointer is the fixed denylisted one; this dedicated handler is the
+        // authorization (T-07-07). The remaining /courier/smtp keys are preserved.
+        if let Some(Value::Object(smtp)) = merged.pointer_mut("/courier/smtp") {
+            smtp.remove("connection_uri");
+        }
+        tracing::info!(service = svc.key(), status = "clearing", "smtp-connection put: removing stored connection_uri (explicit clear)");
+    } else {
+        // Single fixed-pointer patch — NOT via allowlist::filter (the pointer is
+        // denylisted; this dedicated handler IS the authorization, T-07-07).
+        let patch = vec![(
+            SMTP_CONNECTION_URI_POINTER.to_string(),
+            Value::String(incoming),
+        )];
+        yaml::apply_patch(&mut merged, &patch)?;
+    }
 
     // --- VALIDATE the env-overlaid effective doc (dsn overlay, T-07-09) ------
     let validator = schema::validator_for("kratos").map_err(|e| {

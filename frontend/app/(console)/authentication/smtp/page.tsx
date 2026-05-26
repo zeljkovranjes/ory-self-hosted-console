@@ -66,6 +66,10 @@ function ConnectionUriCard() {
   const [status, setStatus] = React.useState<
     "idle" | "saving" | "saved" | "failed"
   >("idle");
+  // WR-06: distinguish a server/API rejection (rolled back) from a transport/
+  // unknown failure (the request may not have reached the server), so the alert
+  // can give an accurate message instead of a misleading dead-branch ternary.
+  const [failedKind, setFailedKind] = React.useState<"api" | "network">("api");
 
   async function save() {
     // Write-only: a blank field is a no-op. Never send a real/sentinel value
@@ -81,7 +85,27 @@ function ConnectionUriCard() {
       setUri("");
       void query.refetch();
     } catch (e) {
-      setStatus(e instanceof ApiError ? "failed" : "failed");
+      setFailedKind(e instanceof ApiError ? "api" : "network");
+      setStatus("failed");
+    }
+  }
+
+  // WR-05: explicitly REMOVE the stored connection URI (decommission the
+  // credential). Distinct from a blank save (which preserves): we send
+  // `{ clear: true }`, which the backend writes as an empty connection_uri.
+  async function clearConnection() {
+    setStatus("saving");
+    try {
+      await api("/api/kratos/smtp-connection", {
+        method: "PUT",
+        body: JSON.stringify({ clear: true }),
+      });
+      setStatus("saved");
+      setUri("");
+      void query.refetch();
+    } catch (e) {
+      setFailedKind(e instanceof ApiError ? "api" : "network");
+      setStatus("failed");
     }
   }
 
@@ -142,12 +166,24 @@ function ConnectionUriCard() {
           <Alert role="alert" variant="destructive">
             <AlertTitle>Save failed</AlertTitle>
             <AlertDescription>
-              The connection URI could not be applied and was rolled back.
+              {failedKind === "api"
+                ? "The connection URI could not be applied and was rolled back."
+                : "The request could not reach the server. Check your connection and try again."}
             </AlertDescription>
           </Alert>
         ) : null}
       </CardContent>
-      <CardFooter className="mt-4 flex justify-end border-t pt-4">
+      <CardFooter className="mt-4 flex justify-between border-t pt-4">
+        {/* WR-05: explicit "clear" affordance — remove the stored URI (distinct
+            from leaving the field blank, which preserves it). */}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={clearConnection}
+          disabled={!isSet || status === "saving"}
+        >
+          Remove stored URI
+        </Button>
         <Button
           type="button"
           onClick={save}
