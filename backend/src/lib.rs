@@ -15,6 +15,7 @@ pub mod db;
 pub mod error;
 pub mod features;
 pub mod members;
+pub mod organizations;
 pub mod overview;
 pub mod ory;
 pub mod routes;

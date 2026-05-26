@@ -136,6 +136,7 @@ hmac = "0.12"
 # HOOK-02 SSRF: CIDR containment for any docker-network range beyond the std
 # classifiers. Promoted from transitive to direct (already resolved at 2.12).
 ipnet = "2.12"
+psl = "2"
 
 [dev-dependencies]
 # WR-01: a self-dependency that turns ON the `test-probe` feature whenever the
