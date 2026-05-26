@@ -81,6 +81,15 @@ fn config_file_path(config_dir: &str, svc: restart::Service) -> PathBuf {
         restart::Service::Hydra => ("hydra", "hydra.yml"),
         restart::Service::Keto => ("keto", "keto.yml"),
         restart::Service::Oathkeeper => ("oathkeeper", "config.yaml"),
+        // Phase 13: Polis is ENV-configured, NOT a JSON-Schema'd mounted YAML, so
+        // it has NO `{service}/{section}` allowlist entry and never reaches the
+        // generic engine — its `allowlist::lookup("polis", …)` 404s before this
+        // helper, and the dedicated `/api/config/polis` route is mounted ahead of
+        // the generic `{service}/{section}` route (Pitfall 1). The dedicated writer
+        // in `config_edit::polis` owns the real path (`polis/settings.env`); this
+        // arm exists only to keep the match total and is never hit via the YAML
+        // engine.
+        restart::Service::Polis => ("polis", "settings.env"),
     };
     PathBuf::from(config_dir).join(dir).join(file)
 }

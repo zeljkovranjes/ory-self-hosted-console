@@ -41,6 +41,11 @@ pub enum Service {
     Hydra,
     Keto,
     Oathkeeper,
+    /// Ory Polis (boxyhq/jackson) SAML->OIDC bridge (Phase 13). Container `polis`,
+    /// internal admin/OIDC port 5225. Unlike the four Ory-Go services it is
+    /// ENV-configured (no JSON-Schema'd mounted YAML) and exposes a Node-style
+    /// liveness path `/api/health` (NOT the Ory `/health/ready`).
+    Polis,
 }
 
 /// Docker Engine API version segment used in the restart path. The Phase-1 broker
@@ -86,6 +91,7 @@ impl Service {
             "hydra" => Ok(Service::Hydra),
             "keto" => Ok(Service::Keto),
             "oathkeeper" => Ok(Service::Oathkeeper),
+            "polis" => Ok(Service::Polis),
             _ => Err(AppError::NotFound),
         }
     }
@@ -98,6 +104,7 @@ impl Service {
             Service::Hydra => "hydra",
             Service::Keto => "keto",
             Service::Oathkeeper => "oathkeeper",
+            Service::Polis => "polis",
         }
     }
 
@@ -108,6 +115,10 @@ impl Service {
             Service::Hydra => "ory-hydra",
             Service::Keto => "ory-keto",
             Service::Oathkeeper => "ory-oathkeeper",
+            // Polis's compose `container_name` is the bare `polis` (NOT `ory-polis`)
+            // — it MUST match the 13-01 compose container_name AND the broker
+            // `-allowPOST` allowlist token (…|polis), or the scoped restart 404s.
+            Service::Polis => "polis",
         }
     }
 
@@ -121,6 +132,10 @@ impl Service {
             Service::Hydra => "http://hydra:4445",
             Service::Keto => "http://keto:4469",
             Service::Oathkeeper => "http://oathkeeper:4456",
+            // Polis serves its admin/OIDC + health surface on the single internal
+            // port 5225 (INFRA-05: never host-published). Server-defined, never
+            // client input.
+            Service::Polis => "http://polis:5225",
         }
     }
 
@@ -141,6 +156,12 @@ impl Service {
         match self {
             Service::Kratos | Service::Hydra | Service::Keto => "/health/ready",
             Service::Oathkeeper => "/health/alive",
+            // Polis (boxyhq/jackson, a Node/Next app) is NOT an Ory-Go service: it
+            // has no `/health/ready`. Its documented liveness endpoint is
+            // `/api/health` (the same path the 13-01 compose node-fetch healthcheck
+            // probes). Polling `/health/ready` here would 404 forever and falsely
+            // roll back a perfectly good Polis settings write.
+            Service::Polis => "/api/health",
         }
     }
 }
@@ -269,6 +290,9 @@ mod tests {
             ("hydra", "ory-hydra"),
             ("keto", "ory-keto"),
             ("oathkeeper", "ory-oathkeeper"),
+            // Phase 13: Polis's container is the bare `polis` (matching the compose
+            // container_name + broker allowlist token), NOT `ory-polis`.
+            ("polis", "polis"),
         ] {
             let svc = Service::parse(name).expect("known service parses");
             assert!(
@@ -287,6 +311,58 @@ mod tests {
         assert_eq!(Service::Hydra.health_path(), "/health/ready");
         assert_eq!(Service::Keto.health_path(), "/health/ready");
         assert_eq!(Service::Oathkeeper.health_path(), "/health/alive");
+        // Phase 13: Polis is a Node/Next app, NOT an Ory-Go service — it has no
+        // `/health/ready`. Its liveness path is `/api/health`.
+        assert_eq!(Service::Polis.health_path(), "/api/health");
+    }
+
+    #[test]
+    fn polis_parse_container_and_health_base() {
+        // The literal "polis" segment parses to the closed Polis variant; an
+        // unknown name still 404s (the SSRF target stays closed).
+        assert_eq!(Service::parse("polis").unwrap(), Service::Polis);
+        assert!(matches!(Service::parse("polish"), Err(AppError::NotFound)));
+        // Canonical key + scoped container both equal the bare `polis`.
+        assert_eq!(Service::Polis.key(), "polis");
+        // The restart URL targets the bare `polis` container (NOT `ory-polis`).
+        assert!(
+            restart_url("http://b", Service::Polis).ends_with("/polis/restart"),
+            "polis must target the bare `polis` container"
+        );
+        // Health base is the single internal :5225 authority.
+        assert_eq!(Service::Polis.health_base(), "http://polis:5225");
+    }
+
+    #[tokio::test]
+    async fn polis_health_poll_uses_api_health_path() {
+        // The wait_healthy URL for Polis must hit /api/health — a mock that serves
+        // ONLY /api/health (and 404s the Ory /health/ready) returns healthy. If
+        // wait_healthy polled /health/ready it would never see a 200 and time out.
+        let mut server = mockito::Server::new_async().await;
+        let api_health = server
+            .mock("GET", "/api/health")
+            .with_status(200)
+            .with_body(r#"{"status":"ok"}"#)
+            .create_async()
+            .await;
+        // The Ory readiness path intentionally 404s (Polis has no such route); if
+        // wait_healthy polled it, this test would time out instead of pass.
+        let _ready_404 = server
+            .mock("GET", "/health/ready")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let http = reqwest::Client::new();
+        let healthy = wait_healthy(
+            &http,
+            Service::Polis,
+            Duration::from_secs(5),
+            Some(&server.url()),
+        )
+        .await;
+        assert!(healthy, "Polis must report healthy via /api/health");
+        api_health.assert_async().await;
     }
 
     #[tokio::test]
