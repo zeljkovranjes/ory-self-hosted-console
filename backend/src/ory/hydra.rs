@@ -216,20 +216,211 @@ pub async fn create_client(
     Ok(Json(value))
 }
 
-/// `PUT /api/hydra/clients/{id}` — update one OAuth2 client, PRESERVING its
-/// secret (OAUTH2-01, T-08-SECRET / ory-hydra #2869 — the headline correctness
-/// requirement).
+/// Field-level MERGE for the update path (CR-01 — the data-loss fix).
 ///
-/// Flow (08-RESEARCH Pattern 1, the fail-closed #2869 guard):
-/// 1. GET the stored client so we PUT a full, valid object.
-/// 2. Apply the operator's edits from the request body (parsed as the crate
-///    `OAuth2Client`).
+/// Hydra's `set_o_auth2_client` is a FULL-REPLACE PUT: any `OAuth2Client` field
+/// absent from the body is reset to its default on the wire. The edit form only
+/// sends a handful of fields (name/scope/uri/redirect_uris/grant_types/auth
+/// method), so a naive "PUT the parsed body" blanks every stored field the form
+/// omits (`response_types`, `audience`, `metadata`, `owner`, `contacts`, the
+/// `*_uri` fields, per-grant lifespans, …) on a routine rename.
+///
+/// The fix is fail-closed: start from the STORED client (a full, valid object)
+/// and overlay ONLY the fields the operator actually sent (each `Some(..)`).
+/// A field the body omits (`None`) keeps its stored value — never blanked.
+///
+/// `client_secret` / `registration_access_token` are explicitly forced to `None`
+/// regardless of the body so they are OMITTED on the wire (#2869 preserve, and no
+/// credential echo re-sent). `client_id` is immutable: always the stored id.
+fn merge_client_update(stored: OAuth2Client, body: OAuth2Client) -> OAuth2Client {
+    // Start from the full stored object; overlay only the operator's edits.
+    let mut merged = stored;
+
+    // Identity / general metadata fields the edit form (or a future richer form)
+    // may send. Each is overlaid ONLY when present in the body — an omitted field
+    // keeps the stored value (fail-closed against blank-on-rename).
+    if body.access_token_strategy.is_some() {
+        merged.access_token_strategy = body.access_token_strategy;
+    }
+    if body.allowed_cors_origins.is_some() {
+        merged.allowed_cors_origins = body.allowed_cors_origins;
+    }
+    if body.audience.is_some() {
+        merged.audience = body.audience;
+    }
+    if body.backchannel_logout_session_required.is_some() {
+        merged.backchannel_logout_session_required = body.backchannel_logout_session_required;
+    }
+    if body.backchannel_logout_uri.is_some() {
+        merged.backchannel_logout_uri = body.backchannel_logout_uri;
+    }
+    if body.client_name.is_some() {
+        merged.client_name = body.client_name;
+    }
+    if body.client_uri.is_some() {
+        merged.client_uri = body.client_uri;
+    }
+    if body.contacts.is_some() {
+        merged.contacts = body.contacts;
+    }
+    if body.frontchannel_logout_session_required.is_some() {
+        merged.frontchannel_logout_session_required = body.frontchannel_logout_session_required;
+    }
+    if body.frontchannel_logout_uri.is_some() {
+        merged.frontchannel_logout_uri = body.frontchannel_logout_uri;
+    }
+    if body.grant_types.is_some() {
+        merged.grant_types = body.grant_types;
+    }
+    if body.jwks.is_some() {
+        merged.jwks = body.jwks;
+    }
+    if body.jwks_uri.is_some() {
+        merged.jwks_uri = body.jwks_uri;
+    }
+    if body.logo_uri.is_some() {
+        merged.logo_uri = body.logo_uri;
+    }
+    // `metadata` is Option<Option<Value>> (serde double_option): the OUTER Some
+    // means "the operator sent a metadata key" (which may be explicit null →
+    // Some(None)); outer None means the body omitted it → keep the stored value.
+    if body.metadata.is_some() {
+        merged.metadata = body.metadata;
+    }
+    if body.owner.is_some() {
+        merged.owner = body.owner;
+    }
+    if body.policy_uri.is_some() {
+        merged.policy_uri = body.policy_uri;
+    }
+    if body.post_logout_redirect_uris.is_some() {
+        merged.post_logout_redirect_uris = body.post_logout_redirect_uris;
+    }
+    if body.redirect_uris.is_some() {
+        merged.redirect_uris = body.redirect_uris;
+    }
+    if body.request_object_signing_alg.is_some() {
+        merged.request_object_signing_alg = body.request_object_signing_alg;
+    }
+    if body.request_uris.is_some() {
+        merged.request_uris = body.request_uris;
+    }
+    if body.response_types.is_some() {
+        merged.response_types = body.response_types;
+    }
+    if body.scope.is_some() {
+        merged.scope = body.scope;
+    }
+    if body.sector_identifier_uri.is_some() {
+        merged.sector_identifier_uri = body.sector_identifier_uri;
+    }
+    if body.skip_consent.is_some() {
+        merged.skip_consent = body.skip_consent;
+    }
+    if body.skip_logout_consent.is_some() {
+        merged.skip_logout_consent = body.skip_logout_consent;
+    }
+    if body.subject_type.is_some() {
+        merged.subject_type = body.subject_type;
+    }
+    if body.token_endpoint_auth_method.is_some() {
+        merged.token_endpoint_auth_method = body.token_endpoint_auth_method;
+    }
+    if body.token_endpoint_auth_signing_alg.is_some() {
+        merged.token_endpoint_auth_signing_alg = body.token_endpoint_auth_signing_alg;
+    }
+    if body.tos_uri.is_some() {
+        merged.tos_uri = body.tos_uri;
+    }
+    if body.userinfo_signed_response_alg.is_some() {
+        merged.userinfo_signed_response_alg = body.userinfo_signed_response_alg;
+    }
+
+    // Per-grant lifespan overrides the operator may tune.
+    if body.authorization_code_grant_access_token_lifespan.is_some() {
+        merged.authorization_code_grant_access_token_lifespan =
+            body.authorization_code_grant_access_token_lifespan;
+    }
+    if body.authorization_code_grant_id_token_lifespan.is_some() {
+        merged.authorization_code_grant_id_token_lifespan =
+            body.authorization_code_grant_id_token_lifespan;
+    }
+    if body.authorization_code_grant_refresh_token_lifespan.is_some() {
+        merged.authorization_code_grant_refresh_token_lifespan =
+            body.authorization_code_grant_refresh_token_lifespan;
+    }
+    if body.client_credentials_grant_access_token_lifespan.is_some() {
+        merged.client_credentials_grant_access_token_lifespan =
+            body.client_credentials_grant_access_token_lifespan;
+    }
+    if body.device_authorization_grant_access_token_lifespan.is_some() {
+        merged.device_authorization_grant_access_token_lifespan =
+            body.device_authorization_grant_access_token_lifespan;
+    }
+    if body.device_authorization_grant_id_token_lifespan.is_some() {
+        merged.device_authorization_grant_id_token_lifespan =
+            body.device_authorization_grant_id_token_lifespan;
+    }
+    if body.device_authorization_grant_refresh_token_lifespan.is_some() {
+        merged.device_authorization_grant_refresh_token_lifespan =
+            body.device_authorization_grant_refresh_token_lifespan;
+    }
+    if body.implicit_grant_access_token_lifespan.is_some() {
+        merged.implicit_grant_access_token_lifespan = body.implicit_grant_access_token_lifespan;
+    }
+    if body.implicit_grant_id_token_lifespan.is_some() {
+        merged.implicit_grant_id_token_lifespan = body.implicit_grant_id_token_lifespan;
+    }
+    if body.jwt_bearer_grant_access_token_lifespan.is_some() {
+        merged.jwt_bearer_grant_access_token_lifespan =
+            body.jwt_bearer_grant_access_token_lifespan;
+    }
+    if body.refresh_token_grant_access_token_lifespan.is_some() {
+        merged.refresh_token_grant_access_token_lifespan =
+            body.refresh_token_grant_access_token_lifespan;
+    }
+    if body.refresh_token_grant_id_token_lifespan.is_some() {
+        merged.refresh_token_grant_id_token_lifespan =
+            body.refresh_token_grant_id_token_lifespan;
+    }
+    if body.refresh_token_grant_refresh_token_lifespan.is_some() {
+        merged.refresh_token_grant_refresh_token_lifespan =
+            body.refresh_token_grant_refresh_token_lifespan;
+    }
+
+    // CRITICAL (T-08-SECRET / #2869): NEVER carry a secret through the edit path.
+    // `None` omits the field on the wire -> Hydra preserves the stored secret.
+    // This is the structural fail-closed guard — do NOT remove. A deliberate
+    // rotate is a SEPARATE action, not this merge path.
+    merged.client_secret = None;
+    // Drop server-managed credential echoes that must not be re-sent on a PUT.
+    merged.registration_access_token = None;
+    merged.registration_client_uri = None;
+
+    // The client_id is immutable; the stored id is already in `merged` — defend
+    // against a body that tried to change it by re-clearing any overlaid id later.
+    // (We never overlaid client_id above, so `merged.client_id` is the stored id.)
+
+    merged
+}
+
+/// `PUT /api/hydra/clients/{id}` — update one OAuth2 client, PRESERVING its
+/// secret AND every stored field the operator did not change (OAUTH2-01,
+/// T-08-SECRET / ory-hydra #2869 + CR-01 — the headline correctness
+/// requirements).
+///
+/// Flow (08-RESEARCH Pattern 1, the fail-closed #2869 + CR-01 merge guard):
+/// 1. GET the stored client so we MERGE onto a full, valid object.
+/// 2. Overlay ONLY the operator's present (`Some`) edits from the request body
+///    onto the stored client (`merge_client_update`). A field the body omits
+///    KEEPS its stored value — `set_o_auth2_client` is a full-replace PUT, so a
+///    naive "PUT the body" would blank every omitted field (CR-01 data loss).
 /// 3. Force `client_secret = None`. Because the field is
 ///    `#[serde(skip_serializing_if = "Option::is_none")]`, `None` OMITS it on the
 ///    wire — Hydra's documented contract preserves the stored secret when the
 ///    field is absent. The update path therefore STRUCTURALLY cannot transmit a
 ///    blank/sentinel secret.
-/// 4. PUT the full object via `set_o_auth2_client`.
+/// 4. PUT the merged full object via `set_o_auth2_client`.
 ///
 /// `patch_o_auth2_client` is NEVER used — it is the #2869 bug surface. Rotation
 /// is a SEPARATE explicit action (the client carries an explicit `client_secret`
@@ -246,31 +437,21 @@ pub async fn update_client(
 
     // Parse the operator's edits as the crate model (CLI-interchangeable). A
     // malformed body is a 400.
-    let mut body: OAuth2Client = req
+    let body: OAuth2Client = req
         .parse_json::<OAuth2Client>()
         .await
         .map_err(|e| AppError::BadRequest(format!("invalid update client body: {e}")))?;
 
     // Load the current client server-side so the PUT carries a full, valid object
-    // (a partial PUT would clear unspecified fields). We keep the operator's edits
-    // from `body` and only adopt the immutable/server-managed identity from the
-    // stored copy.
+    // (a partial PUT would clear unspecified fields). CR-01: we MERGE the
+    // operator's present edits onto the stored copy so unspecified fields survive.
     let stored = o_auth2_api::get_o_auth2_client(&clients.hydra, &id)
         .await
         .map_err(map_hydra_err)?;
 
-    // The client_id is immutable; always carry the stored id (ignore any body id).
-    body.client_id = stored.client_id;
+    let merged = merge_client_update(stored, body);
 
-    // CRITICAL (T-08-SECRET / #2869): NEVER carry a secret through the edit path.
-    // `None` omits the field on the wire -> Hydra preserves the stored secret.
-    // This is the structural fail-closed guard — do NOT remove.
-    body.client_secret = None;
-
-    // Drop server-managed credential echoes that must not be re-sent on a PUT.
-    body.registration_access_token = None;
-
-    let updated = o_auth2_api::set_o_auth2_client(&clients.hydra, &id, body)
+    let updated = o_auth2_api::set_o_auth2_client(&clients.hydra, &id, merged)
         .await
         .map_err(map_hydra_err)?;
 
@@ -485,6 +666,93 @@ mod tests {
     fn shaping_is_noop_without_credential_fields() {
         let raw = serde_json::json!({ "client_id": "abc", "client_name": "x" });
         assert_eq!(shape_client_value(raw.clone()), raw);
+    }
+
+    /// CR-01: the update MERGE preserves every stored field the operator did NOT
+    /// send. A rename-only body (just `client_name`) must keep the stored
+    /// `response_types`, `audience`, `metadata`, `grant_types`, `scope`, …
+    /// untouched, while applying the one changed field. This is the fail-closed
+    /// invariant the full-replace PUT would otherwise violate.
+    #[test]
+    fn merge_preserves_omitted_stored_fields_on_rename() {
+        let mut stored = OAuth2Client::new();
+        stored.client_id = Some("abc-123".to_string());
+        stored.client_name = Some("Original Name".to_string());
+        stored.response_types = Some(vec!["code".to_string(), "token".to_string()]);
+        stored.grant_types = Some(vec!["authorization_code".to_string()]);
+        stored.audience = Some(vec!["https://api.example.com".to_string()]);
+        stored.scope = Some("openid offline".to_string());
+        stored.owner = Some("team-platform".to_string());
+        stored.contacts = Some(vec!["ops@example.com".to_string()]);
+        stored.metadata = Some(Some(serde_json::json!({ "tier": "gold" })));
+        stored.client_secret = Some("STORED_HASHED_SECRET".to_string());
+        stored.registration_access_token = Some("STORED_RAT".to_string());
+
+        // The edit form sends ONLY a rename (everything else omitted = None).
+        let mut body = OAuth2Client::new();
+        body.client_name = Some("Renamed".to_string());
+
+        let merged = merge_client_update(stored, body);
+
+        // The one changed field is applied...
+        assert_eq!(merged.client_name, Some("Renamed".to_string()));
+        // ...and the immutable id is preserved...
+        assert_eq!(merged.client_id, Some("abc-123".to_string()));
+        // ...while EVERY omitted stored field SURVIVES (the CR-01 fix).
+        assert_eq!(
+            merged.response_types,
+            Some(vec!["code".to_string(), "token".to_string()])
+        );
+        assert_eq!(
+            merged.grant_types,
+            Some(vec!["authorization_code".to_string()])
+        );
+        assert_eq!(
+            merged.audience,
+            Some(vec!["https://api.example.com".to_string()])
+        );
+        assert_eq!(merged.scope, Some("openid offline".to_string()));
+        assert_eq!(merged.owner, Some("team-platform".to_string()));
+        assert_eq!(merged.contacts, Some(vec!["ops@example.com".to_string()]));
+        assert_eq!(merged.metadata, Some(Some(serde_json::json!({ "tier": "gold" }))));
+
+        // #2869 + no-echo: secret and registration token are forced None so they
+        // are OMITTED on the wire (preserve), never blanked or re-sent.
+        assert!(merged.client_secret.is_none());
+        assert!(merged.registration_access_token.is_none());
+        let serialized = serde_json::to_string(&merged).unwrap();
+        assert!(
+            !serialized.contains("client_secret"),
+            "client_secret must be omitted on the merged PUT body: {serialized}"
+        );
+        assert!(
+            !serialized.contains("STORED_HASHED_SECRET"),
+            "the stored secret must never appear on the wire: {serialized}"
+        );
+    }
+
+    /// CR-01: an operator who DOES change a field (e.g. swaps grant_types) has
+    /// that change applied over the stored value — the merge is an overlay, not
+    /// a stored-wins clobber.
+    #[test]
+    fn merge_applies_changed_fields_over_stored() {
+        let mut stored = OAuth2Client::new();
+        stored.client_id = Some("abc-123".to_string());
+        stored.grant_types = Some(vec!["authorization_code".to_string()]);
+        stored.scope = Some("openid".to_string());
+
+        let mut body = OAuth2Client::new();
+        body.grant_types = Some(vec!["client_credentials".to_string()]);
+
+        let merged = merge_client_update(stored, body);
+
+        // The changed field reflects the body...
+        assert_eq!(
+            merged.grant_types,
+            Some(vec!["client_credentials".to_string()])
+        );
+        // ...the unchanged field keeps the stored value.
+        assert_eq!(merged.scope, Some("openid".to_string()));
     }
 
     /// The #2869 fail-closed guard, exercised at the model level: setting
