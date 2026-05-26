@@ -219,9 +219,75 @@ pub const KRATOS_SMTP: SectionAllowlist = SectionAllowlist {
     ],
 };
 
+/// AUTH-04 — Social Sign-In / OIDC page (RESEARCH Page 4, schema lines 430–696).
+///
+/// ARRAY-ROOT only (Pattern 1 / Pitfall 4): the whole providers array is replaced
+/// at ONE pointer; per-index pointers (`/.../providers/0/client_id`) are NEVER
+/// allowlisted. `oidc.enabled` toggles the method (shared with the Methods page).
+pub const KRATOS_OIDC: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "oidc",
+    allowed_paths: &[
+        "/selfservice/methods/oidc/config/providers",
+        "/selfservice/methods/oidc/enabled",
+    ],
+};
+
+/// AUTH-10 — SMS page (RESEARCH Page 9, schema lines 2234–2260).
+///
+/// ARRAY-ROOT only: the whole courier `channels` array is replaced at one pointer
+/// (the single `sms`/`http` channel). Per-index pointers are never allowlisted.
+pub const KRATOS_SMS: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "sms",
+    allowed_paths: &["/courier/channels"],
+};
+
+/// AUTH-11 / HOOK-04 — Actions & Webhooks page (RESEARCH Page 10, schema lines
+/// 217–355 `selfServiceWebHook`).
+///
+/// ARRAY-ROOT only: each `hooks` array is its own whole-array-replace pointer; no
+/// per-index pointers. This ships the COMMON default attach points (login,
+/// registration, recovery, verification, settings — each `before` + `after`
+/// default `hooks` array). The full per-method matrix in RESEARCH Page-10 is the
+/// authoritative superset; default-deny means unlisted per-method attach points
+/// (e.g. `/selfservice/flows/login/after/oidc/hooks`) are simply not editable —
+/// safe to expand later (RESEARCH A3).
+pub const KRATOS_WEBHOOKS: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "webhooks",
+    allowed_paths: &[
+        "/selfservice/flows/login/before/hooks",
+        "/selfservice/flows/login/after/hooks",
+        "/selfservice/flows/registration/before/hooks",
+        "/selfservice/flows/registration/after/hooks",
+        "/selfservice/flows/recovery/before/hooks",
+        "/selfservice/flows/recovery/after/hooks",
+        "/selfservice/flows/verification/before/hooks",
+        "/selfservice/flows/verification/after/hooks",
+        "/selfservice/flows/settings/before/hooks",
+        "/selfservice/flows/settings/after/hooks",
+    ],
+};
+
 /// Code-defined registry of every shipped section allowlist. The lookup is the
 /// ONLY way to obtain an allowlist — it is never assembled from client input.
-const REGISTRY: &[&SectionAllowlist] = &[&KRATOS_SESSION];
+///
+/// Phase-4 proof (`KRATOS_SESSION`) + the 10 Phase-7 Kratos auth sections (7
+/// scalar + 3 array-root).
+const REGISTRY: &[&SectionAllowlist] = &[
+    &KRATOS_SESSION,
+    &KRATOS_METHODS,
+    &KRATOS_PASSWORDLESS,
+    &KRATOS_MFA,
+    &KRATOS_SESSIONS,
+    &KRATOS_RECOVERY,
+    &KRATOS_VERIFICATION,
+    &KRATOS_SMTP,
+    &KRATOS_OIDC,
+    &KRATOS_SMS,
+    &KRATOS_WEBHOOKS,
+];
 
 /// Look up the allowlist for a `(service, section)` pair.
 ///
