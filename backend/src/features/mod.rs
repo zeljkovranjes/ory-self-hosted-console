@@ -76,23 +76,40 @@ impl FeatureFlags {
         Self(Arc::new(RwLock::new(map)))
     }
 
-    /// Whether a flag is enabled. FAIL-CLOSED: an unknown key, or a poisoned
-    /// lock, returns `false` (FLAG-01 fail-closed posture / Pitfall 5).
+    /// Whether a flag is enabled. FAIL-CLOSED for an UNKNOWN key (absent → `false`),
+    /// matching the fail-closed posture `auth_guard` relies on (FLAG-01 / Pitfall 5).
+    ///
+    /// WR-02: the lock is POISON-TOLERANT. A `HashMap<String,bool>` has no broken
+    /// invariant after a panic, so recovering the guard via `PoisonError::into_inner`
+    /// is safe — and it avoids the split-brain where a SINGLE poisoning event would
+    /// otherwise wedge every flag to `false` (via the old `unwrap_or(false)`) for the
+    /// lifetime of the process, silently disabling even flags the operator turned ON.
+    /// Unknown-key fail-closed is preserved (the recovered map still reports `false`
+    /// for absent keys); we just no longer let poisoning masquerade as "everything off".
     pub fn is_enabled(&self, key: &str) -> bool {
-        self.0
-            .read()
-            .map(|m| *m.get(key).unwrap_or(&false))
-            .unwrap_or(false)
+        let m = self.0.read().unwrap_or_else(|e| e.into_inner());
+        *m.get(key).unwrap_or(&false)
     }
 
-    /// Refresh a flag's cached state after a successful DB write so the next
-    /// gated request sees the new state without a DB round-trip. A poisoned lock
-    /// is silently skipped (the DB remains the source of truth; the next boot
-    /// reload reconciles).
+    /// Refresh a flag's cached state after a successful DB write so the next gated
+    /// request sees the new state without a DB round-trip.
+    ///
+    /// WR-02: recover a POISONED write lock via `PoisonError::into_inner` rather than
+    /// silently no-op'ing. The old `if let Ok(..)` swallowed a poisoned lock with no
+    /// log and no error, so after one poisoning event every `set` became a no-op: the
+    /// DB write (and the 200 the operator sees) would succeed while the in-process
+    /// gate never opened — a cache/DB split-brain. We log a warning so the (now
+    /// recovered, but noteworthy) poisoning is observable, then apply the write.
     pub fn set(&self, key: &str, enabled: bool) {
-        if let Ok(mut m) = self.0.write() {
-            m.insert(key.to_string(), enabled);
-        }
+        let mut m = self.0.write().unwrap_or_else(|e| {
+            tracing::warn!(
+                flag = key,
+                "feature-flag cache RwLock was poisoned; recovering the guard and \
+                 applying the write (the HashMap has no broken invariant after a panic)"
+            );
+            e.into_inner()
+        });
+        m.insert(key.to_string(), enabled);
     }
 }
 
@@ -174,6 +191,49 @@ mod tests {
         assert!(flags.is_enabled("saml"), "set refreshes the cache to ON");
         flags.set("saml", false);
         assert!(!flags.is_enabled("saml"), "set refreshes the cache to OFF");
+    }
+
+    /// WR-02: a poisoned lock must NOT wedge the cache. After a writer panics while
+    /// holding the guard (poisoning the `RwLock`), `set` must still recover the guard
+    /// and apply the write, and `is_enabled` must read the recovered map — NOT the
+    /// old `unwrap_or(false)` behavior that silently disabled every flag after a
+    /// single poisoning event (the cache/DB split-brain the review flagged).
+    #[test]
+    fn poisoned_lock_is_recovered_not_wedged() {
+        let mut map = HashMap::new();
+        map.insert("saml".to_string(), true);
+        let flags = FeatureFlags::from_map(map);
+
+        // Poison the inner RwLock by panicking while a write guard is held. We catch
+        // the panic so the test process survives; the lock stays poisoned afterward.
+        let clone = flags.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = clone.0.write().unwrap();
+            panic!("intentional panic to poison the feature-flag RwLock");
+        }));
+        assert!(
+            flags.0.read().is_err(),
+            "the RwLock should be poisoned after the panic (test precondition)"
+        );
+
+        // A previously-ON flag is STILL ON despite the poisoning (read recovers the
+        // guard via into_inner instead of collapsing to false).
+        assert!(
+            flags.is_enabled("saml"),
+            "an ON flag must survive a poisoning event (no silent disable)"
+        );
+
+        // And a write through the poisoned lock still lands (recovered, not no-op'd).
+        flags.set("saml", false);
+        assert!(
+            !flags.is_enabled("saml"),
+            "set must apply through a poisoned (recovered) lock, not silently no-op"
+        );
+        flags.set("organizations", true);
+        assert!(
+            flags.is_enabled("organizations"),
+            "a fresh write through the recovered lock must also persist"
+        );
     }
 
     /// FEATURE_META covers every seeded key, only `observability` requires a
