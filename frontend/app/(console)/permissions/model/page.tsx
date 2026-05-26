@@ -171,10 +171,10 @@ export default function PermissionModelPage() {
       setValidation({ ok, errors });
       setValidatedSource(value);
     } catch (e) {
-      const status = e instanceof ApiError ? ` (${e.status})` : "";
+      const statusSuffix = e instanceof ApiError ? ` (${e.status})` : "";
       setValidation({
         ok: false,
-        errors: [{ message: `Validation request failed${status}.` }],
+        errors: [{ message: `Validation request failed${statusSuffix}.` }],
       });
       setValidatedSource(value);
     } finally {
