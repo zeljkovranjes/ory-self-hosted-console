@@ -174,6 +174,144 @@ pub fn write_translations(config_dir: &str, body: &str) -> Result<serde_json::Va
     Ok(value)
 }
 
+// ─── AX-04 (Custom Domains): reachability check + reverse-proxy snippet ─────────
+//
+// These two helpers back the Custom Domains editor. NEITHER provisions TLS/DNS —
+// the operator's reverse proxy owns that (the snippet is GUIDANCE only). The
+// reachability check is the highest-risk surface: an operator-supplied URL is an
+// SSRF vector into the internal admin ports (T-15-11 / Pitfall 7), so it MUST
+// route through the HOOK-02 guard (`webhooks::ssrf::validate_url` + the pinned,
+// redirects-off client) BEFORE any fetch. A guard rejection is an EXPLICIT error
+// (mapped to 4xx upstream), never collapsed into a `reachable:false` success
+// (anti-false-green, T-15-15).
+
+/// The outcome of an AX-04 reachability probe of an operator-supplied URL.
+#[derive(Debug, serde::Serialize)]
+pub struct Reachability {
+    /// True iff the guarded GET returned ANY HTTP response (2xx/3xx/4xx/5xx) —
+    /// i.e. the host is reachable. A transport failure is `false`.
+    pub reachable: bool,
+    /// The HTTP status code when a response was received (omitted on transport
+    /// failure). The presence of a status is the affirmative "reachable" signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+}
+
+/// Run an SSRF-guarded reachability probe of `url`.
+///
+/// The HOOK-02 guard runs FIRST: a private/loopback/link-local/metadata/
+/// credentialed/non-http(s) target is REJECTED here (returns the guard's
+/// `AppError`, which maps to 4xx — NEVER a `reachable:false` 200). Only a target
+/// that passes the guard is fetched, and the fetch uses the pinned, redirects-off
+/// client built by `build_pinned_client` (TOCTOU + no-3xx-bounce defense). A
+/// transport failure AFTER the guard passed (e.g. a public host that does not
+/// answer) is a legitimate `reachable:false` — NOT an SSRF rejection.
+pub async fn check_reachability(url: &str) -> Result<Reachability, AppError> {
+    // Gate 1 (anti-false-green): the SSRF guard. An internal/loopback/credentialed
+    // target is refused HERE and propagates as a 4xx — never a reachable:false.
+    crate::webhooks::ssrf::validate_url(url).await?;
+
+    // Gate 2: build the pinned, redirects-off client (re-resolves + re-validates
+    // every IP — DNS-rebind defense). Production posture: allow_private=false.
+    let (client, _addrs) = crate::webhooks::ssrf::build_pinned_client(url, false).await?;
+
+    // The single guarded GET. A transport error (connection refused/timeout to a
+    // PUBLIC host that passed the guard) is a legitimate unreachable result.
+    match client.get(url).send().await {
+        Ok(resp) => Ok(Reachability {
+            reachable: true,
+            status: Some(resp.status().as_u16()),
+        }),
+        Err(_) => Ok(Reachability {
+            reachable: false,
+            status: None,
+        }),
+    }
+}
+
+/// Generate a reverse-proxy GUIDANCE snippet (nginx + Caddy + Traefik examples)
+/// mapping the operator's AX origin `host` to the Account Experience service and
+/// the Kratos public path. PURE STRING OUTPUT — no fetch, no file write, no
+/// TLS/DNS provisioning (the operator's proxy owns certificates + DNS).
+///
+/// `host` is the operator-entered custom domain (e.g. `accounts.example.com`). It
+/// is sanitised to a bare host token (no scheme/path/whitespace) before being
+/// interpolated, so a malicious value cannot inject extra config directives.
+pub fn reverse_proxy_snippet(host: &str) -> String {
+    let host = sanitize_proxy_host(host);
+    format!(
+        "# Reverse-proxy guidance for the Account Experience custom domain.\n\
+         # TLS and DNS are owned by YOUR reverse proxy — this console does NOT\n\
+         # provision certificates or DNS records. Point {host} at your proxy,\n\
+         # terminate TLS there, and forward to the Account Experience service\n\
+         # (and Kratos public path) as shown below.\n\
+         #\n\
+         # --- nginx ---\n\
+         server {{\n\
+         \x20   listen 443 ssl;\n\
+         \x20   server_name {host};\n\
+         \x20   # ssl_certificate / ssl_certificate_key managed by your proxy\n\
+         \x20   location / {{\n\
+         \x20       proxy_pass http://account-experience:3000;\n\
+         \x20       proxy_set_header Host $host;\n\
+         \x20       proxy_set_header X-Forwarded-Proto $scheme;\n\
+         \x20   }}\n\
+         \x20   location /.ory/kratos/public/ {{\n\
+         \x20       proxy_pass http://kratos:4433/;\n\
+         \x20       proxy_set_header Host $host;\n\
+         \x20   }}\n\
+         }}\n\
+         \n\
+         # --- Caddy ---\n\
+         {host} {{\n\
+         \x20   reverse_proxy /.ory/kratos/public/* kratos:4433\n\
+         \x20   reverse_proxy account-experience:3000\n\
+         }}\n\
+         \n\
+         # --- Traefik (dynamic config) ---\n\
+         http:\n\
+         \x20 routers:\n\
+         \x20   ax:\n\
+         \x20     rule: \"Host(`{host}`)\"\n\
+         \x20     service: account-experience\n\
+         \x20     tls: {{}}\n\
+         \x20 services:\n\
+         \x20   account-experience:\n\
+         \x20     loadBalancer:\n\
+         \x20       servers:\n\
+         \x20         - url: \"http://account-experience:3000\"\n",
+        host = host
+    )
+}
+
+/// Reduce an operator-entered host to a bare host token: strip any scheme, path,
+/// query, and surrounding whitespace, and keep only the authority's host portion.
+/// Falls back to a safe placeholder when nothing host-like remains, so the
+/// generated snippet never carries injected directives or empty interpolation.
+fn sanitize_proxy_host(input: &str) -> String {
+    let trimmed = input.trim();
+    // If it parses as a URL, take the host. Otherwise treat the input as a host
+    // and strip any stray scheme prefix / path suffix defensively.
+    if let Ok(url) = url::Url::parse(trimmed) {
+        if let Some(h) = url.host_str() {
+            return h.to_string();
+        }
+    }
+    let no_scheme = trimmed
+        .rsplit("://")
+        .next()
+        .unwrap_or(trimmed);
+    let host_only = no_scheme
+        .split(['/', '?', '#', ' ', '\t', '\n', '\r'])
+        .next()
+        .unwrap_or("");
+    if host_only.is_empty() {
+        "your-domain.example".to_string()
+    } else {
+        host_only.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +402,53 @@ mod tests {
         let err = write_translations(&dir, "[1,2,3]").unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(!translations_path(&dir).is_file());
+    }
+
+    // ─── AX-04: reverse-proxy snippet generation + host sanitization ───
+
+    #[test]
+    fn reverse_proxy_snippet_is_guidance_with_no_provisioning() {
+        let snippet = reverse_proxy_snippet("accounts.example.com");
+        // The operator host appears in each proxy example.
+        assert!(snippet.contains("accounts.example.com"));
+        // All three proxy flavours are present (guidance, not provisioning).
+        assert!(snippet.contains("nginx"));
+        assert!(snippet.contains("Caddy"));
+        assert!(snippet.contains("Traefik"));
+        // It explicitly states the operator owns TLS/DNS — NO provisioning.
+        assert!(
+            snippet.to_lowercase().contains("tls and dns are owned by your"),
+            "snippet must state the operator owns TLS/DNS"
+        );
+        // It forwards to the AX service + Kratos public path.
+        assert!(snippet.contains("account-experience:3000"));
+        assert!(snippet.contains("kratos:4433"));
+    }
+
+    #[test]
+    fn reverse_proxy_snippet_sanitizes_host() {
+        // A full URL is reduced to its bare host (no scheme/path can inject).
+        let s = reverse_proxy_snippet("https://accounts.example.com/path?x=1");
+        assert!(s.contains("accounts.example.com"));
+        assert!(!s.contains("/path"));
+        assert!(!s.contains("x=1"));
+        // A host carrying a stray path is reduced to the host token.
+        let s2 = reverse_proxy_snippet("evil.example/}\ninjected");
+        assert!(s2.contains("evil.example"));
+        assert!(!s2.contains("injected"));
+        // An empty host falls back to a safe placeholder (never empty interpolation).
+        let s3 = reverse_proxy_snippet("   ");
+        assert!(s3.contains("your-domain.example"));
+    }
+
+    #[test]
+    fn sanitize_proxy_host_strips_scheme_and_path() {
+        assert_eq!(sanitize_proxy_host("accounts.example.com"), "accounts.example.com");
+        assert_eq!(
+            sanitize_proxy_host("https://accounts.example.com/login"),
+            "accounts.example.com"
+        );
+        assert_eq!(sanitize_proxy_host("foo.example/a/b"), "foo.example");
+        assert_eq!(sanitize_proxy_host(""), "your-domain.example");
     }
 }

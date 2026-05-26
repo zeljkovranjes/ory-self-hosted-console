@@ -288,3 +288,114 @@ async fn unauth_401_and_missing_csrf_403(pool: PgPool) {
         "a state-changing PUT without X-CSRF-Token must be 403"
     );
 }
+
+// --- AX-04: SSRF-guarded reachability + reverse-proxy snippet -------------------
+
+/// T-15-11 / T-15-15 (anti-false-green): the reachability check REFUSES an
+/// internal-admin / loopback / credentialed target via the HOOK-02 SSRF guard —
+/// returning a 4xx, NEVER a 200 `{reachable:false}` (which would mean the fetch
+/// happened). The guard rejects BEFORE any connection, so no internal port is
+/// ever touched. The flag is ON here so the only rejection is the SSRF guard.
+#[sqlx::test(migrations = "./migrations")]
+async fn reachability_ssrf_rejects_internal_and_credentialed_targets(pool: PgPool) {
+    common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
+    let fixture = AxFixture::new();
+    let service = Service::new(router_with_ax_dir(pool.clone(), &fixture));
+    let (raw, csrf) = login_and_get_session(&service, &pool).await;
+    enable_account_experience(&service, &raw, &csrf).await;
+
+    // Each of these MUST be refused by the SSRF guard (NOT a 200 reachable):
+    //   - the Kratos INTERNAL ADMIN port (the INFRA-05 SSRF target, Pitfall 7);
+    //   - a loopback literal;
+    //   - a credentialed URL (userinfo).
+    for bad in [
+        "http://kratos:4434/admin/identities",
+        "http://127.0.0.1/whatever",
+        "http://169.254.169.254/latest/meta-data",
+        "http://user:pass@example.com/",
+        "ftp://example.com/",
+    ] {
+        let resp = TestClient::post("http://127.0.0.1:8080/api/account-experience/reachability")
+            .add_header("Cookie", format!("console_session={raw}"), true)
+            .add_header("X-CSRF-Token", csrf.clone(), true)
+            .json(&serde_json::json!({ "url": bad }))
+            .send(&service)
+            .await;
+        // Anti-false-green: it must be an EXPLICIT 4xx refusal, NEVER a 200.
+        let code = resp.status_code.expect("status");
+        assert!(
+            code == StatusCode::BAD_REQUEST || code == StatusCode::UNPROCESSABLE_ENTITY,
+            "SSRF target `{bad}` must be REFUSED with a 4xx (got {code:?}) — never a reachable:false 200"
+        );
+        assert_ne!(
+            code,
+            StatusCode::OK,
+            "SSRF target `{bad}` must NEVER return a 200 (no fetch may happen)"
+        );
+    }
+}
+
+/// The reverse-proxy snippet route returns a generated guidance string mapping the
+/// operator host to the AX service + Kratos public path — pure string output, no
+/// fetch, no write. csrf-exempt (GET).
+#[sqlx::test(migrations = "./migrations")]
+async fn reverse_proxy_snippet_generates_guidance(pool: PgPool) {
+    common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
+    let fixture = AxFixture::new();
+    let service = Service::new(router_with_ax_dir(pool.clone(), &fixture));
+    let (raw, csrf) = login_and_get_session(&service, &pool).await;
+    enable_account_experience(&service, &raw, &csrf).await;
+
+    let mut resp =
+        TestClient::get("http://127.0.0.1:8080/api/account-experience/reverse-proxy-snippet?host=accounts.example.com")
+            .add_header("Cookie", format!("console_session={raw}"), true)
+            .send(&service)
+            .await;
+    assert_eq!(resp.status_code, Some(StatusCode::OK), "snippet GET -> 200");
+    let body: serde_json::Value = resp.take_json().await.expect("snippet json");
+    let snippet = body["snippet"].as_str().expect("snippet string");
+    assert!(snippet.contains("accounts.example.com"), "snippet carries the host");
+    assert!(snippet.contains("account-experience:3000"), "maps the AX service");
+    assert!(snippet.contains("kratos:4433"), "maps the Kratos public path");
+    assert!(
+        snippet.to_lowercase().contains("tls and dns are owned by your"),
+        "snippet states the operator owns TLS/DNS (no provisioning)"
+    );
+}
+
+/// FLAG-01 (T-15-13): with `account_experience` seeded OFF, BOTH AX-04 routes 404
+/// even with a valid session + matching CSRF — the FeatureFlagHoop sits after
+/// auth_guard/csrf_guard, so a flag-OFF request never reaches the handler.
+#[sqlx::test(migrations = "./migrations")]
+async fn ax04_routes_404_when_flag_off(pool: PgPool) {
+    common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
+    let fixture = AxFixture::new();
+    let service = Service::new(router_with_ax_dir(pool.clone(), &fixture));
+    let (raw, csrf) = login_and_get_session(&service, &pool).await;
+    // account_experience is NOT toggled ON — it stays seeded OFF.
+
+    // reachability POST (valid session + matching CSRF) -> 404 (gate beats both).
+    let reach = TestClient::post("http://127.0.0.1:8080/api/account-experience/reachability")
+        .add_header("Cookie", format!("console_session={raw}"), true)
+        .add_header("X-CSRF-Token", csrf.clone(), true)
+        .json(&serde_json::json!({ "url": "https://example.com/" }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        reach.status_code,
+        Some(StatusCode::NOT_FOUND),
+        "flag-OFF reachability POST must 404 past a valid session + CSRF (FLAG-01)"
+    );
+
+    // snippet GET (authenticated) -> 404.
+    let snip =
+        TestClient::get("http://127.0.0.1:8080/api/account-experience/reverse-proxy-snippet?host=x.example")
+            .add_header("Cookie", format!("console_session={raw}"), true)
+            .send(&service)
+            .await;
+    assert_eq!(
+        snip.status_code,
+        Some(StatusCode::NOT_FOUND),
+        "flag-OFF snippet GET must 404 for an authenticated request (FLAG-01)"
+    );
+}

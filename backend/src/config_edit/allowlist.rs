@@ -415,6 +415,16 @@ pub const HYDRA_COOKIES: SectionAllowlist = SectionAllowlist {
 /// save. The `ui_urls_omits_logout_ui_url` test asserts its absence. If a logout
 /// redirect is ever wanted, add `/selfservice/flows/logout/after/default_browser_return_url`
 /// instead — NEVER `logout/ui_url`.
+///
+/// AX-04 (Phase 15 — Custom Domains): `/serve/public/base_url` is the Kratos
+/// public base URL / issuer the operator rebinds to a custom AX domain. It is a
+/// plain string (verified against `kratos.config.schema.json` `serve.public` via
+/// the `ory://serve-config` ref — the SAME sub-schema Hydra's General page uses
+/// for `serve.public.host`/`port`). It is NON-sensitive: only `/serve/admin` and
+/// `/serve/public/tls` are on `SENSITIVE_PREFIXES`, so `/serve/public/base_url`
+/// is NOT caught by Gate-1 (the `base_url_not_caught_by_sensitive_prefixes` test
+/// asserts this). It flows through the scalar config-edit engine (Kratos-only
+/// restart) like the rest of this section.
 pub const KRATOS_UI_URLS: SectionAllowlist = SectionAllowlist {
     service: "kratos",
     section: "ui-urls",
@@ -430,6 +440,9 @@ pub const KRATOS_UI_URLS: SectionAllowlist = SectionAllowlist {
         // secret/Jsonnet); it carries plain string URLs, so it flows through the
         // scalar engine unchanged. Per-index pointers are never allowlisted.
         "/selfservice/allowed_return_urls",
+        // AX-04 — the Kratos public base URL / issuer (custom-domain rebind).
+        // Non-sensitive (NOT under /serve/admin or /serve/public/tls); scalar.
+        "/serve/public/base_url",
         // DO NOT add `/selfservice/flows/logout/ui_url` (Pitfall 1).
     ],
 };
@@ -1191,6 +1204,51 @@ mod tests {
             KRATOS_UI_URLS.allowed_paths.iter().all(|p| !p.contains("logout")),
             "no UI-URL pointer may reference the logout flow"
         );
+    }
+
+    // ─── Phase 15 — AX-04 custom-domain base_url allowlist (15-03 Task 1) ───
+
+    /// AX-04: `/serve/public/base_url` is a MEMBER of the ui-urls allowlist and is
+    /// ACCEPTED through the section filter (the Kratos public base URL / issuer
+    /// rebind), while an out-of-scope `/serve/public/*` pointer is still rejected
+    /// (default-deny, full-pointer match).
+    #[test]
+    fn ui_urls_accepts_serve_public_base_url() {
+        assert!(
+            KRATOS_UI_URLS
+                .allowed_paths
+                .contains(&"/serve/public/base_url"),
+            "AX-04: serve.public.base_url must be allowlisted on the ui-urls section"
+        );
+        let ok = vec![(
+            "/serve/public/base_url".to_string(),
+            json!("https://accounts.example.com/"),
+        )];
+        assert!(
+            filter(&KRATOS_UI_URLS, &ok).is_ok(),
+            "AX-04: serve.public.base_url must pass the ui-urls filter"
+        );
+        // A sibling serve.public pointer that is NOT allowlisted is still rejected.
+        let oos = vec![("/serve/public/host".to_string(), json!("0.0.0.0"))];
+        assert!(
+            matches!(filter(&KRATOS_UI_URLS, &oos), Err(AppError::Forbidden)),
+            "AX-04: a non-allowlisted /serve/public/* pointer must be Forbidden"
+        );
+    }
+
+    /// AX-04: `/serve/public/base_url` must NOT be caught by `SENSITIVE_PREFIXES`
+    /// (Gate-1). Only `/serve/admin` and `/serve/public/tls` are sensitive — a
+    /// base_url write would be silently denied if a denylist prefix over-matched.
+    #[test]
+    fn base_url_not_caught_by_sensitive_prefixes() {
+        assert!(
+            !is_sensitive("/serve/public/base_url"),
+            "AX-04: serve.public.base_url must NOT be on the sensitive denylist"
+        );
+        // The adjacent sensitive pointers ARE still sensitive (defense-in-depth
+        // intact): /serve/admin/* and /serve/public/tls/* stay denied.
+        assert!(is_sensitive("/serve/admin/base_url"));
+        assert!(is_sensitive("/serve/public/tls/key/path"));
     }
 
     /// email_templates: KRATOS_EMAIL_TEMPLATES accepts each courier-template

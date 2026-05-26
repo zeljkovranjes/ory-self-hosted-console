@@ -623,6 +623,28 @@ pub fn build(
                 .get(crate::account_experience::routes::get_translations) // AX-03 read
                 .put(crate::account_experience::routes::put_translations), // AX-03 write (CSRF-guarded, 422 on malformed)
         )
+        // Phase 15 (AX-04 — Custom Domains): the SSRF-guarded reachability check +
+        // the reverse-proxy guidance-snippet generator. Same `account_experience`
+        // gate as the theming/localization routes above (flag-OFF → 404 past a
+        // valid session + CSRF, FLAG-01 / T-15-13). The reachability POST performs
+        // a server-side fetch of an operator-supplied URL — the highest-risk
+        // surface — so it is CSRF-guarded (state-changing) AND routes through the
+        // HOOK-02 SSRF guard (`webhooks::ssrf::validate_url` + pinned/redirects-off
+        // client) BEFORE any fetch: an internal/loopback/credentialed/metadata
+        // target is REFUSED as a 4xx, never a reachable:false success (T-15-11/15,
+        // Pitfall 7). The snippet GET is csrf-exempt (read-only), pure string
+        // output — NO fetch, NO file write, NO TLS/DNS provisioning (the operator's
+        // reverse proxy owns that). Both inherit auth_guard (401).
+        .push(
+            Router::with_path("api/account-experience/reachability")
+                .hoop(crate::features::FeatureFlagHoop::new("account_experience"))
+                .post(crate::account_experience::routes::reachability), // AX-04 SSRF-guarded probe (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/account-experience/reverse-proxy-snippet")
+                .hoop(crate::features::FeatureFlagHoop::new("account_experience"))
+                .get(crate::account_experience::routes::reverse_proxy_snippet), // AX-04 guidance snippet (read-only)
+        )
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
         // allowlisted values; PUT runs the full transactional flow. Both inherit
         // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`

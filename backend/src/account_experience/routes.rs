@@ -98,3 +98,50 @@ pub async fn put_translations(
     res.render(Json(json!({ "status": "saved", "translations": stored })));
     Ok(())
 }
+
+/// PUT body for the AX-04 reachability check: the operator-supplied URL to probe.
+#[derive(Debug, Deserialize)]
+struct ReachabilityBody {
+    url: String,
+}
+
+/// `POST /api/account-experience/reachability` — SSRF-guarded reachability probe
+/// of an operator-supplied custom-domain URL (AX-04 / T-15-11). CSRF-guarded (it
+/// performs a server-side fetch, so it is treated as state-changing for CSRF).
+///
+/// The HOOK-02 SSRF guard runs INSIDE `check_reachability` BEFORE any fetch: an
+/// internal/loopback/credentialed/metadata/non-http(s) target is REJECTED as a
+/// 4xx (`AppError::BadRequest` → 400) — NEVER collapsed into a `reachable:false`
+/// 200 (anti-false-green, T-15-15). A public target that passes the guard is
+/// fetched with the pinned, redirects-off client; a transport failure to that
+/// public host is a legitimate `{reachable:false}`.
+#[handler]
+pub async fn reachability(req: &mut Request, res: &mut Response) -> Result<(), AppError> {
+    let body = req
+        .parse_json::<ReachabilityBody>()
+        .await
+        .map_err(|_| AppError::BadRequest("expected a JSON body with a 'url' string".into()))?;
+    // The guard (and thus a 4xx on an internal/credentialed target) is enforced
+    // inside check_reachability — the rejection propagates as the guard's error.
+    let result = crate::account_experience::check_reachability(&body.url).await?;
+    res.status_code(StatusCode::OK);
+    res.render(Json(result));
+    Ok(())
+}
+
+/// `GET /api/account-experience/reverse-proxy-snippet?host=<axhost>` — generate a
+/// reverse-proxy GUIDANCE snippet (nginx/Caddy/Traefik) mapping the operator's AX
+/// origin to the Account Experience service + Kratos public path (AX-04). PURE
+/// string output: NO fetch, NO file write, NO TLS/DNS provisioning. csrf-exempt
+/// (read-only). A missing `host` falls back to a safe placeholder in the snippet.
+#[handler]
+pub async fn reverse_proxy_snippet(
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), AppError> {
+    let host = req.query::<String>("host").unwrap_or_default();
+    let snippet = crate::account_experience::reverse_proxy_snippet(&host);
+    res.status_code(StatusCode::OK);
+    res.render(Json(json!({ "snippet": snippet })));
+    Ok(())
+}
