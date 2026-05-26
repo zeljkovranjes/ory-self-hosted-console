@@ -12,3 +12,4 @@ pub mod db;
 pub mod error;
 pub mod ory;
 pub mod routes;
+pub mod webhooks;

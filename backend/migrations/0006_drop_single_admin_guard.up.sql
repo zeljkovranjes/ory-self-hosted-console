@@ -1,0 +1,11 @@
+-- 0006_drop_single_admin_guard.up.sql — Phase 11 PROJ-04 multi-operator unlock.
+--
+-- The inverse of 0002_single_admin_guard.up.sql. That migration's own comment
+-- (0002:9-11) directs Phase 11 to DROP the single-row guard once multi-admin
+-- "members" are introduced. RESEARCH (11-RESEARCH.md:421-423) flags this as the
+-- only stateful carry-over and requires the DROP be sequenced BEFORE any
+-- add-member path (Wave 2). Until this ran, the unique index on the constant
+-- expression `(true)` permitted at most one row in `admins`.
+--
+-- Idempotent: `if exists` so a re-run (or a never-applied 0002) does not error.
+drop index if exists admins_single_row_guard;

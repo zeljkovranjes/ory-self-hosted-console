@@ -2132,6 +2132,8 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "base64",
+ "hmac 0.12.1",
+ "ipnet",
  "jsonschema",
  "mockito",
  "oauth2",

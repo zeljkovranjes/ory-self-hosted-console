@@ -114,6 +114,15 @@ jsonschema = "0.46"
 # used by later plans; added now so the engine's deps are in place.
 tempfile = "3"
 
+# --- Phase 11: webhook dispatcher (HOOK-01/02/03) ----------------------------
+# HOOK-02 HMAC-SHA256 signing of webhook deliveries. PIN 0.12 to match the
+# existing direct sha2 0.10 (digest 0.10 traits) — hmac 0.13 targets digest 0.11
+# and will NOT type-check against Hmac<Sha256> over the sha2-0.10 Sha256.
+hmac = "0.12"
+# HOOK-02 SSRF: CIDR containment for any docker-network range beyond the std
+# classifiers. Promoted from transitive to direct (already resolved at 2.12).
+ipnet = "2.12"
+
 [dev-dependencies]
 # Salvo `test` feature exposes TestClient for in-process handler/middleware tests.
 salvo = { version = "0.93.0", features = ["test"] }
