@@ -180,6 +180,54 @@ secrets:
     - PLACEHOLDERcipherSECRET0123456AB
 "#;
 
+/// Phase-7 auth-config fixture: a Kratos doc that DOES carry a `courier` block
+/// (but NO `smtp.connection_uri` — so the SMTP GET reports `{set:false}`) AND a
+/// `selfservice.methods.oidc.config.providers` array whose single provider carries
+/// a real `client_secret` and a `base64://` `mapper_url` (so the OIDC GET must mask
+/// the secret and decode the mapper). The base64 mapper decodes to a small Jsonnet
+/// source. Like the default fixture it OMITS `dsn` (env-injected) and `session`.
+pub const KRATOS_AUTH_FIXTURE_YAML: &str = r#"serve:
+  public:
+    base_url: http://kratos:4433/
+  admin:
+    base_url: http://kratos:4434/
+
+identity:
+  default_schema_id: default
+  schemas:
+    - id: default
+      url: file:///etc/config/kratos/identity.schema.json
+
+selfservice:
+  default_browser_return_url: http://localhost:3000/
+  methods:
+    oidc:
+      enabled: true
+      config:
+        providers:
+          - id: google
+            provider: google
+            client_id: public-client-id
+            client_secret: REAL-OIDC-SECRET-DO-NOT-LEAK
+            mapper_url: "base64://bG9jYWwgY2xhaW1zID0gc3RkLmV4dFZhcigiY2xhaW1zIik7IHsgaWRlbnRpdHk6IHsgdHJhaXRzOiB7IGVtYWlsOiBjbGFpbXMuZW1haWwgfSB9IH0="
+
+courier:
+  smtp:
+    from_address: noreply@example.com
+    from_name: Example
+
+secrets:
+  cookie:
+    - PLACEHOLDERcookieSECRET0123456789AB
+  cipher:
+    - PLACEHOLDERcipherSECRET0123456AB
+"#;
+
+/// The plaintext Jsonnet source the `KRATOS_AUTH_FIXTURE_YAML` mapper decodes to
+/// (so the OIDC GET test can assert the decode round-trip).
+pub const KRATOS_AUTH_FIXTURE_MAPPER_SRC: &str =
+    r#"local claims = std.extVar("claims"); { identity: { traits: { email: claims.email } } }"#;
+
 /// A valid draft-07 identity schema WITH `properties.traits` — the deterministic
 /// "last-known-good" the IDENT-03 schema-editor tests seed and assert is left
 /// untouched after a rejected PUT. Mirrors the shape of the shipped
@@ -216,6 +264,14 @@ impl ConfigFixture {
     /// Create a fresh temp config-dir seeded with the no-session/no-dsn Kratos doc
     /// AND a valid identity schema file.
     pub fn new() -> Self {
+        Self::with_kratos_yaml(KRATOS_FIXTURE_YAML)
+    }
+
+    /// Create a fresh temp config-dir seeded with a CUSTOM `kratos.yml` body (plus
+    /// the same valid identity schema file). Used by the Phase-7 auth-config tests
+    /// to seed a doc that carries `courier`/`selfservice.methods.oidc.config.providers`
+    /// blocks the default `KRATOS_FIXTURE_YAML` omits.
+    pub fn with_kratos_yaml(kratos_yaml: &str) -> Self {
         // Unique per call: pid + nanos avoids collisions across parallel tests.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -223,7 +279,7 @@ impl ConfigFixture {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("ory-cfg-test-{}-{}", std::process::id(), nanos));
         std::fs::create_dir_all(root.join("kratos")).expect("create temp kratos dir");
-        std::fs::write(root.join("kratos").join("kratos.yml"), KRATOS_FIXTURE_YAML)
+        std::fs::write(root.join("kratos").join("kratos.yml"), kratos_yaml)
             .expect("seed temp kratos.yml");
         std::fs::write(
             root.join("kratos").join("identity.schema.json"),
