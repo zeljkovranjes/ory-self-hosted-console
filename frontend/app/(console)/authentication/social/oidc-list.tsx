@@ -118,6 +118,11 @@ type DraftState = {
   // untouched secret round-trips verbatim. Undefined when adding.
   originalSecret?: string;
   originalAppleKey?: string;
+  // CR-01: the provider id as GET returned it. The backend merge keys on `id`; if
+  // the operator renames it, the stored secret can no longer be preserved by
+  // echoing the sentinel (the backend fails closed 422). We track it so the dialog
+  // can require the secret to be re-entered on a rename. Undefined when adding.
+  originalId?: string;
 };
 
 function blankDraft(): DraftState {
@@ -194,6 +199,7 @@ function OidcTable({
       values: { ...p, client_secret: "", apple_private_key: "" },
       originalSecret: p.client_secret,
       originalAppleKey: p.apple_private_key,
+      originalId: p.id,
     });
   }
 
@@ -202,17 +208,25 @@ function OidcTable({
   }
 
   function commitDraft(next: OidcProvider, original: DraftState) {
-    // Compose write-only secrets: untouched -> the verbatim GET value (sentinel);
-    // typed -> the new value.
+    // CR-01: if the operator renamed the provider id, the backend can no longer
+    // resolve a sentinel-echoed secret (merge keys on `id`), so an untouched secret
+    // must NOT be echoed — `idChanged` makes composeSecret yield `undefined`. The
+    // dialog's Save guard already blocks this case, but we mirror the rule here so
+    // the composed payload is correct even if Save were bypassed.
+    const idChanged =
+      original.originalId !== undefined && next.id !== original.originalId;
+    // Compose write-only secrets: untouched + same id -> the verbatim GET value
+    // (sentinel, preserve); typed -> the new value; untouched + renamed -> dropped.
     const composed: OidcProvider = {
       ...next,
-      client_secret: composeSecret(
-        next.client_secret ?? "",
-        original.originalSecret,
-      ),
+      client_secret: composeSecret(next.client_secret ?? "", original.originalSecret, {
+        idChanged,
+      }),
       apple_private_key:
         next.provider === "apple"
-          ? composeSecret(next.apple_private_key ?? "", original.originalAppleKey)
+          ? composeSecret(next.apple_private_key ?? "", original.originalAppleKey, {
+              idChanged,
+            })
           : undefined,
     };
     // Apple forbids client_secret (schema allOf if/then).
@@ -319,6 +333,21 @@ function ProviderDialog({
   function set<K extends keyof OidcProvider>(k: K, val: OidcProvider[K]) {
     setV((prev) => ({ ...prev, [k]: val }));
   }
+
+  // CR-01: the id was renamed vs. what GET returned. The backend keys merge-by-id
+  // on `id`, so a renamed provider can NOT preserve its stored secret by echoing
+  // the sentinel — the operator must re-enter it (else the backend fails closed).
+  const idChanged =
+    draft.originalId !== undefined && v.id !== draft.originalId;
+  // The relevant write-only secret for the current provider type.
+  const hadStoredSecret = isApple
+    ? draft.originalAppleKey !== undefined
+    : draft.originalSecret !== undefined;
+  const typedSecret = isApple
+    ? (v.apple_private_key ?? "").length > 0
+    : (v.client_secret ?? "").length > 0;
+  // Renamed + had a stored secret + left blank => must re-enter (block Save).
+  const mustReenterSecret = idChanged && hadStoredSecret && !typedSecret;
 
   return (
     <Dialog open onOpenChange={(o) => (!o ? onCancel() : undefined)}>
@@ -481,11 +510,23 @@ function ProviderDialog({
           </p>
         </div>
 
+        {mustReenterSecret ? (
+          <p className="text-destructive text-sm" role="alert">
+            You changed this provider&rsquo;s ID. Re-enter the{" "}
+            {isApple ? "Apple private key" : "client secret"} — the stored secret
+            cannot be carried over to a renamed provider.
+          </p>
+        ) : null}
+
         <DialogFooter>
           <Button type="button" variant="outline" onClick={onCancel}>
             Cancel
           </Button>
-          <Button type="button" onClick={() => onSave(v)}>
+          <Button
+            type="button"
+            disabled={mustReenterSecret}
+            onClick={() => onSave(v)}
+          >
             Save provider
           </Button>
         </DialogFooter>

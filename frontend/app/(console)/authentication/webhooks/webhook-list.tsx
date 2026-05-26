@@ -95,6 +95,13 @@ type WebhookEntry = {
   parse: boolean;
   // The secret as GET returned it (sentinel) so an untouched secret round-trips.
   originalSecret?: string;
+  // CR-01 / WR-01 / WR-03: webhooks have no stable id — the backend keys merge by
+  // `config.url`. We capture the url + auth kind as GET returned them so a rename
+  // (or auth-kind switch) can NOT echo the sentinel (the backend would fail closed
+  // 422); the operator is prompted to re-enter the secret instead. Undefined on a
+  // freshly added entry.
+  originalUrl?: string;
+  originalKind?: AuthKind;
 };
 
 export type WebhookDefaults = Record<string, unknown[]>;
@@ -142,6 +149,8 @@ function toEntries(defaults: WebhookDefaults): WebhookEntry[] {
             : kind === "api_key"
               ? (ac.value as string | undefined)
               : undefined,
+        originalUrl: (cfg.url as string) ?? "",
+        originalKind: kind,
       });
     }
   }
@@ -159,12 +168,21 @@ function toFlat(entries: WebhookEntry[]): Record<string, unknown[]> {
       body: e.body,
       response: { ignore: e.ignore, parse: e.parse },
     };
+    // CR-01 / WR-01 / WR-03: the backend keys merge-by-id on config.url. If the url
+    // OR the auth kind changed vs. what GET returned, the stored secret can't be
+    // preserved by echoing the sentinel — `idChanged` makes composeSecret drop it
+    // (the dialog Save guard requires re-entry for the happy path).
+    const identityChanged =
+      (e.originalUrl !== undefined && e.url !== e.originalUrl) ||
+      (e.originalKind !== undefined && e.authKind !== e.originalKind);
     if (e.authKind === "basic_auth") {
       config.auth = {
         type: "basic_auth",
         config: {
           user: e.basicUser,
-          password: composeSecret(e.basicPassword, e.originalSecret),
+          password: composeSecret(e.basicPassword, e.originalSecret, {
+            idChanged: identityChanged,
+          }),
         },
       };
     } else if (e.authKind === "api_key") {
@@ -172,7 +190,9 @@ function toFlat(entries: WebhookEntry[]): Record<string, unknown[]> {
         type: "api_key",
         config: {
           name: e.apiKeyName,
-          value: composeSecret(e.apiKeyValue, e.originalSecret),
+          value: composeSecret(e.apiKeyValue, e.originalSecret, {
+            idChanged: identityChanged,
+          }),
           in: e.apiKeyIn || "header",
         },
       };
@@ -361,6 +381,28 @@ function WebhookDialog({
     setV((prev) => ({ ...prev, [k]: val }));
   }
 
+  // CR-01 / WR-01 / WR-03: webhooks have no stable id — the backend merges by
+  // config.url. If the operator changed the URL or the auth kind, the stored
+  // secret can't be carried over (the backend fails closed 422), so require it to
+  // be re-entered when one was stored.
+  const hadStoredSecret = entry.originalSecret !== undefined;
+  const identityChanged =
+    (entry.originalUrl !== undefined && v.url !== entry.originalUrl) ||
+    (entry.originalKind !== undefined && v.authKind !== entry.originalKind);
+  const typedSecret =
+    v.authKind === "basic_auth"
+      ? v.basicPassword.length > 0
+      : v.authKind === "api_key"
+        ? v.apiKeyValue.length > 0
+        : false;
+  // Only block when the (changed) entry still uses an auth kind that needs a
+  // secret AND one was previously stored AND the operator hasn't re-typed it.
+  const mustReenterSecret =
+    identityChanged &&
+    hadStoredSecret &&
+    v.authKind !== "none" &&
+    !typedSecret;
+
   // response.ignore XOR response.parse (Pitfall 8): enabling one disables the
   // other.
   function setIgnore(on: boolean) {
@@ -531,11 +573,23 @@ function WebhookDialog({
           </div>
         </div>
 
+        {mustReenterSecret ? (
+          <p className="text-destructive text-sm" role="alert">
+            You changed this webhook&rsquo;s URL or authentication type. Re-enter
+            the secret — the stored secret cannot be carried over when the URL or
+            auth type changes.
+          </p>
+        ) : null}
+
         <DialogFooter>
           <Button type="button" variant="outline" onClick={onCancel}>
             Cancel
           </Button>
-          <Button type="button" onClick={() => onSave(v)}>
+          <Button
+            type="button"
+            disabled={mustReenterSecret}
+            onClick={() => onSave(v)}
+          >
             Save webhook
           </Button>
         </DialogFooter>

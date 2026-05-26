@@ -107,7 +107,7 @@ describe("Actions & Webhooks list editor (AUTH-11/HOOK-04)", () => {
     expect(await screen.findByTestId("monaco")).toBeInTheDocument();
   });
 
-  it("an untouched auth secret resends EXACTLY the value GET returned (sentinel verbatim)", async () => {
+  it("an untouched auth secret resends the GET sentinel verbatim when the URL is UNCHANGED", async () => {
     renderEditor({
       [LOGIN_AFTER]: [
         {
@@ -127,9 +127,10 @@ describe("Actions & Webhooks list editor (AUTH-11/HOOK-04)", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /edit/i }));
     const dialog = await screen.findByRole("dialog");
-    // Touch the URL to dirty, leave the secret blank.
-    const url = within(dialog).getByLabelText(/^url/i);
-    await userEvent.type(url, "/v2");
+    // Edit a NON-identity field (method), leave the URL and secret untouched.
+    const method = within(dialog).getByLabelText(/^method/i);
+    await userEvent.clear(method);
+    await userEvent.type(method, "PUT");
     await userEvent.click(within(dialog).getByRole("button", { name: /^save webhook/i }));
 
     await userEvent.click(screen.getByRole("button", { name: /^save$/i }));
@@ -139,7 +140,56 @@ describe("Actions & Webhooks list editor (AUTH-11/HOOK-04)", () => {
     const auth = (arr[0].config as Record<string, unknown>).auth as {
       config: { value: string };
     };
+    // URL unchanged -> the sentinel is safely echoed (backend preserves the secret).
     expect(auth.config.value).toBe(SERVER_SENTINEL);
+  });
+
+  it("CR-01: changing the URL while leaving the secret blank requires re-entry (Save blocked)", async () => {
+    renderEditor({
+      [LOGIN_AFTER]: [
+        {
+          hook: "web_hook",
+          config: {
+            url: "https://h.example.com",
+            method: "POST",
+            body: "local x = 1;",
+            auth: {
+              type: "api_key",
+              config: { name: "X-Key", value: SERVER_SENTINEL, in: "header" },
+            },
+          },
+        },
+      ],
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: /edit/i }));
+    const dialog = await screen.findByRole("dialog");
+    // Rename the URL (the merge identity) while leaving the secret blank — the
+    // sentinel can no longer be safely echoed (backend would fail closed 422).
+    const url = within(dialog).getByLabelText(/^url/i);
+    await userEvent.type(url, "/v2");
+
+    // A re-entry prompt appears and the Save button is disabled.
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(/re-enter the secret/i);
+    expect(
+      within(dialog).getByRole("button", { name: /^save webhook/i }),
+    ).toBeDisabled();
+
+    // Re-typing the secret unblocks Save and sends the NEW value (never the sentinel).
+    await userEvent.type(
+      within(dialog).getByLabelText(/api key value/i),
+      "new-token",
+    );
+    await userEvent.click(within(dialog).getByRole("button", { name: /^save webhook/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => expect(findPut()).toBeTruthy());
+    const arr = putBody()[LOGIN_AFTER] as Array<Record<string, unknown>>;
+    const auth = (arr[0].config as Record<string, unknown>).auth as {
+      config: { value: string };
+    };
+    expect(auth.config.value).toBe("new-token");
+    expect(auth.config.value).not.toBe(SERVER_SENTINEL);
   });
 
   it("only the allowlisted attach points are offered", async () => {

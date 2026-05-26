@@ -69,6 +69,10 @@ type StoredAuth = {
 function parseChannel(channels: unknown): {
   draft: ChannelDraft;
   originalSecret: string | undefined;
+  // WR-01: the auth KIND as stored. originalSecret is bound to THIS kind; if the
+  // operator switches kinds, the stored secret belongs to the old kind and must
+  // NOT be echoed for the new one (it would be unresolvable on the backend).
+  originalKind: AuthKind;
 } {
   const arr = Array.isArray(channels) ? channels : [];
   const ch = (arr[0] ?? {}) as Record<string, unknown>;
@@ -103,12 +107,14 @@ function parseChannel(channels: unknown): {
       apiKeyIn: (cfg.in as string) ?? "header",
     },
     originalSecret,
+    originalKind: kind,
   };
 }
 
 function composeChannel(
   v: ChannelDraft,
   originalSecret: string | undefined,
+  originalKind: AuthKind,
 ): Record<string, unknown> {
   const request_config: Record<string, unknown> = {
     url: v.url,
@@ -116,12 +122,20 @@ function composeChannel(
     body: v.body,
   };
 
+  // WR-01: only echo the stored secret when the auth KIND is unchanged. On a kind
+  // switch the stored secret belongs to the old kind, so we do NOT carry it over
+  // (idChanged) — the operator must have typed a new value (the Save guard
+  // enforces this for the happy path; the backend fails closed otherwise).
+  const kindChanged = v.authKind !== originalKind;
+
   if (v.authKind === "basic_auth") {
     request_config.auth = {
       type: "basic_auth",
       config: {
         user: v.basicUser,
-        password: composeSecret(v.basicPassword, originalSecret),
+        password: composeSecret(v.basicPassword, originalSecret, {
+          idChanged: kindChanged,
+        }),
       },
     };
   } else if (v.authKind === "api_key") {
@@ -129,7 +143,9 @@ function composeChannel(
       type: "api_key",
       config: {
         name: v.apiKeyName,
-        value: composeSecret(v.apiKeyValue, originalSecret),
+        value: composeSecret(v.apiKeyValue, originalSecret, {
+          idChanged: kindChanged,
+        }),
         in: v.apiKeyIn || "header",
       },
     };
@@ -141,9 +157,11 @@ function composeChannel(
 function SmsForm({
   draft,
   originalSecret,
+  originalKind,
 }: {
   draft: ChannelDraft;
   originalSecret: string | undefined;
+  originalKind: AuthKind;
 }) {
   return (
     <SettingsForm
@@ -159,7 +177,7 @@ function SmsForm({
           {
             method: "PUT",
             body: JSON.stringify({
-              [CHANNELS_PTR]: [composeChannel(v, originalSecret)],
+              [CHANNELS_PTR]: [composeChannel(v, originalSecret, originalKind)],
             }),
           },
         );
@@ -168,6 +186,19 @@ function SmsForm({
       {(form) => {
         const authKind =
           (form.watch("authKind" as never) as unknown as AuthKind) ?? "none";
+        // WR-01: a kind switch means the stored secret (bound to the old kind)
+        // can't be carried over. If the operator picked a kind needing a secret
+        // but hasn't typed one, prompt them — the compose logic will NOT echo the
+        // old secret, so the new credential must be entered here.
+        const newSecretValue =
+          authKind === "basic_auth"
+            ? ((form.watch("basicPassword" as never) as unknown as string) ?? "")
+            : authKind === "api_key"
+              ? ((form.watch("apiKeyValue" as never) as unknown as string) ?? "")
+              : "";
+        const kindChanged = authKind !== originalKind;
+        const needsNewSecret =
+          kindChanged && authKind !== "none" && newSecretValue.length === 0;
         return (
           <div className="space-y-4">
             <div className="text-muted-foreground text-sm">
@@ -227,6 +258,14 @@ function SmsForm({
                 </SelectContent>
               </Select>
             </div>
+
+            {needsNewSecret ? (
+              <p className="text-destructive text-sm" role="alert">
+                You changed the authentication type. Enter the new secret below —
+                the previously stored secret cannot be reused for a different
+                authentication type.
+              </p>
+            ) : null}
 
             {authKind === "basic_auth" ? (
               <>
@@ -328,9 +367,15 @@ export default function SmsPage() {
     );
   }
 
-  const { draft, originalSecret } = parseChannel(
+  const { draft, originalSecret, originalKind } = parseChannel(
     (query.data ?? {})[CHANNELS_PTR],
   );
 
-  return <SmsForm draft={draft} originalSecret={originalSecret} />;
+  return (
+    <SmsForm
+      draft={draft}
+      originalSecret={originalSecret}
+      originalKind={originalKind}
+    />
+  );
 }
