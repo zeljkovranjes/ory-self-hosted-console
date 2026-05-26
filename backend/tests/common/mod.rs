@@ -76,6 +76,13 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
         // `Config::from_env`.
         restart_broker_url: "http://restart-broker:2375".to_string(),
         config_dir: "/etc/config".to_string(),
+        // Phase 14 (SSO-02/04): Polis admin base + write-only api key + issuer.
+        // The router fixtures do not call Polis; defaults mirror `Config::from_env`
+        // (the key/issuer are absent so the SAML routes 502 rather than calling
+        // Polis unauthenticated — exercised by the dedicated sso route tests).
+        polis_admin_url: "http://polis:5225".to_string(),
+        polis_api_key: None,
+        polis_external_url: None,
         // Phase 11 (HOOK-01/02): the webhook SSRF relaxation raw flag. Production
         // default is false; the effective posture is double-gated by
         // `webhook_allow_private_targets()` (also requires insecure_cookies). The

@@ -18,4 +18,5 @@ pub mod members;
 pub mod overview;
 pub mod ory;
 pub mod routes;
+pub mod sso;
 pub mod webhooks;

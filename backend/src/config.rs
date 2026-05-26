@@ -41,6 +41,14 @@ const DEFAULT_KETO_WRITE_URL: &str = "http://keto:4467";
 const DEFAULT_KETO_OPL_URL: &str = "http://keto:4469";
 const DEFAULT_OATHKEEPER_API_URL: &str = "http://oathkeeper:4456";
 
+/// Internal-network default for the Ory Polis ADMIN/OIDC base URL (Phase 14,
+/// SSO-02/04). Polis serves its admin connection API (`/api/v1/sso`) and OIDC
+/// surface on the single internal port 5225 (NEVER host-published, INFRA-05).
+/// The backend is the SOLE client of the Polis admin API. Server-defined,
+/// never client input. base is bare `scheme://host:port` (the `/api/v1/sso`
+/// path is appended by the `sso::polis_admin` client).
+const DEFAULT_POLIS_ADMIN_URL: &str = "http://polis:5225";
+
 /// Internal-network default for the Phase-1 restart broker (`wollomatic`
 /// socket-proxy). Phase 4 (BACK-05): the backend holds NO docker socket — it
 /// triggers a single-container restart by POSTing to this scoped broker over the
@@ -136,6 +144,25 @@ pub struct Config {
     /// `<config_dir>/<service>/<file>`. NON-SECRET fixed path; never client input.
     pub config_dir: String,
 
+    // --- Phase 14 (SSO-02/03/04): Polis SAML connection admin -----------------
+    /// Internal Polis ADMIN/OIDC base URL (env `POLIS_ADMIN_URL`, default
+    /// `http://polis:5225`). The `sso::polis_admin` client targets
+    /// `{polis_admin_url}/api/v1/sso` with `Authorization: Api-Key`. INFRA-05:
+    /// internal-only DNS; never host-published, never frontend-facing. NON-SECRET
+    /// (carries no credential) — cleartext in the redacting `Debug`.
+    pub polis_admin_url: String,
+    /// Polis admin API key (env `POLIS_API_KEY`, == the Polis `API_KEYS`). SECRET
+    /// (BACK-07 / T-14-04): the `Authorization: Api-Key` credential for the Polis
+    /// admin API. NEVER logged, NEVER serialized to any response — REDACTED in the
+    /// `Debug` impl. `None` when unset (the SAML routes then surface a 502 rather
+    /// than calling Polis unauthenticated).
+    pub polis_api_key: Option<String>,
+    /// Polis single public OIDC issuer URL (env `POLIS_EXTERNAL_URL`, == the Polis
+    /// `EXTERNAL_URL`). This is the `issuer_url` written into the Kratos generic
+    /// provider entry (Phase-13 split-horizon Pattern A — reachable identically by
+    /// the browser and by Kratos server-side). NON-SECRET — cleartext in `Debug`.
+    pub polis_external_url: Option<String>,
+
     // --- Phase 11 (HOOK-01/02): webhook worker SSRF posture -----------------
     /// Whether the webhook delivery worker is permitted to deliver to PRIVATE /
     /// loopback / docker-internal targets (env `WEBHOOK_ALLOW_PRIVATE_TARGETS`,
@@ -175,6 +202,12 @@ impl fmt::Debug for Config {
             // Config-edit subsystem URLs/paths are non-secret: print in cleartext.
             .field("restart_broker_url", &self.restart_broker_url)
             .field("config_dir", &self.config_dir)
+            // Polis admin URL + issuer are non-secret: cleartext. The Polis API
+            // key is a SECRET — never print it, even its presence is collapsed to
+            // a redaction marker (BACK-07 / T-14-04).
+            .field("polis_admin_url", &self.polis_admin_url)
+            .field("polis_api_key", &self.polis_api_key.as_ref().map(|_| "<redacted>"))
+            .field("polis_external_url", &self.polis_external_url)
             .field(
                 "webhook_allow_private_targets",
                 &self.webhook_allow_private_targets,
@@ -277,6 +310,16 @@ impl Config {
         let config_dir =
             env::var("CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string());
 
+        // Phase 14 (SSO-02/04): Polis admin base + the write-only Api-Key + the
+        // public issuer URL. The admin base falls back to the internal default;
+        // the API key + issuer are optional (the SAML routes 502 if the key is
+        // missing rather than calling Polis unauthenticated). An empty env value
+        // is treated as unset (mirrors the GitHub id/secret gating).
+        let polis_admin_url =
+            env::var("POLIS_ADMIN_URL").unwrap_or_else(|_| DEFAULT_POLIS_ADMIN_URL.to_string());
+        let polis_api_key = env::var("POLIS_API_KEY").ok().filter(|s| !s.is_empty());
+        let polis_external_url = env::var("POLIS_EXTERNAL_URL").ok().filter(|s| !s.is_empty());
+
         // Phase 11 (HOOK-01/02): the webhook-worker SSRF relaxation flag. Parsed
         // permissively, default false. It is ONLY consulted via
         // `webhook_allow_private_targets()`, which additionally requires the dev
@@ -301,6 +344,9 @@ impl Config {
             oathkeeper_api_url,
             restart_broker_url,
             config_dir,
+            polis_admin_url,
+            polis_api_key,
+            polis_external_url,
             webhook_allow_private_targets,
         })
     }
