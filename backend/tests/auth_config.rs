@@ -294,7 +294,7 @@ fn unit_merge_preserves_masked_oidc_secret() {
         "id": "google", "provider": "google", "client_id": "pub-edited",
         "client_secret": MASKED, "mapper_url": "x;"
     })];
-    let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC);
+    let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC).expect("merge ok");
     assert_eq!(
         merged[0]["client_secret"],
         serde_json::json!("REAL"),
@@ -307,8 +307,18 @@ fn unit_merge_preserves_masked_oidc_secret() {
         "id": "google", "provider": "google", "client_id": "pub",
         "client_secret": "NEW", "mapper_url": "x;"
     })];
-    let merged2 = merge_array_by_id(&stored, &incoming2, &OIDC_SPEC);
+    let merged2 = merge_array_by_id(&stored, &incoming2, &OIDC_SPEC).expect("merge ok");
     assert_eq!(merged2[0]["client_secret"], serde_json::json!("NEW"));
+
+    // CR-01 fail-closed: renaming the id while leaving the secret masked has no
+    // stored value to inherit -> the merge refuses (the sentinel is never written).
+    let incoming3 = vec![serde_json::json!({
+        "id": "g00gle", "provider": "google", "client_id": "pub",
+        "client_secret": MASKED, "mapper_url": "x;"
+    })];
+    let err = merge_array_by_id(&stored, &incoming3, &OIDC_SPEC)
+        .expect_err("renamed-id + masked secret must fail closed (CR-01)");
+    assert_eq!(err.item_id.as_deref(), Some("g00gle"));
 }
 
 #[test]

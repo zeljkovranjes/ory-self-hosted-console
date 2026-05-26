@@ -47,6 +47,7 @@ use salvo::prelude::*;
 use serde_json::{Map, Value};
 
 use crate::config::Config;
+use crate::config_edit::secret_merge::{get_dot, set_dot};
 use crate::config_edit::{allowlist, locks, restart, schema, secret_merge, yaml};
 use crate::error::AppError;
 
@@ -140,33 +141,10 @@ fn array_section_descriptor(section: &str) -> Option<ArraySectionDescriptor> {
     }
 }
 
-/// Read a dot-notation path on a JSON object (immutable). `None` if any
-/// intermediate is missing or not an object.
-fn get_dot<'a>(item: &'a Value, dot_path: &str) -> Option<&'a Value> {
-    let mut cur = item;
-    for seg in dot_path.split('.') {
-        cur = cur.as_object()?.get(seg)?;
-    }
-    Some(cur)
-}
-
-/// Set a dot-notation path on a JSON object, creating intermediate objects;
-/// graceful no-op if an intermediate exists but is not an object.
-fn set_dot(item: &mut Value, dot_path: &str, value: Value) {
-    let segs: Vec<&str> = dot_path.split('.').collect();
-    let mut cur = item;
-    for (i, seg) in segs.iter().enumerate() {
-        let last = i + 1 == segs.len();
-        let Value::Object(map) = cur else { return };
-        if last {
-            map.insert((*seg).to_string(), value);
-            return;
-        }
-        cur = map
-            .entry((*seg).to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    }
-}
+// WR-04: the dot-path getter/setter live in `secret_merge` (the single canonical
+// definition) and are imported above — NOT re-declared here. Keeping one copy
+// guarantees the mask/merge/encode pipeline shares identical non-object/graceful
+// semantics; a divergent second copy was the subtle secret-handling drift risk.
 
 /// GET transform for an array value: mask per-item secrets, then DECODE each item's
 /// Jsonnet `base64://` field back to source for the editor. A non-array value is
@@ -194,18 +172,42 @@ fn array_get_transform(value: &Value, desc: &ArraySectionDescriptor) -> Result<V
 /// (preserving masked secrets, Pitfall 3), then ENCODE each item's edited Jsonnet
 /// source field to `base64://` before it lands in the doc. A non-array incoming
 /// value is returned unchanged (defensive — the schema validate will reject it).
+///
+/// CR-01: merge-by-id can FAIL CLOSED — if an incoming item carries the masked
+/// sentinel for a secret but no stored value can be inherited (renamed id/url, or
+/// an auth-kind switch left the stored item without that field), this returns a
+/// 422 `AppError::Validation` telling the operator to re-enter the secret for the
+/// named item, rather than writing the literal sentinel as a real credential.
 fn array_put_transform(
     stored: &Value,
     incoming: &Value,
     desc: &ArraySectionDescriptor,
-) -> Value {
+) -> Result<Value, AppError> {
     let Some(incoming_items) = incoming.as_array() else {
-        return incoming.clone();
+        return Ok(incoming.clone());
     };
     let empty: Vec<Value> = Vec::new();
     let stored_items = stored.as_array().unwrap_or(&empty);
     // 1) merge-by-id: a masked/absent incoming secret inherits the stored value.
-    let mut merged = secret_merge::merge_array_by_id(stored_items, incoming_items, &desc.spec);
+    //    A masked secret with NO stored value to inherit fails closed (CR-01).
+    let mut merged = secret_merge::merge_array_by_id(stored_items, incoming_items, &desc.spec)
+        .map_err(|e| {
+            // Value-free 422: name the item (operator-supplied id, never the secret)
+            // and instruct the operator to re-enter the secret. The sentinel literal
+            // is never logged or echoed.
+            let which = e
+                .item_id
+                .as_deref()
+                .map(|id| format!("'{id}'"))
+                .unwrap_or_else(|| "the edited item".to_string());
+            tracing::debug!("array put: masked secret with no stored value to inherit (fail-closed)");
+            AppError::Validation(vec![schema::FieldError {
+                path: String::new(),
+                message: format!(
+                    "re-enter the secret for {which} (its identifier changed, so the stored secret cannot be preserved)"
+                ),
+            }])
+        })?;
     // 2) re-encode each edited Jsonnet source field to base64://. The editor sent
     //    PLAINTEXT source (the GET decoded it); store it back as base64://. If the
     //    field already carries a base64:// URI (untouched), re-encoding the decoded
@@ -219,7 +221,7 @@ fn array_put_transform(
             }
         }
     }
-    Value::Array(merged)
+    Ok(Value::Array(merged))
 }
 
 /// `GET /api/config/<service>/<section>` — current allowlisted values, absent
@@ -343,10 +345,13 @@ pub async fn put_config(
             .map(|(ptr, incoming)| {
                 // The stored value at this exact root pointer (absent -> empty).
                 let stored = merged.pointer(&ptr).cloned().unwrap_or(Value::Null);
-                let transformed = array_put_transform(&stored, &incoming, &desc);
-                (ptr, transformed)
+                // CR-01: a masked secret with no stored value to inherit fails
+                // closed here (422) BEFORE any disk touch — the sentinel literal
+                // never reaches `apply_patch`/`write_atomic`.
+                let transformed = array_put_transform(&stored, &incoming, &desc)?;
+                Ok::<_, AppError>((ptr, transformed))
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         filtered
     };
@@ -960,7 +965,7 @@ mod tests {
             "mapper_url": "new source;"
         }]);
         let desc = array_section_descriptor("oidc").unwrap();
-        let out = array_put_transform(&stored, &incoming, &desc);
+        let out = array_put_transform(&stored, &incoming, &desc).expect("transform ok");
         let item = &out.as_array().unwrap()[0];
         // Stored secret preserved (NOT clobbered with the mask).
         assert_eq!(item["client_secret"], json!("REAL-SECRET"));
@@ -980,6 +985,44 @@ mod tests {
         let desc = array_section_descriptor("oidc").unwrap();
         let scalar = json!(true);
         assert_eq!(array_get_transform(&scalar, &desc).unwrap(), json!(true));
-        assert_eq!(array_put_transform(&json!(null), &scalar, &desc), json!(true));
+        assert_eq!(
+            array_put_transform(&json!(null), &scalar, &desc).expect("passthrough ok"),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn array_put_transform_fails_closed_on_renamed_id_masked_secret() {
+        // CR-01: an OIDC PUT that renames the provider id while leaving the
+        // client_secret masked has no stored value to inherit -> 422 (the
+        // sentinel literal must NEVER be written to disk).
+        let stored = json!([{
+            "id": "google",
+            "provider": "google",
+            "client_id": "public-id",
+            "client_secret": "REAL-SECRET",
+            "mapper_url": crate::config_edit::jsonnet::encode_base64_uri("m;")
+        }]);
+        let incoming = json!([{
+            "id": "g00gle",
+            "provider": "google",
+            "client_id": "public-id",
+            "client_secret": secret_merge::MASKED,
+            "mapper_url": "m;"
+        }]);
+        let desc = array_section_descriptor("oidc").unwrap();
+        let err = array_put_transform(&stored, &incoming, &desc)
+            .expect_err("renamed-id + masked secret must 422");
+        match err {
+            AppError::Validation(fields) => {
+                assert_eq!(fields.len(), 1);
+                // The operator-safe message names the item and asks to re-enter;
+                // it never contains the secret value or the sentinel literal.
+                assert!(fields[0].message.contains("g00gle"));
+                assert!(fields[0].message.contains("re-enter the secret"));
+                assert!(!fields[0].message.contains(secret_merge::MASKED));
+            }
+            other => panic!("expected Validation 422, got {other:?}"),
+        }
     }
 }

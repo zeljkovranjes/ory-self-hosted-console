@@ -24,6 +24,12 @@
 //!     same `id` carries a real value, copy the stored value back in (preserve);
 //!     a freshly-typed secret OVERWRITES; a new id keeps incoming verbatim; an id
 //!     present only in `stored` is DROPPED (removal). Stable order = incoming.
+//!     CR-01 FAIL-CLOSED: if an incoming secret field is the [`MASKED`] sentinel but
+//!     no stored value can be resolved (the id/url was renamed, or the stored item
+//!     lacks that field — e.g. an auth-kind switch, WR-01), the merge REFUSES with
+//!     [`MaskWithoutStored`] rather than writing the literal sentinel to disk; the
+//!     caller turns that into a value-free 422 telling the operator to re-enter the
+//!     secret for the renamed item. The sentinel literal NEVER reaches disk.
 //!
 //! ## AUTHORITATIVE CROSS-PLAN CONTRACT — the masked-secret sentinel
 //!
@@ -45,6 +51,21 @@ use serde_json::Value;
 /// exact literal). Emitted on GET for any stored secret; detected on PUT to mean
 /// "preserve the existing stored value".
 pub const MASKED: &str = "__ory_console_masked__";
+
+/// CR-01 fail-closed error: a PUT array item carried the [`MASKED`] sentinel for a
+/// secret field but the merge could NOT resolve a stored secret to inherit (the
+/// item's id was renamed so no stored item matches, OR the stored item has no value
+/// for that field — e.g. an auth-KIND switch, WR-01). Writing the literal sentinel
+/// to disk would silently clobber the credential (Pitfall 3), so the merge REFUSES
+/// and the caller surfaces a value-free 422. Carries the (operator-safe) item id so
+/// the caller can name which item needs its secret re-entered. NEVER carries the
+/// secret value or the sentinel itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskWithoutStored {
+    /// The id/url of the offending incoming item (operator-supplied, safe to echo).
+    /// `None` when the item had no resolvable id.
+    pub item_id: Option<String>,
+}
 
 /// Per-section descriptor: the item `id` field and the dot-notation paths of the
 /// per-item secret fields within an item. Dot paths address NESTED object fields
@@ -98,7 +119,10 @@ fn item_id(item: &Value, id_field: &str) -> Option<String> {
 
 /// Walk a dot-notation path to an existing scalar/leaf node (immutable). Returns
 /// `None` if any intermediate is missing or not an object (graceful).
-fn get_dot<'a>(item: &'a Value, dot_path: &str) -> Option<&'a Value> {
+///
+/// WR-04: this is the SINGLE canonical dot-path getter. `routes.rs` imports it
+/// rather than re-declaring its own (the duplicate drifted-secret-handling risk).
+pub fn get_dot<'a>(item: &'a Value, dot_path: &str) -> Option<&'a Value> {
     let mut cur = item;
     for seg in dot_path.split('.') {
         cur = cur.as_object()?.get(seg)?;
@@ -110,7 +134,9 @@ fn get_dot<'a>(item: &'a Value, dot_path: &str) -> Option<&'a Value> {
 /// If an intermediate exists but is NOT an object, the set is a graceful no-op
 /// (we never coerce/clobber a non-object node — mirrors the engine's
 /// apply_patch non-object guard).
-fn set_dot(item: &mut Value, dot_path: &str, value: Value) {
+///
+/// WR-04: this is the SINGLE canonical dot-path setter, shared with `routes.rs`.
+pub fn set_dot(item: &mut Value, dot_path: &str, value: Value) {
     let segs: Vec<&str> = dot_path.split('.').collect();
     let mut cur = item;
     for (i, seg) in segs.iter().enumerate() {
@@ -163,38 +189,68 @@ pub fn mask_array_secrets(items: &[Value], spec: &ArraySecretSpec) -> Vec<Value>
 ///     value back in (preserve); a freshly-typed (non-sentinel) secret is KEPT
 ///     (overwrite);
 ///   - if no same-id stored item exists, the incoming item is kept verbatim (a
-///     brand-new provider with a real secret).
+///     brand-new provider with a real secret) — UNLESS it carries the [`MASKED`]
+///     sentinel for a secret (see fail-closed below).
 ///
 /// An id present ONLY in `stored` is DROPPED (the operator removed it).
 ///
 /// An incoming item with NO resolvable id is kept verbatim (it cannot match a
-/// stored item; treated as new).
-pub fn merge_array_by_id(stored: &[Value], incoming: &[Value], spec: &ArraySecretSpec) -> Vec<Value> {
+/// stored item; treated as new) — again UNLESS it carries the sentinel.
+///
+/// ## CR-01 / WR-01 / WR-02 / WR-03 — FAIL-CLOSED on an unresolvable masked secret
+///
+/// Mask detection runs INDEPENDENT of id matching. If an incoming secret field
+/// equals the [`MASKED`] sentinel but the merge cannot find a stored value to
+/// inherit — because the id/url was renamed (no matching stored item), the item
+/// has no id at all, OR the matched stored item has no value for that field (an
+/// auth-KIND switch leaves the new kind's field empty in `stored`) — this returns
+/// `Err(MaskWithoutStored)` and writes NOTHING. The caller maps it to a 422 telling
+/// the operator to re-enter the secret. The literal sentinel string is NEVER
+/// persisted as a real credential (Pitfall 3 clobber, the central Phase-7 risk).
+///
+/// An ABSENT (not-sentinel) secret with no stored value is genuinely "no secret" —
+/// it is left absent, not an error (e.g. switching an item to no-auth, WR-05).
+pub fn merge_array_by_id(
+    stored: &[Value],
+    incoming: &[Value],
+    spec: &ArraySecretSpec,
+) -> Result<Vec<Value>, MaskWithoutStored> {
     incoming
         .iter()
         .map(|inc| {
             let mut merged = inc.clone();
-            let Some(id) = item_id(inc, spec.id_field) else {
-                return merged; // no id -> treat as new, keep verbatim
-            };
-            // Find the stored item with the same id.
-            let stored_item = stored
-                .iter()
-                .find(|s| item_id(s, spec.id_field).as_deref() == Some(id.as_str()));
-            let Some(stored_item) = stored_item else {
-                return merged; // new id -> keep incoming verbatim (incl. real secret)
-            };
+            let id = item_id(inc, spec.id_field);
+            // Find the stored item with the same id (None if no id or no match).
+            let stored_item = id.as_deref().and_then(|id| {
+                stored
+                    .iter()
+                    .find(|s| item_id(s, spec.id_field).as_deref() == Some(id))
+            });
             for field in spec.secret_fields {
-                // Preserve the stored secret iff the incoming value is masked or
-                // absent AND the stored item has a real (present) value.
+                // The incoming value for this secret field is masked or absent.
                 let incoming_missing = get_dot(inc, field).is_none();
-                if is_masked(inc, field) || incoming_missing {
-                    if let Some(stored_secret) = get_dot(stored_item, field) {
-                        set_dot(&mut merged, field, stored_secret.clone());
+                let masked = is_masked(inc, field);
+                if !masked && !incoming_missing {
+                    continue; // a freshly-typed secret OVERWRITES — keep it as-is.
+                }
+                // Resolve the stored value to inherit (None if the id was renamed,
+                // had no match, or the stored item lacks this field).
+                match stored_item.and_then(|s| get_dot(s, field)) {
+                    Some(stored_secret) => {
+                        // Preserve the real stored secret (never the sentinel).
+                        let stored_secret = stored_secret.clone();
+                        set_dot(&mut merged, field, stored_secret);
                     }
+                    // CR-01: a MASKED sentinel with no stored value to inherit must
+                    // NOT be written verbatim — fail closed so the caller 422s.
+                    None if masked => {
+                        return Err(MaskWithoutStored { item_id: id.clone() });
+                    }
+                    // A genuinely absent secret (not the sentinel) -> leave absent.
+                    None => {}
                 }
             }
-            merged
+            Ok(merged)
         })
         .collect()
 }
@@ -275,7 +331,7 @@ mod tests {
         incoming_item["client_id"] = json!("edited-client-id"); // a non-secret edit
         let incoming = vec![incoming_item];
 
-        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC);
+        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC).expect("merge ok");
         assert_eq!(
             merged[0]["client_secret"],
             json!("REAL-google-secret"),
@@ -290,7 +346,7 @@ mod tests {
         // The incoming item omits client_secret entirely -> still preserve stored.
         let stored = vec![oidc("google", Some("REAL-google-secret"))];
         let incoming = vec![oidc("google", None)];
-        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC);
+        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC).expect("merge ok");
         assert_eq!(merged[0]["client_secret"], json!("REAL-google-secret"));
     }
 
@@ -299,7 +355,7 @@ mod tests {
         // The operator retyped the secret -> it replaces the stored value.
         let stored = vec![oidc("google", Some("OLD-secret"))];
         let incoming = vec![oidc("google", Some("NEW-typed-secret"))];
-        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC);
+        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC).expect("merge ok");
         assert_eq!(merged[0]["client_secret"], json!("NEW-typed-secret"));
     }
 
@@ -311,7 +367,7 @@ mod tests {
             oidc("google", Some(MASKED)),
             oidc("github", Some("brand-new-github-secret")),
         ];
-        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC);
+        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC).expect("merge ok");
         assert_eq!(merged.len(), 2, "both incoming items kept (incoming order)");
         assert_eq!(merged[0]["id"], json!("google"));
         assert_eq!(merged[0]["client_secret"], json!("REAL-google-secret"));
@@ -327,7 +383,7 @@ mod tests {
             oidc("github", Some("REAL-github-secret")),
         ];
         let incoming = vec![oidc("google", Some(MASKED))];
-        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC);
+        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC).expect("merge ok");
         assert_eq!(merged.len(), 1, "removed id is dropped");
         assert_eq!(merged[0]["id"], json!("google"));
         assert_eq!(merged[0]["client_secret"], json!("REAL-google-secret"));
@@ -355,7 +411,7 @@ mod tests {
                 "auth": { "type": "basic_auth", "config": { "user": "u", "password": MASKED } }
             }
         })];
-        let merged = merge_array_by_id(&stored, &incoming, &SMS_SPEC);
+        let merged = merge_array_by_id(&stored, &incoming, &SMS_SPEC).expect("merge ok");
         assert_eq!(
             merged[0]["request_config"]["auth"]["config"]["password"],
             json!("REAL-sms-pass"),
@@ -380,9 +436,9 @@ mod tests {
                 "auth": { "type": "api_key", "config": { "value": "REAL-webhook-token", "in": "header", "name": "X-Api" } }
             }
         })];
-        // For the WEBHOOK_SPEC the id is `url` — but it lives under config.url for
-        // a web_hook item shape. The spec keys on top-level `url`; this test only
-        // checks masking (id-independent), so it exercises the nested secret path.
+        // IN-01: the WEBHOOK_SPEC id_field is `config.url` (a dot-path), not a
+        // top-level `url`. This test only checks masking (id-independent), so it
+        // exercises the nested secret path regardless of the id field.
         let masked = mask_array_secrets(&items, &WEBHOOK_SPEC);
         assert_eq!(
             masked[0]["config"]["auth"]["config"]["value"],
@@ -398,8 +454,89 @@ mod tests {
         // An incoming item with no id cannot match -> kept as-is (real secret too).
         let stored = vec![oidc("google", Some("REAL"))];
         let incoming = vec![json!({ "provider": "noid", "client_secret": "x" })];
-        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC);
+        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC).expect("merge ok");
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["client_secret"], json!("x"));
+    }
+
+    // ─── CR-01 / WR-01 / WR-02 — fail-closed regression tests ───────────────
+
+    #[test]
+    fn merge_fails_closed_on_renamed_id_with_masked_secret() {
+        // CR-01: the operator renamed the provider id (google -> g00gle) and left
+        // the client_secret masked. No stored item matches the new id, so the
+        // masked sentinel cannot be resolved — the merge MUST refuse (fail closed),
+        // NEVER writing the literal sentinel as the real secret.
+        let stored = vec![oidc("google", Some("REAL-google-secret"))];
+        let incoming = vec![oidc("g00gle", Some(MASKED))];
+        let err = merge_array_by_id(&stored, &incoming, &OIDC_SPEC)
+            .expect_err("renamed-id + masked secret must fail closed");
+        assert_eq!(err, MaskWithoutStored { item_id: Some("g00gle".to_string()) });
+    }
+
+    #[test]
+    fn merge_fails_closed_on_renamed_id_with_masked_apple_key() {
+        // WR-02: the apple_private_key path is covered by the same fail-closed guard.
+        let mut stored_item = oidc("apple", None);
+        stored_item["provider"] = json!("apple");
+        stored_item["apple_private_key"] = json!("REAL-apple-key");
+        let stored = vec![stored_item];
+        let mut incoming_item = oidc("appl3", None);
+        incoming_item["provider"] = json!("apple");
+        incoming_item["apple_private_key"] = json!(MASKED);
+        let incoming = vec![incoming_item];
+        let err = merge_array_by_id(&stored, &incoming, &OIDC_SPEC)
+            .expect_err("renamed-id + masked apple key must fail closed");
+        assert_eq!(err, MaskWithoutStored { item_id: Some("appl3".to_string()) });
+    }
+
+    #[test]
+    fn merge_fails_closed_on_authkind_switch_masked_secret() {
+        // WR-01: same id (`sms`), but the operator switched basic_auth -> api_key
+        // and left the new kind's value masked. The stored item is a basic_auth
+        // block with NO `value` field, so the masked api_key value cannot be
+        // resolved — fail closed rather than write the sentinel as the api_key.
+        let stored = vec![json!({
+            "id": "sms",
+            "type": "http",
+            "request_config": {
+                "url": "https://sms.example/send",
+                "auth": { "type": "basic_auth", "config": { "user": "u", "password": "REAL-sms-pass" } }
+            }
+        })];
+        let incoming = vec![json!({
+            "id": "sms",
+            "type": "http",
+            "request_config": {
+                "url": "https://sms.example/send",
+                "auth": { "type": "api_key", "config": { "name": "X-Api", "value": MASKED, "in": "header" } }
+            }
+        })];
+        let err = merge_array_by_id(&stored, &incoming, &SMS_SPEC)
+            .expect_err("auth-kind switch with masked new value must fail closed");
+        assert_eq!(err, MaskWithoutStored { item_id: Some("sms".to_string()) });
+    }
+
+    #[test]
+    fn merge_fails_closed_on_no_id_item_with_masked_secret() {
+        // An incoming item with NO resolvable id carrying a masked secret cannot
+        // inherit any stored value -> fail closed (item_id None).
+        let stored = vec![oidc("google", Some("REAL"))];
+        let incoming = vec![json!({ "provider": "noid", "client_secret": MASKED })];
+        let err = merge_array_by_id(&stored, &incoming, &OIDC_SPEC)
+            .expect_err("no-id + masked secret must fail closed");
+        assert_eq!(err, MaskWithoutStored { item_id: None });
+    }
+
+    #[test]
+    fn merge_allows_absent_secret_with_no_stored_value() {
+        // WR-05: a genuinely ABSENT secret (NOT the sentinel) with no stored value
+        // is "no secret" — left absent, not an error (e.g. switching to no-auth).
+        let stored = vec![oidc("google", None)];
+        let incoming = vec![oidc("g00gle", None)]; // renamed, no secret at all
+        let merged = merge_array_by_id(&stored, &incoming, &OIDC_SPEC)
+            .expect("absent secret with no stored value is not an error");
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].get("client_secret").is_none(), "stays absent");
     }
 }
