@@ -16,6 +16,15 @@ FROM rust:1.95-slim-bookworm AS builder
 
 WORKDIR /app
 
+# WR-01: the FLAG-01 keystone probe route (`/api/features/_probe`) is gated behind
+# the OFF-BY-DEFAULT `test-probe` cargo feature so a normal production image carries
+# NO dead, saml-toggleable probe. The live acceptance harness
+# (scripts/verify/phase12-acceptance.sh) sets TEST_PROBE=1 to build an image that
+# DOES expose the probe so it can anchor FLAG-01 end-to-end. Any non-empty value
+# enables it; the default empty value ships the hardened production binary.
+ARG TEST_PROBE=
+ENV CARGO_FEATURE_FLAGS=${TEST_PROBE:+--features test-probe}
+
 # SQLX_OFFLINE: the sqlx `query!`/`query_as!` macros verify SQL at compile time
 # against a live DB unless offline metadata is present. The build stage has NO
 # database, so we force offline mode and ship the committed `.sqlx` metadata
@@ -53,8 +62,11 @@ COPY src ./src
 COPY config ./config
 # Bust the cached dummy artifacts so BOTH the real lib and bin are recompiled
 # (the bin depends on the lib crate, so a stale stub lib.rs would break it).
+# WR-01: $CARGO_FEATURE_FLAGS is empty for a production build (no probe) and
+# `--features test-probe` when TEST_PROBE was set (the acceptance image). It is
+# unquoted on purpose so an empty value expands to nothing.
 RUN touch src/lib.rs src/main.rs \
-    && cargo build --release --locked
+    && cargo build --release --locked ${CARGO_FEATURE_FLAGS}
 
 # ---- curl stage ----
 # The distroless runtime ships no curl. We vendor a single STATICALLY-LINKED

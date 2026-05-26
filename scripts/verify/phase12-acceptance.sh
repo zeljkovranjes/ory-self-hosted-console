@@ -143,6 +143,16 @@ fi
 # =============================================================================
 export CONSOLE_INSECURE_COOKIES=true
 
+# WR-01: the FLAG-01 keystone probe (`/api/features/_probe`) is now compiled OUT
+# of the production backend image — it ships ONLY when the backend is built with
+# the `test-probe` cargo feature. Export TEST_PROBE=1 so the ephemeral acceptance
+# image built below DOES expose the probe (the compose `TEST_PROBE` build-arg
+# threads it into `cargo build --features test-probe`). Without this the keystone
+# assertions below would (correctly) see a 404 for a non-existent route rather
+# than the flag-gate 404, so this export is what keeps FLAG-01 anchorable on the
+# live stack while a normal `docker compose up` ships no probe.
+export TEST_PROBE=1
+
 if [ "${REUSE_STACK:-0}" != "1" ]; then
   echo
   echo "--- fresh-volume reset (down -v) so /setup runs and mints a one-time token ---"

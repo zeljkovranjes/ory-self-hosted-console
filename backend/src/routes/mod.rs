@@ -61,6 +61,15 @@ async fn index() -> &'static str {
 /// the hoop 404s before this ever runs; when ON it returns 200 — that pair is the
 /// full FLAG-01 proof. It carries NO logic of its own and touches no Ory service
 /// (preserving the v1 no-direct-Ory invariant).
+///
+/// WR-01: this handler — and the route mounting it below — are gated behind the
+/// OFF-BY-DEFAULT `test-probe` feature so a normal production binary ships NEITHER.
+/// The feature is auto-enabled for `cargo test` (dev-dependency self-reference)
+/// and for the live acceptance image (compose `TEST_PROBE=1` build-arg), so both
+/// the integration suite and `phase12-acceptance.sh` still anchor FLAG-01 against
+/// a real flag-gated route — without leaving a dead, saml-toggleable probe in the
+/// shipped console.
+#[cfg(any(test, feature = "test-probe"))]
 #[handler]
 async fn feature_probe(res: &mut Response) {
     res.status_code(StatusCode::OK);
@@ -301,21 +310,6 @@ pub fn build(
         .push(
             Router::with_path("api/console/features")
                 .get(crate::features::routes::list_features), // FLAG-02 read (seeded set + meta)
-        )
-        // Phase 12 (FLAG-01): the KEYSTONE gated probe. A minimal self-contained
-        // route mounted INSIDE the protected subtree (so it sits AFTER the
-        // audit/auth/csrf hoops) and gated by FeatureFlagHoop::new("saml") — which
-        // is seeded OFF. A request reaching it has ALREADY passed auth_guard (valid
-        // session) and csrf_guard (valid CSRF), yet a flag-OFF still 404s: that
-        // ordering IS the FLAG-01 security guarantee. This probe is the permanent
-        // keystone-test anchor; later phases mount real feature routes against the
-        // same hoop. GET + POST so the keystone test can prove the gate beats BOTH
-        // a csrf-exempt read and a csrf-guarded state change.
-        .push(
-            Router::with_path("api/features/_probe")
-                .hoop(crate::features::FeatureFlagHoop::new("saml"))
-                .get(feature_probe)
-                .post(feature_probe),
         )
         // Phase 3 (BACK-02) Ory Admin proof wrappers. GET-only, so `csrf_guard`
         // auto-exempts them; they inherit `auth_guard` (401 when unauthenticated)
@@ -590,6 +584,27 @@ pub fn build(
                 .get(crate::webhooks::routes::list_webhooks) // HOOK-03 list (masked secret)
                 .post(crate::webhooks::routes::create_webhook), // HOOK-02/03 create (one-time secret)
         );
+
+    // Phase 12 (FLAG-01): the KEYSTONE gated probe. A minimal self-contained route
+    // mounted INSIDE the protected subtree (so it sits AFTER the audit/auth/csrf
+    // hoops) and gated by FeatureFlagHoop::new("saml") — which is seeded OFF. A
+    // request reaching it has ALREADY passed auth_guard (valid session) and
+    // csrf_guard (valid CSRF), yet a flag-OFF still 404s: that ordering IS the
+    // FLAG-01 security guarantee. GET + POST so the keystone test can prove the gate
+    // beats BOTH a csrf-exempt read and a csrf-guarded state change.
+    //
+    // WR-01: this anchor is mounted ONLY under the OFF-BY-DEFAULT `test-probe`
+    // feature (auto-on for `cargo test`; on in the acceptance image via the compose
+    // `TEST_PROBE=1` build-arg). A normal production binary ships NO probe route, so
+    // there is no dead, saml-toggleable endpoint in the released console. Later
+    // phases anchor FLAG-01 against the REAL saml routes they introduce.
+    #[cfg(any(test, feature = "test-probe"))]
+    let protected = protected.push(
+        Router::with_path("api/features/_probe")
+            .hoop(crate::features::FeatureFlagHoop::new("saml"))
+            .get(feature_probe)
+            .post(feature_probe),
+    );
 
     // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is
     // moved into the affix_state hoop, then inject them into every Depot

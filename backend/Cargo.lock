@@ -2137,6 +2137,7 @@ dependencies = [
  "jsonschema",
  "mockito",
  "oauth2",
+ "ory-console-backend",
  "ory-hydra-client",
  "ory-keto-client",
  "ory-kratos-client",

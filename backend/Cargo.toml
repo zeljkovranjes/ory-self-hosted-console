@@ -7,6 +7,20 @@ description = "Ory Self-Hosted Console backend — single API layer the frontend
 license = "Apache-2.0"
 publish = false
 
+[features]
+# WR-01: the FLAG-01 keystone probe route (`/api/features/_probe`) is a
+# TEST-ONLY anchor — it has no business purpose and must NOT ship in a normal
+# production binary (a dead route gated on the real `saml` flag is attack-surface
+# + audit noise the moment an operator enables saml). It is gated behind this
+# OFF-BY-DEFAULT feature so `cargo build`/the production Docker image carry no
+# probe. It is activated in two places ONLY: (1) automatically for `cargo test`
+# via the dev-dependency self-reference below (so the integration suite, which
+# does NOT see the lib's `#[cfg(test)]`, still has the route to anchor FLAG-01),
+# and (2) the live acceptance harness, which builds the backend image with
+# `--features test-probe` (compose `TEST_PROBE=1` build-arg). Mirrors the
+# existing OFF-by-default `WEBHOOK_ALLOW_PRIVATE_TARGETS` acceptance pattern.
+test-probe = []
+
 [lib]
 name = "ory_console_backend"
 path = "src/lib.rs"
@@ -124,6 +138,15 @@ hmac = "0.12"
 ipnet = "2.12"
 
 [dev-dependencies]
+# WR-01: a self-dependency that turns ON the `test-probe` feature whenever the
+# crate is compiled for tests (`cargo test`, `cargo test --test feature_flags`).
+# Cargo unifies features across the normal + dev dependency graphs at test time,
+# so this activates `test-probe` for the lib/bin under test WITHOUT requiring an
+# explicit `--features` flag — keeping `cargo test --test feature_flags --locked`
+# green — while a plain `cargo build`/`cargo build --release` (no dev-deps) keeps
+# the probe compiled OUT of the production binary. This is the canonical Cargo
+# idiom for "enable a feature only under test".
+ory-console-backend = { path = ".", features = ["test-probe"] }
 # Salvo `test` feature exposes TestClient for in-process handler/middleware tests.
 salvo = { version = "0.93.0", features = ["test"] }
 # In-process mock HTTP server for the restart-broker (204 / non-204) + the

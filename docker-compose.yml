@@ -361,6 +361,14 @@ services:
   backend:
     build:
       context: ./backend
+      args:
+        # WR-01: OFF by default — a normal `docker compose up` builds the hardened
+        # production backend with NO `/api/features/_probe` keystone probe. The
+        # live acceptance gate (scripts/verify/phase12-acceptance.sh) exports
+        # TEST_PROBE=1 so its ephemeral image DOES expose the probe to anchor
+        # FLAG-01 end-to-end. Mirrors the OFF-by-default acceptance-only posture of
+        # WEBHOOK_ALLOW_PRIVATE_TARGETS. NEVER set this for a production build.
+        TEST_PROBE: ${TEST_PROBE:-}
     container_name: backend
     environment:
       BACKEND_BIND_ADDR: 0.0.0.0:8080
