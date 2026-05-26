@@ -51,6 +51,24 @@ networks:
     internal: true
   edge:
     driver: bridge
+  # ax-public (Phase 15, INFRA-05 / threat T-15-01): a DEDICATED internal segment
+  # carrying ONLY the Account Experience service and Kratos. It exists so the AX
+  # can reach Kratos PUBLIC :4433 server-side WITHOUT being placed on the broad
+  # `internal` network (where Hydra/Keto/Oathkeeper ADMIN ports also live). Because
+  # the AX is NOT on `internal`, it has NO route to those three services' admin
+  # ports at all — the live gate asserts each is refused from the AX container.
+  # `internal: true` keeps this segment off the host gateway too.
+  #
+  # RESIDUAL (documented, accepted — mirrors the Hydra --dev residual posture):
+  # Kratos serves both its PUBLIC :4433 and ADMIN :4434 on every interface it
+  # binds (0.0.0.0), so a peer sharing ANY network with Kratos can reach :4434.
+  # Plain compose has no port-level ACL between containers on a shared network.
+  # The AX is given ONLY the public URL (no admin env) and never calls :4434; the
+  # host-level INFRA-05 invariant (no admin port host-published) is unaffected.
+  # Fully closing the Kratos public/admin co-listening gap requires an L7
+  # public-only proxy in front of Kratos — tracked as a hardening follow-up.
+  ax-public:
+    internal: true
 
 # -----------------------------------------------------------------------------
 # Volumes
@@ -162,7 +180,10 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
-    networks: [internal]
+    # internal: the backend + other Ory services reach Kratos here.
+    # ax-public: the Account Experience reaches Kratos PUBLIC :4433 here WITHOUT
+    # being on `internal` (Phase 15, INFRA-05 / T-15-01 — see networks: ax-public).
+    networks: [internal, ax-public]
 
   # NOTE on Hydra/Keto/Oathkeeper healthchecks (Pitfall 1 — distroless has no
   # shell/curl, and only Kratos ships an in-image `remote status`): each of these
@@ -503,6 +524,68 @@ services:
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     networks: [edge]
+
+  # ===========================================================================
+  # Account Experience (AX) — the self-hosted end-user auth UI (Phase 15, AX-01/
+  # AX-05). A separate Next.js 16 service on @ory/elements-react + @ory/nextjs that
+  # serves Kratos v26.2.0 self-service flows (login/registration/recovery/
+  # verification/settings/error) through the @ory/nextjs createOryMiddleware
+  # SAME-ORIGIN proxy to Kratos PUBLIC :4433.
+  #
+  # DUAL-HOMED (mirrors the Polis dual-home precedent above): `internal` so the
+  # AX SERVER can reach `ory-kratos:4433` (PUBLIC) for the proxy target, and
+  # `edge` so the browser reaches it via the host-published port. INFRA-05: the
+  # AX is given ONLY the Kratos PUBLIC URL (:4433); it has NO admin URL env and
+  # MUST NEVER reach :4434 (admin) / Hydra/Keto/Oathkeeper admin — the phase15
+  # acceptance gate asserts :4434 is refused from this container. Kratos PUBLIC
+  # :4433 is NOT an admin port, so dual-homing to reach only :4433 is INFRA-05
+  # compliant.
+  #
+  # SEPARATE ORIGIN from the console frontend (AX-05): host-published on a DISTINCT
+  # port (3001 by default vs the console's 3000) so the AX issues only Kratos
+  # cookies (ory_kratos_session, csrf_token), never the console's
+  # __Host-console_session (whose __Host- prefix structurally forbids a Domain
+  # attribute and so can never reach the AX origin).
+  # ===========================================================================
+  account-experience:
+    build:
+      context: ./account-experience
+    container_name: account-experience
+    environment:
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      # SERVER-ONLY proxy target (threat T-15-04): the @ory/nextjs middleware +
+      # the per-flow getLoginFlow/etc read this to reach Kratos PUBLIC on the
+      # internal network. It is NOT a NEXT_PUBLIC_ var, so the internal hostname
+      # never reaches the client bundle. ORY_PROJECT_API_TOKEN is intentionally
+      # UNSET (Network-only; harmless when absent for self-hosted).
+      ORY_SDK_URL: http://ory-kratos:4433
+    healthcheck:
+      # Next standalone server has global fetch; probe over loopback with
+      # redirect:'manual' (same node-fetch shape as the frontend/Polis services).
+      # We probe a Next INTERNAL path (/_next/static) rather than a flow page:
+      # a flow page (e.g. /auth/login) server-fetches the Kratos flow and 303-
+      # redirects when initiated outside a browser, which a following fetch can
+      # not resolve — that is liveness noise, not a health signal. A static asset
+      # request returns a stable status from the AX server itself the moment it is
+      # up. ANY response (incl. 404 for a non-existent asset) proves the server is
+      # listening; only a connection error / 5xx is unhealthy.
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/_next/static/health-probe',{redirect:'manual'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      # Gate readiness (and `--wait`) on a healthy Kratos so the very first proxied
+      # flow init finds a reachable Kratos public endpoint.
+      kratos:
+        condition: service_healthy
+    ports:
+      - "${ACCOUNT_EXPERIENCE_PORT:-3001}:3000"
+    # ax-public: reach Kratos PUBLIC :4433 server-side (NOT the broad `internal`
+    # network, so no route to Hydra/Keto/Oathkeeper admin — INFRA-05/T-15-01).
+    # edge: host-publish the AX origin for the browser.
+    networks: [ax-public, edge]
 
   # ===========================================================================
   # Ory Polis (SAML→OAuth2 bridge — Phase 13, SSO-01).

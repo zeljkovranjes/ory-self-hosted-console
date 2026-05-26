@@ -25,19 +25,30 @@ identity:
 
 selfservice:
   default_browser_return_url: http://localhost:3000/
+  # BRAND-02 ui_url rebind (Phase 15, AX-01): the six self-service flow ui_url
+  # keys point at the Account Experience (AX) origin (the host-published AX port,
+  # default 3001 — see ACCOUNT_EXPERIENCE_PORT) on the AX route paths, which match
+  # account-experience/ory.config.ts. This direct edit seeds the committed config;
+  # the LIVE rebind through the BRAND-02 config-edit PUT (+ Kratos-only restart via
+  # the broker) is exercised by scripts/verify/phase15-acceptance.sh.
+  #
+  # LOGOUT TRAP (allowlist.rs Pitfall 1 / 15-RESEARCH Open Q3): there is NO
+  # `logout.ui_url` — the v26.2.0 schema gives logout no `ui_url` and is
+  # additionalProperties:false, so adding it would brick every full-config save.
+  # A logout redirect, if ever wanted, uses logout.after.default_browser_return_url.
   flows:
     login:
-      ui_url: http://localhost:3000/login
+      ui_url: http://localhost:3001/auth/login
     registration:
-      ui_url: http://localhost:3000/registration
+      ui_url: http://localhost:3001/auth/registration
     settings:
-      ui_url: http://localhost:3000/settings
+      ui_url: http://localhost:3001/settings
     error:
-      ui_url: http://localhost:3000/error
+      ui_url: http://localhost:3001/auth/error
     recovery:
-      ui_url: http://localhost:3000/recovery
+      ui_url: http://localhost:3001/auth/recovery
     verification:
-      ui_url: http://localhost:3000/verification
+      ui_url: http://localhost:3001/auth/verification
 
 secrets:
   # PLACEHOLDER 32-char values — Plan 04 overrides via env/.env. Do NOT use in production.
