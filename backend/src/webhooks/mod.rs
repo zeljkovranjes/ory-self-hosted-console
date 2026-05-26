@@ -4,8 +4,7 @@
 //! OWN `console` Postgres schema — there is NO Ory webhook primitive. Composed of:
 //!   - [`ssrf`]    — the outbound trust-boundary guard (resolve, classify, pin).
 //!   - [`hmac`]    — the `X-Console-Signature` HMAC-SHA256 signer.
-//!   - [`worker`]  — the durable FOR-UPDATE-SKIP-LOCKED claim loop + backoff +
-//!                   dead-letter + retention pruning.
+//!   - [`worker`]  — the durable FOR-UPDATE-SKIP-LOCKED claim loop, backoff, dead-letter, retention pruning.
 //!   - [`queries`] — sqlx wrappers for `webhooks` / `webhook_deliveries`.
 //!   - [`routes`]  — CRUD + delivery-log + redeliver handlers (protected subtree).
 //!
