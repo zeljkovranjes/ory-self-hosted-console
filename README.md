@@ -760,6 +760,17 @@ decision**, not an oversight:
   encryption-at-rest key) and the Postgres `DSN` remain env-injected and intact;
   both are on the console's hard config denylist and are never editable through
   the OAuth2 config pages.
+- **Concrete instance — token revoke relays a client secret over plain HTTP**
+  (`T-08-DEV`, WR-05). The Token & Flow Inspector's **Revoke** action targets
+  Hydra's **public** `/oauth2/revoke` endpoint, which per RFC 7009 requires the
+  client to authenticate for a confidential-client token. The operator-supplied
+  `client_id`/`client_secret` therefore travel backend → Hydra public port in
+  **plaintext** because the public port is served over plain HTTP under `--dev`.
+  This is the **one** place the console relays a *client* credential (not an
+  admin credential) to the public port. The residual risk is bounded by the same
+  INFRA-05 guarantee: the public port is internal-only and never host-published,
+  so the relay has no externally reachable surface. Going fully production-mode
+  (TLS-terminated public port, below) closes this too.
 - **To go fully production-mode.** Put a TLS-terminating reverse proxy in front of
   Hydra's public port, set `urls.self.issuer`/`urls.self.public` to the `https://`
   external URL (editable on the **General & Issuer** OAuth2 config page), and drop

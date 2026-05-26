@@ -480,6 +480,88 @@ else
   AT1=""
 fi
 
+# --- OAUTH2-01 / CR-01: a name-only PUT must NOT blank stored fields the edit
+# --- form omits (response_types / audience / metadata). `set_o_auth2_client` is
+# --- a full-replace PUT; the backend MERGEs the operator's edits onto the stored
+# --- client so omitted fields survive. This is the CR-01 no-blank-on-rename
+# --- invariant — distinct from the #2869 secret-preserve proof above.
+echo
+echo "--- [OAUTH2-01/CR-01] no-blank-on-rename: omitted stored fields survive a name-only PUT ---"
+CR01_CLIENT_ID=""
+# Create a client populated WITH the fields the edit form does NOT send.
+CR01_CREATE_BODY="$(node -e '
+  const body = {
+    client_name: "cr01-rich-client",
+    grant_types: ["authorization_code"],
+    response_types: ["code", "token"],
+    audience: ["https://api.example.com"],
+    scope: "openid offline profile",
+    redirect_uris: ["https://app.example.com/callback"],
+    metadata: { tier: "gold", team: "platform" },
+    token_endpoint_auth_method: "client_secret_post"
+  };
+  process.stdout.write(JSON.stringify(body));
+')"
+cr01_create_resp="$(_auth_mut POST "$CLIENTS_URL" "$CR01_CREATE_BODY")"
+cr01_create_code="$(_code_of "$cr01_create_resp")"; cr01_create_body="$(_body_of "$cr01_create_resp")"
+if { [ "$cr01_create_code" = "200" ] || [ "$cr01_create_code" = "201" ]; }; then
+  CR01_CLIENT_ID="$(_json_field "$cr01_create_body" 'data.client_id')"
+fi
+if [ -n "$CR01_CLIENT_ID" ]; then
+  _pass "[OAUTH2-01/CR-01] created a rich client ($CR01_CLIENT_ID) with response_types/audience/metadata"
+
+  # PUT a name-only change — exactly what the edit form sends on a rename. Every
+  # other field is OMITTED from the body (this is what would blank them on a
+  # naive full-replace PUT).
+  CR01_PUT_BODY='{"client_name":"cr01-rich-client-renamed"}'
+  cr01_put_resp="$(_auth_mut PUT "${CLIENTS_URL}/${CR01_CLIENT_ID}" "$CR01_PUT_BODY")"
+  cr01_put_code="$(_code_of "$cr01_put_resp")"; cr01_put_body="$(_body_of "$cr01_put_resp")"
+  if [ "$cr01_put_code" = "200" ]; then
+    _pass "[OAUTH2-01/CR-01] name-only PUT -> 200"
+  else
+    _fail "[OAUTH2-01/CR-01] name-only PUT -> '$cr01_put_code' (want 200; body: $cr01_put_body)"
+  fi
+
+  # GET and assert the OMITTED fields SURVIVED the rename (the CR-01 invariant).
+  cr01_get_body="$(_body_of "$(_auth_get "${CLIENTS_URL}/${CR01_CLIENT_ID}")")"
+  CR01_NAME="$(_json_field "$cr01_get_body" 'data.client_name')"
+  CR01_RTYPES="$(_json_field "$cr01_get_body" '(data.response_types||[]).slice().sort().join(",")')"
+  CR01_AUD="$(_json_field "$cr01_get_body" '(data.audience||[]).join(",")')"
+  CR01_META_TIER="$(_json_field "$cr01_get_body" 'data.metadata && data.metadata.tier')"
+  CR01_SCOPE="$(_json_field "$cr01_get_body" 'data.scope')"
+
+  if [ "$CR01_NAME" = "cr01-rich-client-renamed" ]; then
+    _pass "[OAUTH2-01/CR-01] the rename applied (client_name updated)"
+  else
+    _fail "[OAUTH2-01/CR-01] rename did NOT apply (client_name='$CR01_NAME')"
+  fi
+  if [ "$CR01_RTYPES" = "code,token" ]; then
+    _pass "[OAUTH2-01/CR-01] response_types SURVIVED the name-only PUT (not blanked)"
+  else
+    _fail "[OAUTH2-01/CR-01] response_types BLANKED on rename (got '$CR01_RTYPES'; want 'code,token') — CR-01 regression!"
+  fi
+  if [ "$CR01_AUD" = "https://api.example.com" ]; then
+    _pass "[OAUTH2-01/CR-01] audience SURVIVED the name-only PUT (not blanked)"
+  else
+    _fail "[OAUTH2-01/CR-01] audience BLANKED on rename (got '$CR01_AUD') — CR-01 regression!"
+  fi
+  if [ "$CR01_META_TIER" = "gold" ]; then
+    _pass "[OAUTH2-01/CR-01] metadata SURVIVED the name-only PUT (not blanked)"
+  else
+    _fail "[OAUTH2-01/CR-01] metadata BLANKED on rename (tier='$CR01_META_TIER'; want 'gold') — CR-01 regression!"
+  fi
+  if [ "$CR01_SCOPE" = "openid offline profile" ]; then
+    _pass "[OAUTH2-01/CR-01] scope SURVIVED the name-only PUT (not blanked)"
+  else
+    _fail "[OAUTH2-01/CR-01] scope BLANKED on rename (got '$CR01_SCOPE') — CR-01 regression!"
+  fi
+
+  # Clean up the CR-01 fixture client.
+  _auth_mut DELETE "${CLIENTS_URL}/${CR01_CLIENT_ID}" >/dev/null 2>&1 || true
+else
+  _fail "[OAUTH2-01/CR-01] no-blank-on-rename skipped — rich client create failed (body: $cr01_create_body)"
+fi
+
 echo
 echo "============================================================"
 echo " GROUP 2 — DATA PLANE: introspect + revoke (OAUTH2-02)"
