@@ -33,12 +33,40 @@
 use ory_hydra_client::apis::o_auth2_api;
 use ory_hydra_client::models::OAuth2Client;
 use salvo::prelude::*;
+use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::ory::clients::OryClients;
 use crate::ory::error::map_hydra_err;
 use crate::ory::fallback;
 use crate::ory::DEFAULT_LIST_PAGE_SIZE;
+
+// =============================================================================
+// OAUTH2-02 request bodies (token introspect / revoke)
+// =============================================================================
+
+/// Body for `POST /api/hydra/oauth2/introspect`: the token to introspect and an
+/// optional space-separated `scope` to assert against (RFC 7662). The token is
+/// untrusted operator input — it is forwarded to Hydra's introspection endpoint,
+/// never logged.
+#[derive(Debug, Deserialize)]
+struct IntrospectTokenBody {
+    token: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Body for `POST /api/hydra/oauth2/revoke`: the token to revoke plus the
+/// optional client credentials Hydra's revoke endpoint accepts (RFC 7009). All
+/// fields are untrusted operator input forwarded to Hydra; none are logged.
+#[derive(Debug, Deserialize)]
+struct RevokeTokenBody {
+    token: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+}
 
 // =============================================================================
 // Response shaping — strip credential material (T-08-LEAK)
@@ -267,6 +295,152 @@ pub async fn delete_client(
 
     res.status_code(StatusCode::NO_CONTENT);
     Ok(())
+}
+
+// =============================================================================
+// OAUTH2-02: token introspection / revoke + read-only flow-request lookup
+// =============================================================================
+//
+// The console INSPECTS and REVOKES only. Accepting or rejecting a grant
+// (`accept_*`/`reject_*` on the crate's `o_auth2_api`) is DELIBERATELY NOT wired
+// here — the grant decision belongs to the end-user login/consent provider app,
+// not the console (T-08-GRANT; a grep gate proves `accept_o_auth2`/`reject_o_auth2`
+// never appear in this module). Introspection and the flow-request lookups are
+// read-only; `revoke_token` is the single state-changing action and inherits the
+// protected subtree's `csrf_guard` (T-08-REVOKE-CSRF). Every upstream failure is
+// mapped through `map_hydra_err` (no body/URL leak, T-08-ERRLEAK).
+
+/// `POST /api/hydra/oauth2/introspect` — introspect an OAuth2 token (OAUTH2-02).
+///
+/// Parses `{token, scope?}` and forwards Hydra's `IntrospectedOAuth2Token`
+/// verbatim. Hydra reports an unknown/expired/revoked token as `{active:false}`
+/// (a normal 200 response, not an error), so an operator pasting a stale token
+/// sees an inactive result rather than a failure. The introspection response
+/// carries NO secret material (no `client_secret`), so it is forwarded as-is.
+#[handler]
+pub async fn introspect_token(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+
+    let body = req
+        .parse_json::<IntrospectTokenBody>()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("invalid introspect body: {e}")))?;
+
+    let introspected = o_auth2_api::introspect_o_auth2_token(
+        &clients.hydra,
+        &body.token,
+        body.scope.as_deref(),
+    )
+    .await
+    .map_err(map_hydra_err)?;
+
+    let value = serde_json::to_value(introspected)
+        .map_err(|e| AppError::Internal(format!("serialize ory response: {e}")))?;
+    Ok(Json(value))
+}
+
+/// `POST /api/hydra/oauth2/revoke` — revoke an OAuth2 token (OAUTH2-02).
+///
+/// This is the ONLY state-changing action in the inspector; it sits on the
+/// protected subtree so `csrf_guard` requires a matching `X-CSRF-Token` (403
+/// otherwise — T-08-REVOKE-CSRF). Parses `{token, client_id?, client_secret?}`
+/// and calls `revoke_o_auth2_token`; on success returns 200 `{revoked:true}`.
+/// Revocation is idempotent on Hydra's side — revoking an already-invalid token
+/// is not an error.
+#[handler]
+pub async fn revoke_token(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+
+    let body = req
+        .parse_json::<RevokeTokenBody>()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("invalid revoke body: {e}")))?;
+
+    o_auth2_api::revoke_o_auth2_token(
+        &clients.hydra,
+        &body.token,
+        body.client_id.as_deref(),
+        body.client_secret.as_deref(),
+    )
+    .await
+    .map_err(map_hydra_err)?;
+
+    Ok(Json(serde_json::json!({ "revoked": true })))
+}
+
+/// Read the required `challenge` query param shared by the three flow lookups; a
+/// missing/empty challenge is a 400 (never a silent upstream call).
+fn flow_challenge(req: &Request) -> Result<String, AppError> {
+    req.query::<String>("challenge")
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| AppError::BadRequest("missing `challenge` query parameter".into()))
+}
+
+/// `GET /api/hydra/oauth2/login?challenge=…` — look up a pending login request
+/// (OAUTH2-02, READ-ONLY). Forwards Hydra's `OAuth2LoginRequest`. A bogus/expired
+/// challenge surfaces as a mapped upstream error (not a 500); the console NEVER
+/// accepts or rejects the login (T-08-GRANT).
+#[handler]
+pub async fn get_login_request(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+    let challenge = flow_challenge(req)?;
+
+    let request = o_auth2_api::get_o_auth2_login_request(&clients.hydra, &challenge)
+        .await
+        .map_err(map_hydra_err)?;
+
+    let value = serde_json::to_value(request)
+        .map_err(|e| AppError::Internal(format!("serialize ory response: {e}")))?;
+    Ok(Json(value))
+}
+
+/// `GET /api/hydra/oauth2/consent?challenge=…` — look up a pending consent
+/// request (OAUTH2-02, READ-ONLY). Forwards Hydra's `OAuth2ConsentRequest`. The
+/// console NEVER accepts or rejects the consent grant (T-08-GRANT).
+#[handler]
+pub async fn get_consent_request(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+    let challenge = flow_challenge(req)?;
+
+    let request = o_auth2_api::get_o_auth2_consent_request(&clients.hydra, &challenge)
+        .await
+        .map_err(map_hydra_err)?;
+
+    let value = serde_json::to_value(request)
+        .map_err(|e| AppError::Internal(format!("serialize ory response: {e}")))?;
+    Ok(Json(value))
+}
+
+/// `GET /api/hydra/oauth2/logout?challenge=…` — look up a pending logout request
+/// (OAUTH2-02, READ-ONLY). Forwards Hydra's `OAuth2LogoutRequest`. The console
+/// NEVER accepts or rejects the logout (T-08-GRANT).
+#[handler]
+pub async fn get_logout_request(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+    let challenge = flow_challenge(req)?;
+
+    let request = o_auth2_api::get_o_auth2_logout_request(&clients.hydra, &challenge)
+        .await
+        .map_err(map_hydra_err)?;
+
+    let value = serde_json::to_value(request)
+        .map_err(|e| AppError::Internal(format!("serialize ory response: {e}")))?;
+    Ok(Json(value))
 }
 
 #[cfg(test)]

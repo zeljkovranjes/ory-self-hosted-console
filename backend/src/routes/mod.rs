@@ -259,6 +259,35 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
                 .put(crate::ory::hydra::update_client) // OAUTH2-01 update (#2869 preserve)
                 .delete(crate::ory::hydra::delete_client), // OAUTH2-01 delete
         )
+        // Phase 8 (OAUTH2-02) Hydra token & flow inspection. All inherit
+        // `auth_guard` (401 unauth, T-08-AUTHZ). `introspect` and `revoke` are
+        // POST: `csrf_guard` enforces `X-CSRF-Token` (403) — `revoke` is the
+        // state-changing action (T-08-REVOKE-CSRF). The three flow-request
+        // lookups are GET (csrf-exempt, read-only): they look up a PENDING
+        // login/consent/logout request by `?challenge=`; the console NEVER
+        // accepts/rejects the grant (T-08-GRANT — out of scope, the end-user
+        // provider app owns it). A bogus challenge maps cleanly via
+        // `map_hydra_err` (no 500/leak, T-08-ERRLEAK).
+        .push(
+            Router::with_path("api/hydra/oauth2/introspect")
+                .post(crate::ory::hydra::introspect_token), // OAUTH2-02 introspect
+        )
+        .push(
+            Router::with_path("api/hydra/oauth2/revoke")
+                .post(crate::ory::hydra::revoke_token), // OAUTH2-02 revoke (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/hydra/oauth2/login")
+                .get(crate::ory::hydra::get_login_request), // OAUTH2-02 flow lookup (read-only)
+        )
+        .push(
+            Router::with_path("api/hydra/oauth2/consent")
+                .get(crate::ory::hydra::get_consent_request), // OAUTH2-02 flow lookup (read-only)
+        )
+        .push(
+            Router::with_path("api/hydra/oauth2/logout")
+                .get(crate::ory::hydra::get_logout_request), // OAUTH2-02 flow lookup (read-only)
+        )
         .push(
             Router::with_path("api/keto/relationships")
                 .get(crate::ory::keto::list_relationships),
