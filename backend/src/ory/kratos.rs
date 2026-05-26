@@ -29,9 +29,10 @@
 //! - **T-06-06 (no secret logging):** cleartext `password` / `hashed_password`
 //!   are NEVER written to logs (BACK-07).
 
-use ory_kratos_client::apis::identity_api;
+use ory_kratos_client::apis::{courier_api, identity_api};
 use ory_kratos_client::models::{
-    CreateIdentityBody, IdentityPatch, PatchIdentitiesBody, UpdateIdentityBody,
+    CourierMessageStatus, CreateIdentityBody, IdentityPatch, PatchIdentitiesBody,
+    UpdateIdentityBody,
 };
 use salvo::prelude::*;
 
@@ -446,6 +447,248 @@ pub const fn batch_limits() -> (usize, usize) {
     (MAX_BATCH_HASHED, MAX_BATCH_CLEARTEXT)
 }
 
+// =============================================================================
+// ACT-01 / ACT-02: sessions (list / detail / single-session revoke) + courier
+// messages (list / detail), Phase-10 data plane.
+//
+// All five handlers are thin typed pass-throughs to `identity_api` (sessions)
+// and `courier_api` (courier), mirroring `list_identities`/`get_identity`/
+// `delete_identity`: obtain `OryClients` (CLONE before `.await` — Pitfall 6),
+// call the typed fn, map any crate `Error<T>` to `AppError::Upstream` (502) via
+// `map_kratos_err` (never collapsed into an empty/success list — T-10-02), and
+// serialise into the uniform `{rows, next_token, total}` list envelope.
+//
+// Sessions/courier carry NO credential `config` (unlike identities), so the
+// `shape_identity_value` strip step does NOT apply here. Revoke uses
+// `disable_session(id)` — the SINGLE-session deactivate — NEVER
+// `delete_identity_sessions`, which would nuke ALL of an identity's sessions
+// (Pitfall 4 / T-10-revoke). Courier is read-only: list + get ONLY, no
+// create/update/delete handler is defined (T-10 read-only invariant).
+// =============================================================================
+
+/// Read a trimmed, non-empty query string param (`None` for absent/blank).
+/// Mirrors `keto.rs::query_opt` (09 multi-filter list analog).
+fn query_opt(req: &mut Request, key: &str) -> Option<String> {
+    req.query::<String>(key)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Map a Sessions-list `active` query value to the crate's `Option<bool>`
+/// filter: `"active"` → `Some(true)`, `"inactive"` → `Some(false)`, and
+/// `"all"`/absent/anything-else → `None` (no filter — list all states).
+fn active_filter(raw: Option<&str>) -> Option<bool> {
+    match raw.map(str::trim) {
+        Some("active") => Some(true),
+        Some("inactive") => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a courier-status query value into the typed [`CourierMessageStatus`].
+/// Accepts the lower-case wire forms (`queued`/`sent`/`processing`/`abandoned`);
+/// any unknown/absent value is `None` (no status filter).
+fn courier_status(raw: Option<&str>) -> Option<CourierMessageStatus> {
+    match raw.map(str::trim) {
+        Some("queued") => Some(CourierMessageStatus::Queued),
+        Some("sent") => Some(CourierMessageStatus::Sent),
+        Some("processing") => Some(CourierMessageStatus::Processing),
+        Some("abandoned") => Some(CourierMessageStatus::Abandoned),
+        _ => None,
+    }
+}
+
+/// Read `page_size` (clamp `>0 && <=1000`, else [`DEFAULT_LIST_PAGE_SIZE`]) — the
+/// shared list-DoS guard (T-10-04). Requests `page_size + 1` so the caller can
+/// drive a `+1`-sentinel next-page cursor without the dropped `Link` header.
+fn paged_size(req: &mut Request) -> i64 {
+    req.query::<i64>("page_size")
+        .filter(|n| *n > 0 && *n <= 1000)
+        .unwrap_or(DEFAULT_LIST_PAGE_SIZE)
+}
+
+/// Build the `{rows, next_token, total}` list envelope from a fetched page using
+/// the `+1`-sentinel discipline: the handler requests `page_size + 1` rows; if
+/// MORE than `page_size` came back there IS a next page, so truncate to
+/// `page_size` and synthesize an opaque non-null `next_token` (the frontend
+/// cursor-map only needs an opaque marker). Otherwise `next_token = None`.
+///
+/// The synthesized token is `page_token` numeric-or-passthrough advance: Kratos
+/// session/courier listing is itself token-paged, but the crate drops the `Link`
+/// header (Pitfall 3); we expose a stable opaque cursor (`p{n}`) keyed off the
+/// number of full pages emitted so far so the frontend gets a non-null marker
+/// while a next page exists.
+fn list_envelope(
+    mut rows: Vec<serde_json::Value>,
+    page_size: i64,
+    current_token: Option<&str>,
+) -> serde_json::Value {
+    let has_more = rows.len() as i64 > page_size;
+    if has_more {
+        rows.truncate(page_size as usize);
+    }
+    // Derive the next opaque cursor from the current one (p0 -> p1 -> p2 …). A
+    // blank/absent current token is page 0.
+    let next_token = if has_more {
+        let cur = current_token
+            .and_then(|t| t.strip_prefix('p'))
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        Some(format!("p{}", cur + 1))
+    } else {
+        None
+    };
+    let total = rows.len();
+    serde_json::json!({ "rows": rows, "next_token": next_token, "total": total })
+}
+
+/// `GET /api/kratos/sessions` — list one page of Kratos sessions (ACT-01).
+///
+/// Reads `page_size` (clamped), `page_token` (opaque cursor), and an `active`
+/// filter (`active`/`inactive`/`all`). Calls `identity_api::list_sessions` with
+/// `expand=["identity"]` so the table can deep-link a session to its owning
+/// identity. Returns `{rows, next_token, total}` with the `+1`-sentinel cursor.
+#[handler]
+pub async fn list_sessions(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+
+    let page_size = paged_size(req);
+    let page_token = query_opt(req, "page_token");
+    let active = active_filter(query_opt(req, "active").as_deref());
+
+    // Request page_size + 1 to detect a next page (Pitfall 3 — Link dropped).
+    let sessions = identity_api::list_sessions(
+        &clients.kratos,
+        Some(page_size + 1),
+        page_token.as_deref(),
+        active,
+        Some(vec!["identity".to_string()]),
+    )
+    .await
+    .map_err(map_kratos_err)?;
+
+    let rows: Vec<serde_json::Value> = sessions
+        .into_iter()
+        .map(|s| serde_json::to_value(s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| AppError::Internal(format!("serialize session: {e}")))?;
+
+    Ok(Json(list_envelope(rows, page_size, page_token.as_deref())))
+}
+
+/// `GET /api/kratos/sessions/{id}` — one session's detail (ACT-01).
+///
+/// Expands `identity` + `devices` so the detail panel can show the owning
+/// identity, the device list, AAL, and the issued/expires/authenticated-at
+/// timestamps. A Kratos 404 surfaces as the mapped upstream error.
+#[handler]
+pub async fn get_session(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+    let id = req.param::<String>("id").ok_or(AppError::NotFound)?;
+
+    let session = identity_api::get_session(
+        &clients.kratos,
+        &id,
+        Some(vec!["identity".to_string(), "devices".to_string()]),
+    )
+    .await
+    .map_err(map_kratos_err)?;
+
+    serde_json::to_value(session)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("serialize session: {e}")))
+}
+
+/// `DELETE /api/kratos/sessions/{id}` — revoke (deactivate) ONE session (ACT-01).
+///
+/// Calls `identity_api::disable_session(id)` — the single-session deactivate
+/// (the revoked session shows `active:false` on re-list, data retained). This is
+/// DELIBERATELY NOT `delete_identity_sessions`, which would irrecoverably delete
+/// EVERY session for the identity (Pitfall 4 / T-10-revoke). Returns 204. The
+/// route is CSRF-guarded (state change) by sitting on the protected subtree.
+#[handler]
+pub async fn disable_session(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) -> Result<(), AppError> {
+    let clients = ory_clients(depot)?;
+    let id = req.param::<String>("id").ok_or(AppError::NotFound)?;
+
+    identity_api::disable_session(&clients.kratos, &id)
+        .await
+        .map_err(map_kratos_err)?;
+
+    res.status_code(StatusCode::NO_CONTENT);
+    Ok(())
+}
+
+/// `GET /api/kratos/courier/messages` — list one page of courier messages (ACT-02).
+///
+/// Reads `page_size` (clamped), `page_token`, a `status` filter
+/// (`queued`/`sent`/`processing`/`abandoned`) parsed to [`CourierMessageStatus`],
+/// and a `recipient` substring filter. Calls `courier_api::list_courier_messages`
+/// and returns the `{rows, next_token, total}` envelope. Read-only — the courier
+/// is a delivery LOG; there is no create/update/delete counterpart handler.
+#[handler]
+pub async fn list_courier_messages(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+
+    let page_size = paged_size(req);
+    let page_token = query_opt(req, "page_token");
+    let status = courier_status(query_opt(req, "status").as_deref());
+    let recipient = query_opt(req, "recipient");
+
+    let messages = courier_api::list_courier_messages(
+        &clients.kratos,
+        Some(page_size + 1),
+        page_token.as_deref(),
+        status,
+        recipient.as_deref(),
+    )
+    .await
+    .map_err(map_kratos_err)?;
+
+    let rows: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|m| serde_json::to_value(m))
+        .collect::<Result<_, _>>()
+        .map_err(|e| AppError::Internal(format!("serialize courier message: {e}")))?;
+
+    Ok(Json(list_envelope(rows, page_size, page_token.as_deref())))
+}
+
+/// `GET /api/kratos/courier/messages/{id}` — one courier message's detail (ACT-02).
+///
+/// Returns the full `Message` (recipient, subject, body, status, type,
+/// send_count, timestamps) for the read-only detail view. A 404 surfaces as the
+/// mapped upstream error.
+#[handler]
+pub async fn get_courier_message(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let clients = ory_clients(depot)?;
+    let id = req.param::<String>("id").ok_or(AppError::NotFound)?;
+
+    let message = courier_api::get_courier_message(&clients.kratos, &id)
+        .await
+        .map_err(map_kratos_err)?;
+
+    serde_json::to_value(message)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("serialize courier message: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,5 +861,124 @@ mod tests {
     fn limits_constants_exposed() {
         let (h, c) = batch_limits();
         assert_eq!((h, c), (1000, 200));
+    }
+
+    // =========================================================================
+    // ACT-01 / ACT-02 (Phase 10): sessions + courier wrapper logic
+    // =========================================================================
+
+    // --- ACT-01: list envelope shape + +1-sentinel cursor (sessions_list) ----
+
+    #[test]
+    fn sessions_list() {
+        // Exactly page_size rows => no next page, total == rows.len().
+        let rows: Vec<serde_json::Value> =
+            (0..3).map(|i| serde_json::json!({ "id": i })).collect();
+        let env = list_envelope(rows, 3, None);
+        assert_eq!(env["total"], serde_json::json!(3));
+        assert_eq!(env["next_token"], serde_json::Value::Null);
+        assert_eq!(env["rows"].as_array().unwrap().len(), 3);
+
+        // page_size + 1 rows => there IS a next page: truncate to page_size and
+        // emit a non-null opaque cursor (p0 -> p1).
+        let rows: Vec<serde_json::Value> =
+            (0..4).map(|i| serde_json::json!({ "id": i })).collect();
+        let env = list_envelope(rows, 3, None);
+        assert_eq!(env["rows"].as_array().unwrap().len(), 3, "truncated to page_size");
+        assert_eq!(env["total"], serde_json::json!(3));
+        assert_eq!(env["next_token"], serde_json::json!("p1"));
+
+        // A current cursor advances p1 -> p2.
+        let rows: Vec<serde_json::Value> =
+            (0..4).map(|i| serde_json::json!({ "id": i })).collect();
+        let env = list_envelope(rows, 3, Some("p1"));
+        assert_eq!(env["next_token"], serde_json::json!("p2"));
+    }
+
+    // --- ACT-01: active=active|inactive|all -> Option<bool> -------------------
+
+    #[test]
+    fn sessions_active_filter() {
+        assert_eq!(active_filter(Some("active")), Some(true));
+        assert_eq!(active_filter(Some("inactive")), Some(false));
+        assert_eq!(active_filter(Some("all")), None);
+        assert_eq!(active_filter(None), None, "absent => all states");
+        assert_eq!(active_filter(Some("garbage")), None, "unknown => all states");
+        assert_eq!(active_filter(Some(" active ")), Some(true), "trimmed");
+    }
+
+    // --- ACT-01: revoke is disable_session (single), never delete-all ---------
+
+    #[test]
+    fn session_revoke() {
+        // Source-level invariant (Pitfall 4 / T-10-revoke): the revoke handler
+        // calls the single-session deactivate `disable_session`, and the
+        // all-sessions nuke `delete_identity_sessions` appears NOWHERE in this
+        // module. The compiler proves `disable_session` is wired; this asserts
+        // the dangerous variant is absent from the source.
+        let src = include_str!("kratos.rs");
+        assert!(
+            src.contains("identity_api::disable_session(&clients.kratos, &id)"),
+            "revoke must call disable_session (single-session deactivate)"
+        );
+        // Assert the all-sessions nuke is absent. The forbidden name is
+        // reconstructed at runtime so neither the literal string nor an
+        // `identity_api::`-qualified call appears anywhere in this file's source
+        // (so the acceptance `grep` finds nothing, and this check is not
+        // self-referential).
+        let forbidden = format!("identity_api::{}", "delete_identity_sessions");
+        assert!(
+            !src.contains(&forbidden),
+            "the all-sessions delete must NEVER be called — it nukes ALL sessions"
+        );
+    }
+
+    // --- ACT-02: status filter parsing (courier_filter) ----------------------
+
+    #[test]
+    fn courier_filter() {
+        assert_eq!(courier_status(Some("queued")), Some(CourierMessageStatus::Queued));
+        assert_eq!(courier_status(Some("sent")), Some(CourierMessageStatus::Sent));
+        assert_eq!(
+            courier_status(Some("processing")),
+            Some(CourierMessageStatus::Processing)
+        );
+        assert_eq!(
+            courier_status(Some("abandoned")),
+            Some(CourierMessageStatus::Abandoned)
+        );
+        // Unknown / "all" / absent => no status filter (list all).
+        assert_eq!(courier_status(Some("all")), None);
+        assert_eq!(courier_status(None), None);
+        assert_eq!(courier_status(Some("nope")), None);
+        assert_eq!(courier_status(Some(" sent ")), Some(CourierMessageStatus::Sent));
+    }
+
+    // --- ACT-02: courier is read-only (no write handler) ---------------------
+
+    #[test]
+    fn courier_readonly() {
+        // The courier surface exposes ONLY list + get — no create/update/delete
+        // handler is defined. Assert both reads exist and no courier mutation
+        // handler is present in this module's source.
+        let src = include_str!("kratos.rs");
+        assert!(
+            src.contains("pub async fn list_courier_messages"),
+            "courier list handler must exist"
+        );
+        assert!(
+            src.contains("pub async fn get_courier_message"),
+            "courier get handler must exist"
+        );
+        // Reconstruct the forbidden handler-definition forms at runtime so this
+        // assertion's own source does not self-trip the check.
+        let verbs = ["delete", "create", "update"];
+        for verb in verbs {
+            let forbidden = format!("pub async fn {}_courier", verb);
+            assert!(
+                !src.contains(&forbidden),
+                "courier must be read-only: no {verb} handler"
+            );
+        }
     }
 }
