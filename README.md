@@ -564,6 +564,60 @@ unauthenticated / no-CSRF writes are refused `401` / `403`; and the
 **bundle-egress** gate stays clean. Every negative assertion passes ONLY on the
 explicit refusal (a `2xx` where a `4xx` is due is a hard fail).
 
+### Verifying Phase 8 — OAuth2 / Hydra (`OAUTH2-01..08`)
+
+A single fail-closed gate proves both Hydra planes end-to-end against the real
+stack and tears it down cleanly afterward (a `trap` restores
+`config/hydra/hydra.yml` and runs `docker compose down -v`):
+
+```bash
+docker compose down -v
+MSYS_NO_PATHCONV=1 docker compose build backend frontend
+MSYS_NO_PATHCONV=1 docker compose up -d --wait
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase8-acceptance.sh   # Git Bash on Windows
+# (the gate runs `docker compose down -v` itself on exit; pass KEEP_STACK=1 to keep it up)
+```
+
+The gate exits `0` only when:
+
+- **Data plane (`OAUTH2-01`).** An OAuth2 client is created (the one-time
+  `client_secret` is captured from the create response), a `GET` masks both
+  `client_secret` and `registration_access_token`, and the client is deleted
+  (`204`).
+- **`#2869` empirical secret-preserve (the headline correctness requirement).**
+  The captured secret mints a `client_credentials` token, a **non-secret `PUT`**
+  (a rename, secret omitted) is applied, and the **same original secret still
+  mints a token afterward** — proving the stored secret survived the edit. This is
+  proven by re-authenticating (not merely a `200` on the `PUT`); a regenerated /
+  blanked secret would fail with `invalid_client` and **fail** the gate. Tokens are
+  minted against Hydra's public `/oauth2/token` **from inside the `ory-hydra`
+  container** because the Ory ports are host-internal (`INFRA-05`).
+- **Data plane (`OAUTH2-02`).** The minted token introspects `active`, is
+  **revoked** (the single CSRF-guarded state change), then introspects
+  `inactive`; an unknown token introspects `active:false` (a `200`, not an error).
+- **Config plane (`OAUTH2-03..08`).** A representative key per section
+  (`general` issuer, `ttl` access-token, `strategies` access-token, `cookies`
+  same-site) **validates → persists → restarts only Hydra** (Kratos/Keto/Oathkeeper
+  `StartedAt` unchanged) → recovers healthy → `GET` reflects; the `oidc`
+  `pairwise.salt` reports presence only (`{set:bool}`, never the value).
+- **Negatives.** An invalid value (bad enum / bad duration) is rejected `422`
+  with **no disk write**; a sensitive key (`/dsn`, `/secrets/system/*`,
+  `/serve/admin/*`) is refused `403`; unauthenticated / no-CSRF writes on the new
+  routes are refused `401` / `403`. Every negative passes ONLY on the explicit
+  refusal.
+
+**CLI-interchange method.** The gate asserts the created client JSON carries the
+crate `OAuth2Client` field names the `ory` CLI consumes (`client_id`,
+`grant_types`, `response_types`, `token_endpoint_auth_method`, …) — both are
+generated from the same Hydra OpenAPI spec. If the `ory` CLI binary is present in
+`PATH` the gate also round-trips the JSON through it; otherwise the field-shape
+assertion is the interchange proof (the CLI is not a build dependency).
+
+**`--dev` cross-reference.** Hydra runs with `--dev` (`T-08-DEV`) so the gate's
+`http://localhost:4444/` issuer is accepted and tokens mint over plain HTTP on the
+internal-only public port. See "Hydra boot mode — `--dev` residual risk" below for
+the production-mode (https-issuer behind TLS) migration path.
+
 ---
 
 ## Architecture (Phase 1)
