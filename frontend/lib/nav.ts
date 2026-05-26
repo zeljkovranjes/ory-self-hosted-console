@@ -11,6 +11,7 @@ import {
   KeyRound,
   Languages,
   LayoutDashboard,
+  LineChart,
   Link2,
   ListChecks,
   Mail,
@@ -377,18 +378,38 @@ export const NAV_GROUPS: NavGroup[] = [
         built: true,
       },
       {
+        // Phase 16 (OBS-03): the Activity page is now the Prometheus-backed
+        // metrics dashboard — a pure observability surface, so it is HIDDEN
+        // when the observability flag is OFF (and shows the FeatureGate disabled
+        // state if visited). The derived v1 stub was retired as the live surface.
         slug: "project-activity",
         label: "Activity",
         href: "/project/activity",
         icon: Activity,
         built: true,
+        requiresFlag: "observability",
       },
       {
+        // Logs & events stays ALWAYS visible: the console-audit tab is ungated
+        // (it records console operations, not container logs). The Loki
+        // "Container logs" tab inside is observability-gated at the component
+        // level (FeatureGate), so the entry itself is not flag-hidden.
         slug: "project-logs",
         label: "Logs & events",
         href: "/project/logs",
         icon: ScrollText,
         built: true,
+      },
+      {
+        // Phase 16 (OBS-05): the Grafana power-user surface — a link to the
+        // proxied Grafana through the authenticated backend proxy. Hidden when
+        // the observability flag is OFF.
+        slug: "observability-grafana",
+        label: "Grafana",
+        href: "/observability/grafana",
+        icon: LineChart,
+        built: true,
+        requiresFlag: "observability",
       },
       {
         slug: "project-event-streams",
