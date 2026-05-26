@@ -3,11 +3,15 @@ import {
   Cookie,
   FileCode2,
   Fingerprint,
+  Globe,
+  Image,
   Inbox,
   KeyRound,
+  Languages,
   Link2,
   Mail,
   MonitorSmartphone,
+  Paintbrush,
   RefreshCw,
   Route,
   RotateCcw,
@@ -272,10 +276,12 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    // Phase 10 — the "Branding" group (10-UI-SPEC §G). Plan 02 ships the two
+    // Phase 10 — the "Branding" group (10-UI-SPEC §G). Plan 02 shipped the two
     // kratos-config branding pages (Email Templates, UI URLs); Plan 03 appends
-    // Console Logo + the three gated pages (Localization, Custom Domains,
-    // Theming) without re-touching these two. Both `built: true`.
+    // Console Logo (the console-OWNED asset upload) + the three gated pages
+    // (Localization, Custom Domains, Theming). The gated items route to the
+    // labeled `GatedFeature` page — NOT the "coming in a later phase"
+    // placeholder. All `built: true`.
     label: "Branding",
     items: [
       {
@@ -290,6 +296,34 @@ export const NAV_GROUPS: NavGroup[] = [
         label: "UI URLs",
         href: "/branding/ui-urls",
         icon: Link2,
+        built: true,
+      },
+      {
+        slug: "branding-logo",
+        label: "Console Logo",
+        href: "/branding/logo",
+        icon: Image,
+        built: true,
+      },
+      {
+        slug: "branding-localization",
+        label: "Localization",
+        href: "/branding/localization",
+        icon: Languages,
+        built: true,
+      },
+      {
+        slug: "branding-custom-domains",
+        label: "Custom Domains",
+        href: "/branding/custom-domains",
+        icon: Globe,
+        built: true,
+      },
+      {
+        slug: "branding-theming",
+        label: "Theming",
+        href: "/branding/theming",
+        icon: Paintbrush,
         built: true,
       },
     ],

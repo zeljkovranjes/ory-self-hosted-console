@@ -88,7 +88,13 @@ export async function api<T = unknown>(
   const method = (init.method ?? "GET").toUpperCase();
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
-  if (init.body) headers.set("Content-Type", "application/json");
+  // Set the JSON content-type for string bodies only. For a `FormData` body
+  // (the BRAND-03 multipart logo upload) we MUST NOT set Content-Type: the
+  // browser sets `multipart/form-data` with the correct boundary itself, and
+  // forcing application/json would corrupt the multipart parse on the backend.
+  if (init.body && !(init.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
   if (MUTATING_METHODS.has(method)) {
     const token = resolveCsrf();
     if (token) headers.set("X-CSRF-Token", token);
