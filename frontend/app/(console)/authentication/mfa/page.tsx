@@ -3,11 +3,16 @@
 // AUTH-03 — Two-Factor / MFA (UI-SPEC §3, 07-RESEARCH Page 3).
 //
 // 2FA method switches (totp / lookup_secret / webauthn / code-as-2nd-factor),
-// the TOTP issuer, and the login + whoami required_aal selects. The AAL enum is
+// the TOTP issuer, and the whoami required_aal select. The AAL enum is
 // the shared `AAL_VALUES` const (aal1, highest_available) — NEVER `highest_aal`
 // (07-RESEARCH Pitfall 1). This page is the canonical UI owner of required_aal
 // (Open Q2). Bound 1:1 to the section JSON-Pointers; the form values ARE the
 // flat pointer-keyed PUT body.
+//
+// NOTE: `selfservice.flows.login.required_aal` is NOT exposed — the Kratos
+// v26.2.0 config schema marks `selfservice.flows.login` additionalProperties:false
+// with no `required_aal`, so writing it 422s. `session.whoami.required_aal` is the
+// schema-valid assurance-level control and is the sole AAL field here.
 
 import { z } from "zod";
 
@@ -19,7 +24,6 @@ const TOTP_ISSUER = "/selfservice/methods/totp/config/issuer";
 const LOOKUP = "/selfservice/methods/lookup_secret/enabled";
 const WEBAUTHN = "/selfservice/methods/webauthn/enabled";
 const CODE_MFA = "/selfservice/methods/code/mfa_enabled";
-const LOGIN_AAL = "/selfservice/flows/login/required_aal";
 const WHOAMI_AAL = "/session/whoami/required_aal";
 
 const schema = z.object({
@@ -28,7 +32,6 @@ const schema = z.object({
   [LOOKUP]: z.boolean(),
   [WEBAUTHN]: z.boolean(),
   [CODE_MFA]: z.boolean(),
-  [LOGIN_AAL]: z.enum(AAL_VALUES),
   [WHOAMI_AAL]: z.enum(AAL_VALUES),
 }) as unknown as z.ZodType<Record<string, unknown>, Record<string, unknown>>;
 
@@ -38,7 +41,6 @@ const defaults: Record<string, unknown> = {
   [LOOKUP]: false,
   [WEBAUTHN]: false,
   [CODE_MFA]: false,
-  [LOGIN_AAL]: "highest_available",
   [WHOAMI_AAL]: "highest_available",
 };
 
@@ -86,15 +88,8 @@ export default function MfaPage() {
           />
           <PointerSelect
             form={form}
-            pointer={LOGIN_AAL}
-            label="Login required AAL"
-            options={AAL_VALUES}
-            description="The assurance level required to complete a login."
-          />
-          <PointerSelect
-            form={form}
             pointer={WHOAMI_AAL}
-            label="whoami required AAL"
+            label="Required AAL"
             options={AAL_VALUES}
             description="The assurance level required for an active session (whoami)."
           />

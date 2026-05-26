@@ -60,7 +60,10 @@ describe("Authentication / Verification (/authentication/verification)", () => {
     expect(putCall).toBeUndefined();
   });
 
-  it("Save PUTs to /api/config/kratos/verification", async () => {
+  it("Save PUTs only the dirtied pointer to /api/config/kratos/verification", async () => {
+    // SettingsForm submits DIRTY-ONLY fields (Phase-10 WR-01 — the backend merges
+    // the patch over the loaded doc). Toggling ONLY the enable switch sends ONLY
+    // its pointer; the untouched `use` pointer is absent from the PUT body.
     apiMock.mockResolvedValueOnce(defaults);
     apiMock.mockResolvedValueOnce({ status: "healthy" });
     renderPage();
@@ -77,7 +80,8 @@ describe("Authentication / Verification (/authentication/verification)", () => {
       expect(String(putCall?.[0])).toBe("/api/config/kratos/verification");
       const body = JSON.parse((putCall?.[1] as RequestInit).body as string);
       expect(body).toHaveProperty("/selfservice/flows/verification/enabled");
-      expect(body).toHaveProperty("/selfservice/flows/verification/use");
+      // The untouched `use` pointer is NOT sent (dirty-only).
+      expect(body).not.toHaveProperty("/selfservice/flows/verification/use");
     });
   });
 });

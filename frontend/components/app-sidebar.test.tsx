@@ -20,26 +20,41 @@ function renderSidebar() {
 }
 
 describe("AppSidebar", () => {
-  it("renders every nav section from the model", () => {
-    renderSidebar();
+  it("renders a routed link for every nav item in the model", () => {
+    // Every NAV_ITEMS entry renders as an <a> at its href. Labels are NOT unique
+    // across groups (e.g. "Sessions" appears under BOTH Activity and
+    // Authentication; "Webhooks" is a substring of "Actions & Webhooks"), so we
+    // assert by each item's UNIQUE href rather than by label text. Use getAllBy +
+    // scoping by href so duplicate-label items don't collide.
+    const { container } = renderSidebar();
     for (const item of NAV_ITEMS) {
-      expect(
-        screen.getByRole("link", { name: new RegExp(item.label, "i") }),
-      ).toBeInTheDocument();
+      const link = container.querySelector(`a[href="${item.href}"]`);
+      expect(link, `missing nav link for ${item.href}`).toBeInTheDocument();
+      // The item's label text renders inside its own link.
+      expect(link).toHaveTextContent(new RegExp(item.label, "i"));
     }
   });
 
-  it("renders the UI-SPEC core section links (Users, Permissions, Branding, Project, Activity)", () => {
-    renderSidebar();
-    for (const label of [
-      "Activity",
-      "Users",
-      "Permissions",
-      "Branding",
-      "Project",
+  it("renders the UI-SPEC core sections: group labels as headings + their item links", () => {
+    const { container } = renderSidebar();
+    // "Activity", "Permissions", "Branding", "Project" are GROUP LABELS (section
+    // headings), not links — assert them as plain text. ("Identity" is the group
+    // that contains the Users item.) "Activity" also appears as a Project item
+    // label (/project/activity), so use getAllByText (>=1) to allow the collision.
+    for (const groupLabel of ["Activity", "Permissions", "Branding", "Project"]) {
+      expect(screen.getAllByText(groupLabel).length).toBeGreaterThan(0);
+    }
+    // The actual nav-item links are asserted by their unique hrefs.
+    for (const href of [
+      "/users",
+      "/permissions/relationships",
+      "/branding/email-templates",
+      "/project/overview",
+      "/activity/sessions",
     ]) {
       expect(
-        screen.getByRole("link", { name: new RegExp(label, "i") }),
+        container.querySelector(`a[href="${href}"]`),
+        `missing nav link for ${href}`,
       ).toBeInTheDocument();
     }
   });

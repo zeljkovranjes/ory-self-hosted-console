@@ -60,7 +60,10 @@ describe("Authentication / Recovery (/authentication/recovery)", () => {
     expect(putCall).toBeUndefined();
   });
 
-  it("Save PUTs to /api/config/kratos/recovery", async () => {
+  it("Save PUTs only the dirtied pointer to /api/config/kratos/recovery", async () => {
+    // SettingsForm submits DIRTY-ONLY fields (Phase-10 WR-01 — the backend merges
+    // the patch over the loaded doc). Toggling ONLY the enable switch sends ONLY
+    // its pointer; the untouched `use` pointer is absent from the PUT body.
     apiMock.mockResolvedValueOnce(defaults);
     apiMock.mockResolvedValueOnce({ status: "healthy" });
     renderPage();
@@ -75,7 +78,8 @@ describe("Authentication / Recovery (/authentication/recovery)", () => {
       expect(String(putCall?.[0])).toBe("/api/config/kratos/recovery");
       const body = JSON.parse((putCall?.[1] as RequestInit).body as string);
       expect(body).toHaveProperty("/selfservice/flows/recovery/enabled");
-      expect(body).toHaveProperty("/selfservice/flows/recovery/use");
+      // The untouched `use` pointer is NOT sent (dirty-only).
+      expect(body).not.toHaveProperty("/selfservice/flows/recovery/use");
     });
   });
 });

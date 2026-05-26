@@ -39,7 +39,10 @@ describe("Authentication / Passwordless (/authentication/passwordless)", () => {
     ).toBeInTheDocument();
   });
 
-  it("Save PUTs the passkey rp id + code passwordless pointers", async () => {
+  it("Save PUTs only the dirtied passkey rp id pointer", async () => {
+    // SettingsForm submits DIRTY-ONLY fields (Phase-10 WR-01 — the backend merges
+    // the patch over the loaded doc). Editing ONLY the passkey rp id sends ONLY
+    // its pointer; the untouched code passwordless pointer is absent from the PUT.
     apiMock.mockResolvedValueOnce({});
     apiMock.mockResolvedValueOnce({ status: "healthy" });
     renderPage();
@@ -59,7 +62,8 @@ describe("Authentication / Passwordless (/authentication/passwordless)", () => {
         "/selfservice/methods/passkey/config/rp/id",
         "example.com",
       );
-      expect(body).toHaveProperty(
+      // The untouched code passwordless pointer is NOT sent (dirty-only).
+      expect(body).not.toHaveProperty(
         "/selfservice/methods/code/passwordless_enabled",
       );
     });

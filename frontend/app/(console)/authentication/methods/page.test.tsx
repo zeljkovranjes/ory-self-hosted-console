@@ -65,13 +65,16 @@ describe("Authentication / Methods (/authentication/methods)", () => {
     expect(oidc).not.toBeChecked();
   });
 
-  it("Save PUTs a flat object keyed by /selfservice/methods/<m>/enabled", async () => {
+  it("Save PUTs only the dirtied pointer keyed by /selfservice/methods/<m>/enabled", async () => {
+    // SettingsForm submits DIRTY-ONLY fields (Phase-10 WR-01 — the backend merges
+    // the patch over the loaded doc). Toggling ONLY the password switch sends ONLY
+    // its pointer; the untouched oidc pointer is absent from the PUT body.
     apiMock.mockResolvedValueOnce({ "/selfservice/methods/password/enabled": false });
     apiMock.mockResolvedValueOnce({ status: "healthy" });
     renderPage();
 
     const password = await screen.findByRole("switch", { name: /password/i });
-    await userEvent.click(password); // toggle to true (dirties the form)
+    await userEvent.click(password); // toggle to true (dirties only this pointer)
     await userEvent.click(screen.getByRole("button", { name: /save/i }));
 
     await waitFor(() => {
@@ -82,7 +85,8 @@ describe("Authentication / Methods (/authentication/methods)", () => {
       expect(String(putCall?.[0])).toBe("/api/config/kratos/methods");
       const body = JSON.parse((putCall?.[1] as RequestInit).body as string);
       expect(body).toHaveProperty("/selfservice/methods/password/enabled", true);
-      expect(body).toHaveProperty("/selfservice/methods/oidc/enabled");
+      // The untouched oidc pointer is NOT sent (dirty-only).
+      expect(body).not.toHaveProperty("/selfservice/methods/oidc/enabled");
     });
   });
 

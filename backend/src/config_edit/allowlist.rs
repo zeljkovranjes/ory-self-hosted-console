@@ -139,7 +139,6 @@ pub const KRATOS_MFA: SectionAllowlist = SectionAllowlist {
         "/selfservice/methods/lookup_secret/enabled",
         "/selfservice/methods/webauthn/enabled",
         "/selfservice/methods/code/mfa_enabled",
-        "/selfservice/flows/login/required_aal",
         "/session/whoami/required_aal",
     ],
 };
@@ -915,13 +914,15 @@ mod tests {
     /// (the CONTEXT typo) appears NOWHERE in the MFA section pointers. Enum-value
     /// validity is the schema validator's job (Plan 05) — here we only prove the
     /// `required_aal` pointer exists and accepts the canonical values.
+    ///
+    /// The canonical AAL pointer is `session.whoami.required_aal` — the v26.2.0
+    /// Kratos schema marks `selfservice.flows.login` additionalProperties:false
+    /// with no `required_aal`, so that login pointer is NOT in the allowlist
+    /// (it would 422 at the schema layer; integration-audit finding).
     #[test]
     fn mfa_required_aal_pointer_and_no_highest_aal_literal() {
         for value in ["aal1", "highest_available"] {
-            let patch = vec![(
-                "/selfservice/flows/login/required_aal".to_string(),
-                json!(value),
-            )];
+            let patch = vec![("/session/whoami/required_aal".to_string(), json!(value))];
             assert!(
                 filter(&KRATOS_MFA, &patch).is_ok(),
                 "required_aal must accept `{value}` at the allowlist layer"
@@ -934,8 +935,12 @@ mod tests {
                 .all(|p| !p.contains("highest_aal")),
             "no MFA pointer may contain the literal `highest_aal`"
         );
-        // The pointer itself is present.
+        // The schema-valid whoami AAL pointer is present; the schema-invalid
+        // login pointer is NOT (pruned per the integration audit).
         assert!(KRATOS_MFA
+            .allowed_paths
+            .contains(&"/session/whoami/required_aal"));
+        assert!(!KRATOS_MFA
             .allowed_paths
             .contains(&"/selfservice/flows/login/required_aal"));
     }
