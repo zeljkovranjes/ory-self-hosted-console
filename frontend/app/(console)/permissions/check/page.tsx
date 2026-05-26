@@ -156,7 +156,7 @@ function CheckTab() {
       {result ? (
         <div className="rounded-md border p-4">
           {result.allowed ? (
-            <p className="text-[--success] font-medium">
+            <p className="text-success font-medium">
               Allowed — the subject has this permission.
             </p>
           ) : (
