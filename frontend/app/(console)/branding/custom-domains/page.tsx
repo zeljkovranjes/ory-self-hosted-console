@@ -187,7 +187,14 @@ function ReverseProxySnippet() {
 
 // --- (c) SSRF-guarded reachability check ---------------------------------------
 
-type ReachabilityResponse = { reachable?: boolean; status?: number };
+// WR-02: the backend returns a COARSE classification (`reason`), NOT the raw
+// upstream HTTP status — so the console is not an outbound "fetch any URL and
+// report its exact status" oracle. `reason` is one of "ok" | "http_error" |
+// "unreachable".
+type ReachabilityResponse = {
+  reachable?: boolean;
+  reason?: "ok" | "http_error" | "unreachable";
+};
 
 function ReachabilityCheck() {
   const [url, setUrl] = React.useState("");
@@ -260,11 +267,10 @@ function ReachabilityCheck() {
               <CheckCircle2Icon className="text-green-600 dark:text-green-500" />
               <AlertTitle>Reachable</AlertTitle>
               <AlertDescription>
-                The target responded
-                {typeof result.status === "number"
-                  ? ` with HTTP ${result.status}`
-                  : ""}
-                .
+                {/* WR-02: a COARSE result — never the raw upstream status. */}
+                {result.reason === "http_error"
+                  ? "The target answered, but with an error response. Confirm your reverse proxy is serving the domain successfully."
+                  : "The target responded successfully."}
               </AlertDescription>
             </Alert>
           ) : (

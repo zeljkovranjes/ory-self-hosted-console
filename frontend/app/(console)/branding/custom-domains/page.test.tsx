@@ -98,7 +98,8 @@ describe("Custom Domains page (AX-04)", () => {
 
   it("routes the reachability check through lib/api (POST /api/account-experience/reachability)", async () => {
     apiMock.mockResolvedValueOnce({ "/serve/public/base_url": "" }); // ConfigSection load
-    apiMock.mockResolvedValueOnce({ reachable: true, status: 200 });
+    // WR-02: the backend returns a COARSE `reason`, never the raw upstream status.
+    apiMock.mockResolvedValueOnce({ reachable: true, reason: "ok" });
     renderPage();
 
     const urlInput = await screen.findByLabelText(
@@ -123,7 +124,11 @@ describe("Custom Domains page (AX-04)", () => {
     // The success banner title is exactly "Reachable" (the prose elsewhere also
     // contains the word — target the title node specifically).
     expect(await screen.findByText("Reachable")).toBeInTheDocument();
-    expect(screen.getByText(/HTTP 200/i)).toBeInTheDocument();
+    // WR-02: a coarse success message — NO raw upstream status code is shown.
+    expect(
+      screen.getByText(/The target responded successfully\./i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/HTTP \d/i)).toBeNull();
   });
 
   it("surfaces an SSRF rejection (422) INLINE and never collapses it into a reachable result (T-15-15)", async () => {

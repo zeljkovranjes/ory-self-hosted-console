@@ -249,15 +249,25 @@ pub fn write_translations(config_dir: &str, body: &str) -> Result<serde_json::Va
 // (anti-false-green, T-15-15).
 
 /// The outcome of an AX-04 reachability probe of an operator-supplied URL.
+///
+/// WR-02 (outbound-oracle reduction): this is a COARSE boolean result, NOT a
+/// status echo. The earlier shape returned `status: Some(resp.status())` for any
+/// public host that passed the SSRF guard, turning the console into a generic
+/// "fetch any public URL and report its exact HTTP status" probe for an
+/// authenticated operator. The custom-domain UI only needs "is my domain
+/// serving?", so we collapse the response to `{reachable, reason}` where `reason`
+/// is a fixed enum bucket — never the raw upstream status code or any header.
 #[derive(Debug, serde::Serialize)]
 pub struct Reachability {
-    /// True iff the guarded GET returned ANY HTTP response (2xx/3xx/4xx/5xx) —
-    /// i.e. the host is reachable. A transport failure is `false`.
+    /// True iff the guarded GET returned ANY HTTP response (the host answered).
+    /// A transport failure (no answer) is `false`.
     pub reachable: bool,
-    /// The HTTP status code when a response was received (omitted on transport
-    /// failure). The presence of a status is the affirmative "reachable" signal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
+    /// A FIXED, coarse classification — NOT the upstream status code. One of:
+    /// `"ok"` (2xx/3xx answered), `"http_error"` (4xx/5xx answered),
+    /// `"unreachable"` (transport failure / no answer). This avoids leaking the
+    /// exact status of an arbitrary public endpoint while still telling the
+    /// operator whether their domain is up and serving successfully (WR-02).
+    pub reason: &'static str,
 }
 
 /// Run an SSRF-guarded reachability probe of `url`.
@@ -280,14 +290,25 @@ pub async fn check_reachability(url: &str) -> Result<Reachability, AppError> {
 
     // The single guarded GET. A transport error (connection refused/timeout to a
     // PUBLIC host that passed the guard) is a legitimate unreachable result.
+    //
+    // WR-02: classify into a COARSE bucket — never echo the raw upstream status.
+    // 2xx/3xx -> "ok"; 4xx/5xx -> "http_error" (the host answered, but not a
+    // success); transport failure -> "unreachable".
     match client.get(url).send().await {
-        Ok(resp) => Ok(Reachability {
-            reachable: true,
-            status: Some(resp.status().as_u16()),
-        }),
+        Ok(resp) => {
+            let reason = if resp.status().is_success() || resp.status().is_redirection() {
+                "ok"
+            } else {
+                "http_error"
+            };
+            Ok(Reachability {
+                reachable: true,
+                reason,
+            })
+        }
         Err(_) => Ok(Reachability {
             reachable: false,
-            status: None,
+            reason: "unreachable",
         }),
     }
 }
