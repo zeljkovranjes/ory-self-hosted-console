@@ -681,6 +681,37 @@ This is a security-foundations phase; the controls below are the deliverable.
   fresh key is generated automatically. Only `config/oathkeeper/jwks.json.example`
   (an empty placeholder) is tracked in git.
 
+### Hydra boot mode — `--dev` residual risk (Phase 8, `T-08-DEV`)
+
+Ory Hydra runs with the `--dev` flag in `docker-compose.yml`
+(`command: ["serve", "all", "--dev", …]`). This is a **deliberate, documented
+decision**, not an oversight:
+
+- **Why `--dev` stays.** Hydra v2.x removed the legacy `--dangerous-force-http`
+  switch; `--dev` is now the only relaxed-security flag. Without it, Hydra
+  **refuses to boot with a non-HTTPS `urls.self.issuer`**, and the shipped config
+  uses `http://localhost:4444/` because Hydra's public/admin ports are served over
+  plain HTTP on the **internal-only** Docker network. Running production-mode (no
+  `--dev`) would require terminating TLS at a reverse proxy in front of Hydra's
+  public port and switching the issuer to `https://…` — a reverse-proxy/TLS story
+  that is larger than this phase and orthogonal to the console's job.
+- **Why the residual risk is acceptable (INFRA-05).** Hydra's public (`4444`) and
+  admin (`4445`) ports are **never published to the host** — they are reachable
+  only from inside the `internal` Docker network (the Rust backend is the sole
+  caller). `--dev` relaxes the HTTPS-issuer requirement and a few transport
+  checks; it does **not** disable authentication, the OAuth2 security model, or
+  the `secrets.system` encryption-at-rest. With no host-exposed port, the relaxed
+  transport posture has no externally reachable surface.
+- **What is NOT relaxed.** `SECRETS_SYSTEM` (→ `secrets.system`, immutable
+  encryption-at-rest key) and the Postgres `DSN` remain env-injected and intact;
+  both are on the console's hard config denylist and are never editable through
+  the OAuth2 config pages.
+- **To go fully production-mode.** Put a TLS-terminating reverse proxy in front of
+  Hydra's public port, set `urls.self.issuer`/`urls.self.public` to the `https://`
+  external URL (editable on the **General & Issuer** OAuth2 config page), and drop
+  `--dev` from the Hydra `command` in `docker-compose.yml`. Keep `SECRETS_SYSTEM`
+  and `DSN` env-injected exactly as they are today.
+
 ### Residual risks (accepted, documented per the production-grade mandate)
 
 - **The restart broker has NO TLS / mTLS.** Confidentiality of the broker traffic
@@ -691,6 +722,11 @@ This is a security-foundations phase; the controls below are the deliverable.
   primitive for anything that can reach the broker. The blast radius is minimized
   by `-allowfrom=backend` and the restart-only, four-container scope. Documented
   and accepted (`T-restart-dos`).
+- **Hydra runs in `--dev` relaxed-security mode** (`T-08-DEV`). Justified by
+  INFRA-05 — Hydra's public/admin ports are never host-published, so the relaxed
+  transport posture has no externally reachable surface. `secrets.system` and the
+  Postgres DSN are preserved. See "Hydra boot mode" above for the production-mode
+  migration path.
 
 ---
 

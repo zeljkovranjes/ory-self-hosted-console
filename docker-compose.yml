@@ -181,10 +181,17 @@ services:
       args:
         BASE_IMAGE: *hydra-image
     container_name: ory-hydra
-    # --dev: this Phase-1 infra bring-up serves Hydra over plain HTTP on the
-    # internal-only network (no public port is published; TLS termination is a
-    # reverse-proxy concern out of scope here). Without --dev, Hydra refuses a
-    # non-HTTPS `urls.self.issuer`. Production behind TLS would drop --dev.
+    # --dev: serves Hydra over plain HTTP on the internal-only network (no public
+    # port is published; TLS termination is a reverse-proxy concern out of scope
+    # here). Without --dev, Hydra refuses a non-HTTPS `urls.self.issuer`.
+    #
+    # Phase-8 decision (T-08-DEV): --dev is RETAINED and the residual risk is
+    # documented + accepted in README.md ("Hydra boot mode — --dev residual risk").
+    # Justified by INFRA-05 — Hydra's public/admin ports are NEVER host-published,
+    # so the relaxed transport posture has no externally reachable surface.
+    # SECRETS_SYSTEM (encryption-at-rest, immutable) and DSN below are preserved.
+    # To go fully production-mode: terminate TLS at a reverse proxy, set an https
+    # `urls.self.issuer` (editable on the OAuth2 General page), then drop --dev.
     command: ["serve", "all", "--dev", "--config", "/etc/config/hydra/hydra.yml"]
     environment:
       DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@postgres:5432/hydra?sslmode=disable
