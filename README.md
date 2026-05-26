@@ -1179,6 +1179,208 @@ wires the Kratos egress).
 
 ---
 
+## SAML Sign-In & Organizations (Phase 14)
+
+Phase 14 turns the Phase-13 Polis bridge into two operator-facing features —
+**SAML Sign-In** (connect an enterprise SAML IdP) and **Organizations**
+(map verified email domains to an SSO connection). Both are **fully open-source,
+no license or "Enterprise" tier required**: the pages carry zero upsell copy and
+are gated only by the `saml` / `organizations` feature flags (seeded OFF).
+
+Manage them under **Authentication → SAML Sign-In** and **Project → Organizations**.
+The frontend talks only to the Rust backend (`lib/api.ts`); the backend is the
+sole client of the Polis admin API — the browser never reaches Polis or Kratos.
+
+### How SAML Sign-In works (the trust model)
+
+A SAML connection wires an IdP into the stack as a single Kratos OIDC provider,
+**via Polis**:
+
+```
+operator → console (SAML page) → backend → Polis /api/v1/sso  (connection minted)
+                                          → Kratos providers[]  (generic OIDC entry)
+end-user login → Kratos → Polis (OIDC) → SAML IdP → back to Kratos
+```
+
+The backend keys every connection by `(tenant, product)` where **`product` is the
+fixed string `"ory-console"`** and **`tenant` is the connection's stable id** (the
+Organization id from Phase 15 onward). The Kratos provider entry's id is
+**`saml-<tenant>`**, so a delete can find and remove exactly its own entry.
+
+Three security controls make a SAML connection safe; **each is enforced
+console-side and cannot be toggled off**:
+
+1. **Mandatory IdP signing certificate (SSO-02).** A SAML connection is only as
+   trustworthy as the certificate Polis validates assertion signatures against.
+   The console runs a **mandatory signing-cert pre-flight on the IdP metadata
+   *before* any Polis call**: metadata with **no `<X509Certificate>` usable for
+   signing** — including the subtle **encryption-only** case (a cert present only
+   under `KeyDescriptor use="encryption"`) — is rejected **`422`** and **no Polis
+   connection is created**. There is **no "skip signature validation" affordance**
+   anywhere in the UI or API.
+
+2. **`email_verified`-default-false mapper — the account-takeover defense
+   (SSO-03).** Polis's OIDC id_token for a SAML bridge carries **no
+   `email_verified` claim**. A naive Kratos mapper that maps `email`
+   unconditionally would let an attacker who controls *any* connected SAML IdP
+   assert `victim@corp.com` and have Kratos **auto-link** them to the victim's
+   existing identity. The console therefore generates a Kratos Jsonnet mapper that
+   begins with Ory's documented default-false overlay
+   (`local claims = { email_verified: false } + std.extVar('claims')`) and emits
+   the `email` trait **only** under a conditional gate
+   (`[if 'email' in claims && claims.email_verified then 'email' else null]`).
+   Because Polis never asserts `email_verified`, **the email trait is always
+   dropped** — Kratos **cannot** auto-link by a SAML-asserted email. The mapper is
+   stored base64-encoded in the provider's `mapper_url` and is **identical for
+   every connection** (no per-connection knob can weaken it). The trust anchor that
+   actually makes a SAML email usable is the **Organization domain binding** plus
+   an explicit operator linking action — never the raw assertion.
+
+3. **SSRF-guarded `metadataUrl` (SSO-04).** The preferred way to add a connection
+   is to **upload the IdP metadata XML** (base64'd into `encodedRawMetadata` — no
+   network fetch, no SSRF surface). If you instead supply a **metadata URL**, the
+   backend runs it through the same SSRF guard the webhook dispatcher uses
+   **before any fetch**: a URL whose host resolves to an internal/private/
+   link-local address (`http://kratos:4434`, `http://169.254.169.254`,
+   `127.0.0.1`, …) or that carries **embedded credentials** (`user:pass@…`) is
+   rejected with an explicit **4xx**, and the reject names the *category* — it
+   never echoes the internal IP. DNS-rebind is defended by pinning the resolved
+   address and disabling redirects.
+
+**Two-sided delete.** Deleting a connection removes **both** the Polis
+`/api/v1/sso` connection **and** the matching Kratos `providers[]` entry
+(`saml-<tenant>`), restarting only Kratos and preserving every other provider's
+stored secret. Neither side is left dangling.
+
+**Write-only `clientSecret` (BACK-07).** The OAuth2 `clientSecret` Polis mints is
+written straight into the Kratos provider entry and is **never returned to the
+frontend**: create surfaces only `clientID` + `idpMetadata`; list/detail strip
+the secret and show a masked `clientSecret_set` badge. The `POLIS_API_KEY` is a
+write-only secret sent only in the `Authorization: Api-Key` header — never logged,
+never serialized.
+
+#### Add a SAML connection
+
+1. Enable the `saml` feature flag (**Settings → Features**, or
+   `PUT /api/console/features/saml {"enabled":true}`).
+2. **Authentication → SAML Sign-In → Add connection.** Upload the IdP metadata XML
+   (preferred) or paste a metadata URL. Connections without a signing certificate,
+   or whose metadata URL points at an internal/credentialed host, are rejected
+   verbatim — fix the IdP export rather than looking for a bypass (there is none).
+3. On success the connection appears in the list with its entity ID, certificate
+   thumbprint, and a masked client-secret badge. A Kratos OIDC provider
+   `saml-<tenant>` is written and Kratos is restarted automatically.
+
+### How Organizations work (domain → SSO)
+
+An **Organization** is console-owned state (a row in the console Postgres, not an
+Ory primitive): a label, one or more **verified email domains**, and an optional
+**linked SSO connection tenant**. At login time the Account Experience UI
+(Phase 15) resolves a user's email domain to the org's linked connection via
+`GET /api/sso/lookup?email=…` and routes them to the right IdP.
+
+The single most important property is **domain normalization (SSO-05)**, applied
+**identically on write and on lookup** so a spoofed variant can never match at
+lookup that could not have been stored:
+
+```
+trim → strip a single trailing FQDN dot → lowercase → IDNA/punycode (TR-46,
+url::Host::parse) → registered-domain (eTLD+1) boundary via the Public Suffix List
+```
+
+Consequences (all enforced by a **UNIQUE index on the normalized domain**, the
+last-line `409` defense):
+
+- **`CORP.com`, `corp.com.`** (uppercase, trailing dot) all **collapse to one key**
+  → a second org with any variant is rejected **`409`**.
+- An **IDNA-confusable** domain (e.g. a Cyrillic-homoglyph `cорp.com`) becomes a
+  **distinct `xn--…` punycode label** — it is **never folded into** the ASCII
+  `corp.com`, so it cannot silently hijack the real org's routing.
+- **`corp.com.attacker.com`** reduces to the registered domain **`attacker.com`**
+  — **distinct** from `corp.com`, so an attacker cannot register a sub-label of a
+  victim's domain to capture its SSO routing.
+- **Multi-label TLDs are correct.** The eTLD+1 boundary uses the embedded **Public
+  Suffix List** (the `psl` crate, compiled in — no runtime fetch), so `co.uk` and
+  friends reduce correctly (e.g. `mail.acme.co.uk` → `acme.co.uk`). The PSL is
+  embedded at build time; refresh it by bumping the `psl` crate on an Ory upgrade.
+
+A lookup for an **unknown** domain returns **`404`** (value-free — no
+org-existence leak). Every org/domain create and delete is **audited** by the
+response-phase audit hoop (actor-from-session).
+
+#### Add an Organization
+
+1. Enable the `organizations` feature flag.
+2. **Project → Organizations → Add organization.** Enter a label, one or more
+   email domains (any case / form — they are normalized for you), and optionally
+   the **linked SSO connection tenant** (the SAML connection id from above).
+3. A colliding domain is rejected **`409`** and an invalid/ambiguous domain
+   **`4xx`**, both surfaced verbatim. Once linked, a login from that domain routes
+   to the connection's SAML IdP (Phase-15 login UI).
+
+### Residual risk (carried)
+
+- **Per-tenant SAML list.** The Polis admin list endpoint is **per-`(tenant,
+  product)`**, with no list-all route; the console SAML page aggregates over a
+  **browser-local tenant registry** (localStorage, holds no secret). A connection
+  created in a different browser profile won't appear until its tenant id is
+  re-entered. Acceptable for single-operator self-hosting; revisit if a list-all
+  Polis route becomes available.
+- **Domain binding is the trust anchor, not the SAML assertion.** Because the
+  mapper drops a SAML-asserted email, account linking relies on the operator
+  having bound the correct domain to the correct connection. Bind domains
+  carefully — a wrong domain→connection link routes that domain's logins to the
+  wrong IdP (it cannot, however, take over an existing identity by email).
+
+### Verifying Phase 14 — SAML Sign-In / Organizations (`SSO-02..07`)
+
+A single fail-closed gate brings up the full stack **incl. Polis on a fresh
+volume**, toggles `saml` + `organizations` **ON**, proves every `SSO-02..07`
+control with anti-false-green negatives, **re-runs the v1 + Phase-13 invariants**
+(INFRA-05 / BACK-05 / BACK-01 + bundle-egress) with the SAML/Orgs surface present,
+and tears the stack down cleanly afterward:
+
+```bash
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase14-acceptance.sh   # Git Bash on Windows
+# (the gate does the full build -> up --wait -> drive -> down -v itself, and
+#  GENERATES throwaway Polis secrets for its ephemeral run; pass KEEP_STACK=1 to
+#  keep the stack up for debugging, SKIP_EGRESS=1 to skip the bundle build)
+```
+
+The gate exits `0` only when:
+
+- **`SSO-07` flag-OFF 404.** With a valid session + CSRF, `GET`/`POST`
+  `api/sso/connections` and `api/organizations` (and `api/sso/lookup`) all return
+  **`404`** while their flag is OFF, become reachable once flipped ON, and re-close
+  to `404` when restored — the flag gate beats both the auth and CSRF guards.
+- **`SSO-02`.** A CA-less metadata POST → **`422`** (and **no** Polis connection is
+  created); an encryption-only cert → **`422`**; a signing-cert connection is
+  created, surfacing `clientID` + `idpMetadata` with **no** `clientSecret`.
+- **`SSO-03`.** The stored Kratos mapper (decoded from `base64://`) carries
+  `email_verified: false` **and** the conditional email gate **and no**
+  unconditional `email` mapping — the account-takeover negative; the connection
+  list carries **no** `clientSecret` value.
+- **`SSO-04`.** A `metadataUrl` to `http://kratos:4434`, `169.254.169.254`, a
+  credentialed URL, or loopback → explicit **4xx** SSRF reject with **no** fetch
+  and **no** connection created.
+- **`SSO-05`.** `corp.com.` collides with `CORP.com` → **`409`**; a
+  Cyrillic-homoglyph is a distinct punycode label; `corp.com.attacker.com` is
+  distinct → accepted; an audit row exists for `POST /api/organizations`.
+- **`SSO-06`.** A known org domain lookup returns the linked connection tenant; an
+  unknown domain → **`404`** (no leak).
+- **Two-sided delete.** After delete the Polis connection is gone **and** the
+  Kratos `providers[]` entry `saml-<tenant>` is removed (no dangling provider).
+- **Config-write discipline.** A valid provider write restarts **only** Kratos;
+  an invalid (CA-less) write leaves `kratos.yml` byte-identical (no disk change).
+- **v1 invariants.** INFRA-05 (Ory + Polis admin ports refused from host),
+  BACK-05 (broker scope, no backend/polis socket), BACK-01 (bundle-egress: no
+  Ory/Polis host/port/SDK/CDN in the built bundle, no `enterprise license`/
+  `requires ory` copy in `frontend/`) all re-run green.
+
+Every negative passes ONLY on the explicit refusal (anti-false-green).
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
