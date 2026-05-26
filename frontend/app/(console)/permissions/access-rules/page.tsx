@@ -135,11 +135,11 @@ export default function AccessRulesPage() {
     try {
       parsed = JSON.parse(value);
     } catch {
-      setLocalError("Rules file is not valid JSON/YAML.");
+      setLocalError("Rules file is not valid JSON.");
       return null;
     }
     if (!Array.isArray(parsed)) {
-      setLocalError("Rules file is not valid JSON/YAML.");
+      setLocalError("Rules file is not a valid JSON array.");
       return null;
     }
     return parsed;
