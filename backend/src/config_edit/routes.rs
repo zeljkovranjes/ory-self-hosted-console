@@ -47,8 +47,15 @@ use salvo::prelude::*;
 use serde_json::{Map, Value};
 
 use crate::config::Config;
-use crate::config_edit::{allowlist, locks, restart, schema, yaml};
+use crate::config_edit::{allowlist, locks, restart, schema, secret_merge, yaml};
 use crate::error::AppError;
+
+/// The single fixed JSON-Pointer the dedicated SMTP write-only handler may touch.
+/// It is on the hard `SENSITIVE_PREFIXES` denylist (carries the SMTP password), so
+/// it is NEVER routed through the generic `{service}/{section}` allowlist — this
+/// dedicated handler is the ONLY writer, exactly as IDENT-03 is the only writer of
+/// the schema file (Pitfall 2 / threat T-07-07).
+const SMTP_CONNECTION_URI_POINTER: &str = "/courier/smtp/connection_uri";
 
 /// How long to wait for a restarted service to report healthy before rolling
 /// back (RESEARCH Pitfall 6: services briefly 503; allow ample boot time).
@@ -365,6 +372,157 @@ pub async fn put_identity_schema(
     // Restore the .bak, restart again, re-poll to bring it back onto the
     // last-known-good schema. The detail is never in the body.
     tracing::warn!(service = svc.key(), "identity-schema put: health failed; rolling back");
+    rollback_and_restart(&http, &path, &cfg, svc).await;
+    Err(AppError::HealthFailed)
+}
+
+/// `GET /api/kratos/smtp-connection` — report ONLY whether an SMTP connection_uri
+/// is currently set, MASKED. The URI value (which carries the SMTP password) is
+/// NEVER serialised, never logged, never echoed — not even a substring (T-07-05).
+///
+/// Returns `{ "set": true }` when `/courier/smtp/connection_uri` is present and a
+/// non-empty string, else `{ "set": false }`. Mirrors the IDENT-03 dedicated path:
+/// a fixed target file (`kratos.yml`), NOT the `{service}/{section}` allowlist.
+///
+/// On the protected subtree: `auth_guard` (401 unauth). GET is csrf-exempt.
+#[handler]
+pub async fn get_smtp_connection(
+    _req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    let cfg = config_from(depot)?;
+    let path = config_file_path(&cfg.config_dir, restart::Service::Kratos);
+    let doc = yaml::load(&path)?;
+
+    // "set" iff the pointer is present AND a non-empty string. We read ONLY the
+    // boolean presence — the value itself is never bound to a variable that could
+    // reach the body or a log line.
+    let set = matches!(
+        doc.pointer(SMTP_CONNECTION_URI_POINTER),
+        Some(Value::String(s)) if !s.is_empty()
+    );
+    Ok(Json(serde_json::json!({ "set": set })))
+}
+
+/// `PUT /api/kratos/smtp-connection` — dedicated write-only setter for the SMTP
+/// `connection_uri`, reusing the Phase-4 transactional engine (lock -> validate ->
+/// backup -> atomic-write -> restart Kratos -> health-poll -> rollback).
+///
+/// Body: `{ "connection_uri": "<smtps://…>" }`.
+///   - value == [`secret_merge::MASKED`] OR empty/absent => "unchanged":
+///       * if a value is ALREADY stored, this is an idempotent NO-OP (no lock-held
+///         write, no restart) returning `{status:"healthy"}` (write-only-preserve);
+///       * if NO value is stored, 422 a value-free FieldError ("connection_uri
+///         required") — there is nothing to preserve.
+///   - a real value => single-pointer patch `[(/courier/smtp/connection_uri, v)]`
+///     through the engine.
+///
+/// This dedicated handler is the authorization: it can only EVER touch the one
+/// fixed pointer, so it deliberately does NOT route through `allowlist::filter`
+/// (which would 403 the denylisted pointer, Pitfall 2). The URI value never
+/// appears in any response body or tracing line (BACK-07).
+///
+/// On the protected subtree: `auth_guard` (401) + `csrf_guard` (403 without
+/// `X-CSRF-Token`, since this is state-changing).
+#[handler]
+pub async fn put_smtp_connection(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    #[derive(serde::Deserialize)]
+    struct SmtpBody {
+        connection_uri: Option<String>,
+    }
+
+    let cfg = config_from(depot)?;
+    let svc = restart::Service::Kratos;
+
+    // Parse the body up front (malformed -> 400 before the lock). The value is
+    // never logged.
+    let body: SmtpBody = req
+        .parse_json()
+        .await
+        .map_err(|_| AppError::BadRequest("invalid JSON body".into()))?;
+    let incoming = body.connection_uri.unwrap_or_default();
+    // "unchanged" signal: the masked sentinel or an empty value.
+    let unchanged = incoming.is_empty() || incoming == secret_merge::MASKED;
+
+    // --- Step 1: kratos write lock (busy -> 409 config_busy) -----------------
+    // Shares the per-service lock with put_config/put_identity_schema.
+    let _guard = locks::try_acquire("kratos").await?;
+    tracing::info!(service = svc.key(), "smtp-connection put: lock acquired");
+
+    let path = config_file_path(&cfg.config_dir, svc);
+
+    // Write-only-preserve: a masked/empty PUT must NEVER overwrite a stored value.
+    if unchanged {
+        let doc = yaml::load(&path)?;
+        let already_set = matches!(
+            doc.pointer(SMTP_CONNECTION_URI_POINTER),
+            Some(Value::String(s)) if !s.is_empty()
+        );
+        if already_set {
+            // Idempotent no-op: keep the stored secret, no write, no restart.
+            tracing::info!(
+                service = svc.key(),
+                status = "unchanged",
+                "smtp-connection put: masked/empty with a stored value — preserved (no write)"
+            );
+            return Ok(Json(serde_json::json!({ "status": "healthy" })));
+        }
+        // Nothing stored to preserve -> a value is required. Value-free 422.
+        return Err(AppError::Validation(vec![schema::FieldError {
+            path: SMTP_CONNECTION_URI_POINTER.to_string(),
+            message: "connection_uri required".to_string(),
+        }]));
+    }
+
+    // --- Real value: single-pointer engine flow -----------------------------
+    let mut merged = yaml::load(&path)?;
+    // Single fixed-pointer patch — NOT via allowlist::filter (the pointer is
+    // denylisted; this dedicated handler IS the authorization, T-07-07).
+    let patch = vec![(
+        SMTP_CONNECTION_URI_POINTER.to_string(),
+        Value::String(incoming),
+    )];
+    yaml::apply_patch(&mut merged, &patch)?;
+
+    // --- VALIDATE the env-overlaid effective doc (dsn overlay, T-07-09) ------
+    let validator = schema::validator_for("kratos").map_err(|e| {
+        tracing::error!(error = %e, service = svc.key(), "schema compile failed");
+        AppError::Internal("config schema unavailable".into())
+    })?;
+    let effective = schema::effective_for_validation("kratos", &merged);
+    if let Err(fields) = schema::validate_full(validator, &effective) {
+        tracing::debug!(service = svc.key(), count = fields.len(), "smtp-connection put: validation failed");
+        return Err(AppError::Validation(fields));
+    }
+
+    // --- BACKUP + WR-02 assert ----------------------------------------------
+    yaml::backup(&path)?;
+    if !yaml::backup_exists(&path) {
+        tracing::error!(service = svc.key(), "smtp-connection put: backup missing after backup(); refusing reversible write");
+        return Err(AppError::Internal("config backup missing".into()));
+    }
+
+    // --- ATOMIC WRITE the merged doc (no env overlay) ------------------------
+    let serialized = yaml::serialize(&merged)?;
+    yaml::write_atomic(&path, &serialized)?;
+    tracing::info!(service = svc.key(), status = "applied", "smtp-connection put: written");
+
+    // --- RESTART kratos + health-poll + rollback ----------------------------
+    let http = restart::restart_client()?;
+    tracing::info!(service = svc.key(), status = "restarting", "smtp-connection put: restarting");
+    if let Err(e) = restart::restart(&http, &cfg.restart_broker_url, svc).await {
+        tracing::warn!(service = svc.key(), "smtp-connection put: broker restart failed; restoring disk (no re-restart)");
+        restore_only(&path, svc);
+        return Err(e);
+    }
+    if restart::wait_healthy(&http, svc, HEALTH_TIMEOUT, None).await {
+        tracing::info!(service = svc.key(), status = "healthy", "smtp-connection put: healthy");
+        return Ok(Json(serde_json::json!({ "status": "healthy" })));
+    }
+    tracing::warn!(service = svc.key(), "smtp-connection put: health failed; rolling back");
     rollback_and_restart(&http, &path, &cfg, svc).await;
     Err(AppError::HealthFailed)
 }

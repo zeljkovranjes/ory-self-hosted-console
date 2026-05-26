@@ -271,6 +271,20 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
             Router::with_path("api/kratos/identity-schema")
                 .get(crate::ory::kratos::get_active_schema)
                 .put(crate::config_edit::routes::put_identity_schema),
+        )
+        // Phase 7 (AUTH-09 secret half): the dedicated write-only SMTP
+        // `connection_uri` setter. A DEDICATED route (NOT the {service}/{section}
+        // allowlist) because the URI is on the hard `SENSITIVE_PREFIXES` denylist
+        // and carries the SMTP password — this handler is the ONLY writer and can
+        // only ever touch that one pointer (Pitfall 2 / T-07-07). GET reports
+        // `{set:bool}` MASKED (never the URI, csrf-exempt); PUT sets a real value
+        // or preserves a stored one on the masked sentinel, restarts Kratos, and
+        // rolls back on health failure. PUT is state-changing so `csrf_guard`
+        // enforces `X-CSRF-Token` (403); both inherit `auth_guard` (401 unauth).
+        .push(
+            Router::with_path("api/kratos/smtp-connection")
+                .get(crate::config_edit::routes::get_smtp_connection)
+                .put(crate::config_edit::routes::put_smtp_connection),
         );
 
     // Phase 3 (BACK-02): build the Ory Admin clients from Config BEFORE cfg is
