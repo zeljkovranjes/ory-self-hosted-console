@@ -217,6 +217,46 @@ fn array_section_descriptor(section: &str) -> Option<ArraySectionDescriptor> {
     }
 }
 
+/// BRAND-01 — per-section "template body codec" (10-RESEARCH Pattern 4 / Pitfall
+/// 2). Dispatched by SECTION NAME `"email-templates"` (NEVER pointer-guessed), it
+/// mirrors `array_section_descriptor` but for the scalar `courier.templates.*`
+/// string values: the schema requires each body/subject value to be a
+/// `^(http|https|file|base64)://` URI, so the editor's RAW text must be wrapped as
+/// `base64://<b64>` before it lands in the doc, and decoded back to source on GET.
+///
+/// Returns `true` iff the section uses the template-body base64 codec. This is the
+/// section-name gate the GET/PUT handlers consult — exactly like the array
+/// sections — so the codec can never be applied to the wrong section.
+fn is_template_codec_section(section: &str) -> bool {
+    section == "email-templates"
+}
+
+/// GET transform for a single `courier.templates.*` value: decode a stored
+/// `base64://<b64>` URI back to raw source for the editor. A non-string value is
+/// returned unchanged (defensive); a non-`base64://` URI passes through verbatim
+/// (the decoder is fetch-free — threat T-07-08).
+fn template_get_transform(value: &Value) -> Result<Value, AppError> {
+    match value {
+        Value::String(uri) => Ok(Value::String(
+            crate::config_edit::jsonnet::decode_base64_uri(uri)?,
+        )),
+        other => Ok(other.clone()),
+    }
+}
+
+/// PUT transform for a single incoming `courier.templates.*` value: encode the
+/// editor's RAW text as a `base64://<b64>` URI so the schema's
+/// `^(http|https|file|base64)://` pattern is satisfied (Pitfall 2). A non-string
+/// value is returned unchanged (defensive — the schema validate will reject it).
+fn template_put_transform(value: &Value) -> Value {
+    match value {
+        Value::String(src) => {
+            Value::String(crate::config_edit::jsonnet::encode_base64_uri(src))
+        }
+        other => other.clone(),
+    }
+}
+
 // WR-04: the dot-path getter/setter live in `secret_merge` (the single canonical
 // definition) and are imported above — NOT re-declared here. Keeping one copy
 // guarantees the mask/merge/encode pipeline shares identical non-object/graceful
@@ -332,6 +372,9 @@ pub async fn get_config(
     // base64:// DECODE applied to each present array-root value; scalar sections
     // pass through unchanged. Selection is by SECTION NAME, not pointer-guessing.
     let array_desc = array_section_descriptor(&section);
+    // BRAND-01: the email-templates section decodes each stored `base64://` body
+    // back to raw source for the editor (selected by SECTION NAME, never pointer).
+    let template_codec = is_template_codec_section(&section);
 
     let mut out = Map::new();
     for ptr in allow.allowed_paths {
@@ -347,6 +390,8 @@ pub async fn get_config(
                 // Jsonnet. A non-array allowlisted value (e.g. oidc.enabled) is
                 // returned unchanged by array_get_transform's defensive guard.
                 Some(desc) => array_get_transform(value, desc)?,
+                // BRAND-01: decode a `base64://` template body back to raw source.
+                None if template_codec => template_get_transform(value)?,
                 None => value.clone(),
             };
             out.insert((*ptr).to_string(), emitted);
@@ -428,6 +473,15 @@ pub async fn put_config(
                 Ok::<_, AppError>((ptr, transformed))
             })
             .collect::<Result<Vec<_>, _>>()?
+    } else if is_template_codec_section(&section) {
+        // BRAND-01: encode each editor-supplied RAW template body/subject as a
+        // `base64://<b64>` URI BEFORE apply_patch, so the schema's
+        // `^(http|https|file|base64)://` pattern is satisfied (Pitfall 2). The
+        // value stays a single allowlisted scalar pointer (already passed filter).
+        filtered
+            .into_iter()
+            .map(|(ptr, incoming)| (ptr, template_put_transform(&incoming)))
+            .collect()
     } else {
         filtered
     };
@@ -1693,6 +1747,79 @@ mod tests {
     }
 
     // ─── 09-02 Task 2: OATH-01 rules structural pre-check ───
+
+    // ─── 10-02 Task 1: BRAND-01 template-body base64 codec ───
+
+    #[test]
+    fn template_codec_selected_by_section_name_only() {
+        // The email-templates section uses the codec; nothing else does
+        // (selection is by SECTION NAME, never pointer-guessing).
+        assert!(is_template_codec_section("email-templates"));
+        for other in [
+            "ui-urls",
+            "session",
+            "methods",
+            "oidc",
+            "smtp",
+            "recovery",
+            "verification",
+        ] {
+            assert!(
+                !is_template_codec_section(other),
+                "section `{other}` must NOT use the template codec"
+            );
+        }
+    }
+
+    #[test]
+    fn template_base64_put_encodes_then_get_decodes_round_trip() {
+        // PUT: the editor's RAW template body is encoded to a base64:// URI before
+        // it lands in the doc (so the schema uri-pattern is satisfied).
+        let raw = "<h1>Recover your account</h1>\n<a href=\"{{ .RecoveryURL }}\">Reset</a>\n";
+        let stored = template_put_transform(&json!(raw));
+        let stored_uri = stored.as_str().expect("encoded value is a string");
+        assert!(
+            stored_uri.starts_with("base64://"),
+            "PUT must wrap raw text as base64://: {stored_uri}"
+        );
+        // The raw HTML must NOT appear verbatim in the stored value.
+        assert!(
+            !stored_uri.contains("<h1>"),
+            "the stored value must not contain plaintext: {stored_uri}"
+        );
+        // GET: the stored base64:// URI decodes back to the exact raw source.
+        let decoded = template_get_transform(&stored).expect("decode round-trips");
+        assert_eq!(decoded, json!(raw), "PUT-encode -> GET-decode is the identity");
+    }
+
+    #[test]
+    fn template_get_passes_through_non_base64_value_without_fetch() {
+        // A non-base64:// stored value (e.g. a file:// override or a legacy plain
+        // string) passes through on GET unchanged — never fetched (T-07-08).
+        for stored in [
+            json!("file:///etc/config/kratos/templates/recovery.html"),
+            json!("https://cdn.example/recovery.html"),
+            json!("already plain text"),
+        ] {
+            assert_eq!(
+                template_get_transform(&stored).expect("pass-through never errors"),
+                stored,
+                "a non-base64:// template value must pass through unchanged"
+            );
+        }
+        // A non-string value (defensive) passes through on both transforms.
+        assert_eq!(template_get_transform(&json!(null)).unwrap(), json!(null));
+        assert_eq!(template_put_transform(&json!(42)), json!(42));
+    }
+
+    #[test]
+    fn template_get_rejects_invalid_base64_value_free() {
+        // A stored value that claims base64:// but is undecodable is a value-free
+        // BadRequest (the offending payload is never echoed).
+        let err = template_get_transform(&json!("base64://not*valid*b64"))
+            .expect_err("invalid base64 must be rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
 
     #[test]
     fn rules_array_accepts_array_rejects_non_array() {

@@ -393,11 +393,92 @@ pub const HYDRA_COOKIES: SectionAllowlist = SectionAllowlist {
     ],
 };
 
+// ─── Phase 10 — Kratos Branding config sections (10-RESEARCH BRAND-01/02) ───
+//
+// Two new Kratos config sections, both VERIFIED against the vendored v26.2.0
+// `kratos.config.schema.json`. Both restart Kratos ONLY through the reused
+// Phase-4 engine. Neither lists a sensitive pointer (templates + UI URLs are
+// non-secret); the `SENSITIVE_PREFIXES` denylist (Gate-1) still applies as
+// defense-in-depth.
+
+/// BRAND-02 — UI URLs & Redirects page (10-RESEARCH Pattern 5 / Pitfall 1).
+///
+/// The self-service flow `ui_url` keys plus `allowed_return_urls` (array-root)
+/// and `default_browser_return_url`. The Phase-7 `KRATOS_RECOVERY`/
+/// `KRATOS_VERIFICATION` allowlists deliberately OMITted their `ui_url` keys,
+/// reserving them for THIS section (see their "ui_url is OMITTED (BRAND-02/
+/// Phase-10)" comments).
+///
+/// PITFALL 1 (the logout trap): `/selfservice/flows/logout/ui_url` is
+/// DELIBERATELY ABSENT — the v26.2.0 schema gives `logout` NO `ui_url` (only
+/// `logout.after.default_browser_return_url`) and is `additionalProperties:false`,
+/// so including `logout/ui_url` would fail full-config validation and BRICK every
+/// save. The `ui_urls_omits_logout_ui_url` test asserts its absence. If a logout
+/// redirect is ever wanted, add `/selfservice/flows/logout/after/default_browser_return_url`
+/// instead — NEVER `logout/ui_url`.
+pub const KRATOS_UI_URLS: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "ui-urls",
+    allowed_paths: &[
+        "/selfservice/flows/login/ui_url",
+        "/selfservice/flows/registration/ui_url",
+        "/selfservice/flows/recovery/ui_url",
+        "/selfservice/flows/verification/ui_url",
+        "/selfservice/flows/settings/ui_url",
+        "/selfservice/flows/error/ui_url",
+        "/selfservice/default_browser_return_url",
+        // Array-root (whole-array replace) — NOT an array-section (no per-item
+        // secret/Jsonnet); it carries plain string URLs, so it flows through the
+        // scalar engine unchanged. Per-index pointers are never allowlisted.
+        "/selfservice/allowed_return_urls",
+        // DO NOT add `/selfservice/flows/logout/ui_url` (Pitfall 1).
+    ],
+};
+
+/// BRAND-01 — Email Templates page (10-RESEARCH Pattern 4 / Pitfall 2).
+///
+/// The inline `courier.templates.*` body/subject keys. Body values are URI
+/// strings (`format:uri`, `pattern ^(http|https|file|base64)://`), so the
+/// editor's raw text is wrapped as `base64://<b64>` by the per-section template
+/// codec in `routes.rs` (dispatched by SECTION NAME "email-templates") before it
+/// lands in the doc, and decoded back to source on GET.
+///
+/// Scope (10-RESEARCH Open Q1): the `valid/email` html+plaintext bodies + subject
+/// for the six courier template types. The `invalid/email` + `valid/sms` variants
+/// are a safe later expansion under default-deny (unlisted = not editable). NO
+/// sensitive pointer is listed (`/courier/smtp/*` stays denylisted / out of scope).
+pub const KRATOS_EMAIL_TEMPLATES: SectionAllowlist = SectionAllowlist {
+    service: "kratos",
+    section: "email-templates",
+    allowed_paths: &[
+        "/courier/templates/recovery/valid/email/body/html",
+        "/courier/templates/recovery/valid/email/body/plaintext",
+        "/courier/templates/recovery/valid/email/subject",
+        "/courier/templates/recovery_code/valid/email/body/html",
+        "/courier/templates/recovery_code/valid/email/body/plaintext",
+        "/courier/templates/recovery_code/valid/email/subject",
+        "/courier/templates/verification/valid/email/body/html",
+        "/courier/templates/verification/valid/email/body/plaintext",
+        "/courier/templates/verification/valid/email/subject",
+        "/courier/templates/verification_code/valid/email/body/html",
+        "/courier/templates/verification_code/valid/email/body/plaintext",
+        "/courier/templates/verification_code/valid/email/subject",
+        "/courier/templates/registration_code/valid/email/body/html",
+        "/courier/templates/registration_code/valid/email/body/plaintext",
+        "/courier/templates/registration_code/valid/email/subject",
+        "/courier/templates/login_code/valid/email/body/html",
+        "/courier/templates/login_code/valid/email/body/plaintext",
+        "/courier/templates/login_code/valid/email/subject",
+    ],
+};
+
 /// Code-defined registry of every shipped section allowlist. The lookup is the
 /// ONLY way to obtain an allowlist — it is never assembled from client input.
 ///
 /// Phase-4 proof (`KRATOS_SESSION`) + the 10 Phase-7 Kratos auth sections (7
-/// scalar + 3 array-root) + the 6 Phase-8 Hydra config sections (all scalar).
+/// scalar + 3 array-root) + the 6 Phase-8 Hydra config sections (all scalar) +
+/// the 2 Phase-10 Kratos branding sections (`ui-urls` scalar/array-root +
+/// `email-templates` base64-codec).
 const REGISTRY: &[&SectionAllowlist] = &[
     &KRATOS_SESSION,
     &KRATOS_METHODS,
@@ -416,6 +497,8 @@ const REGISTRY: &[&SectionAllowlist] = &[
     &HYDRA_TTL,
     &HYDRA_STRATEGIES,
     &HYDRA_COOKIES,
+    &KRATOS_UI_URLS,
+    &KRATOS_EMAIL_TEMPLATES,
 ];
 
 /// Look up the allowlist for a `(service, section)` pair.
@@ -1025,5 +1108,143 @@ mod tests {
             .allowed_paths
             .iter()
             .all(|p| !p.contains("secret") && !p.starts_with("/secrets")));
+    }
+
+    // ─── Phase 10 — Kratos branding allowlist behaviors (10-02 Task 1) ───
+
+    /// brand_allowlist: both new sections resolve via `lookup` and an unknown
+    /// kratos branding section is NotFound (no permissive fall-through).
+    #[test]
+    fn brand_allowlist_sections_resolve() {
+        assert!(lookup("kratos", "ui-urls").is_ok(), "ui-urls must resolve");
+        assert!(
+            lookup("kratos", "email-templates").is_ok(),
+            "email-templates must resolve"
+        );
+        assert!(matches!(lookup("kratos", "branding-nope"), Err(AppError::NotFound)));
+    }
+
+    /// ui_urls: KRATOS_UI_URLS accepts each of its 8 pointers and rejects an
+    /// out-of-scope pointer (default-deny, full-pointer match).
+    #[test]
+    fn ui_urls_allowlist_accepts_listed_rejects_out_of_scope() {
+        for ptr in KRATOS_UI_URLS.allowed_paths {
+            let ok = vec![((*ptr).to_string(), json!("https://ui.example/x"))];
+            assert!(
+                filter(&KRATOS_UI_URLS, &ok).is_ok(),
+                "ui-urls: `{ptr}` must be accepted"
+            );
+        }
+        // An out-of-scope selfservice pointer no section owns is rejected.
+        let oos = vec![(
+            "/selfservice/flows/login/lifespan".to_string(),
+            json!("1h"),
+        )];
+        assert!(matches!(
+            filter(&KRATOS_UI_URLS, &oos),
+            Err(AppError::Forbidden)
+        ));
+        // The array-root is allowed; a per-index pointer is NOT (full-match).
+        let root = vec![(
+            "/selfservice/allowed_return_urls".to_string(),
+            json!(["https://a.example", "https://b.example"]),
+        )];
+        assert!(filter(&KRATOS_UI_URLS, &root).is_ok());
+        let per_index = vec![(
+            "/selfservice/allowed_return_urls/0".to_string(),
+            json!("https://evil.example"),
+        )];
+        assert!(matches!(
+            filter(&KRATOS_UI_URLS, &per_index),
+            Err(AppError::Forbidden)
+        ));
+    }
+
+    /// ui_urls_omits_logout: `/selfservice/flows/logout/ui_url` is NOT a member
+    /// of KRATOS_UI_URLS.allowed_paths (Pitfall 1 — including it would brick every
+    /// save) AND it is rejected through the section filter. This is the explicit
+    /// absence assertion the plan requires.
+    #[test]
+    fn ui_urls_omits_logout_ui_url() {
+        assert!(
+            !KRATOS_UI_URLS
+                .allowed_paths
+                .contains(&"/selfservice/flows/logout/ui_url"),
+            "logout/ui_url must NEVER be allowlisted (schema additionalProperties:false bricks the save)"
+        );
+        // And it is rejected if a client tries to send it through this section.
+        let patch = vec![(
+            "/selfservice/flows/logout/ui_url".to_string(),
+            json!("https://ui.example/logout"),
+        )];
+        assert!(matches!(
+            filter(&KRATOS_UI_URLS, &patch),
+            Err(AppError::Forbidden)
+        ));
+        // No allowlisted UI-URL pointer mentions `logout` at all.
+        assert!(
+            KRATOS_UI_URLS.allowed_paths.iter().all(|p| !p.contains("logout")),
+            "no UI-URL pointer may reference the logout flow"
+        );
+    }
+
+    /// email_templates: KRATOS_EMAIL_TEMPLATES accepts each courier-template
+    /// body/subject pointer and rejects an out-of-scope courier pointer.
+    #[test]
+    fn email_templates_allowlist_accepts_listed_rejects_out_of_scope() {
+        for ptr in KRATOS_EMAIL_TEMPLATES.allowed_paths {
+            let ok = vec![((*ptr).to_string(), json!("base64://aGVsbG8="))];
+            assert!(
+                filter(&KRATOS_EMAIL_TEMPLATES, &ok).is_ok(),
+                "email-templates: `{ptr}` must be accepted"
+            );
+        }
+        // An out-of-scope courier pointer (e.g. a non-allowlisted template type or
+        // the override path) is rejected.
+        let oos = vec![(
+            "/courier/template_override_path".to_string(),
+            json!("/some/dir"),
+        )];
+        assert!(matches!(
+            filter(&KRATOS_EMAIL_TEMPLATES, &oos),
+            Err(AppError::Forbidden)
+        ));
+        // Every allowlisted pointer is a `valid/email` body/subject under courier.
+        assert!(KRATOS_EMAIL_TEMPLATES.allowed_paths.iter().all(|p| {
+            p.starts_with("/courier/templates/")
+                && p.contains("/valid/email")
+        }));
+    }
+
+    /// brand_allowlist sensitive_denied: a sensitive pointer (`/courier/smtp/
+    /// connection_uri`, `/secrets/...`, `/dsn`) is rejected for BOTH new sections
+    /// regardless of allowlist membership (Gate-1 denylist wins).
+    #[test]
+    fn sensitive_pointers_denied_for_branding_sections() {
+        let sections: &[&SectionAllowlist] = &[&KRATOS_UI_URLS, &KRATOS_EMAIL_TEMPLATES];
+        let sensitive = [
+            "/courier/smtp/connection_uri",
+            "/secrets/cipher/0",
+            "/dsn",
+            "/serve/admin/base_url",
+        ];
+        for al in sections {
+            for p in sensitive {
+                let patch = vec![(p.to_string(), json!("x"))];
+                assert!(
+                    matches!(filter(al, &patch), Err(AppError::Forbidden)),
+                    "branding section `{}`: `{p}` must be denied",
+                    al.section
+                );
+            }
+            // And no branding allowlist lists a sensitive pointer.
+            for sp in SENSITIVE_PREFIXES {
+                assert!(
+                    !al.allowed_paths.iter().any(|p| p.starts_with(sp)),
+                    "branding section `{}` must not list a sensitive pointer ({sp})",
+                    al.section
+                );
+            }
+        }
     }
 }
