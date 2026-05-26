@@ -571,4 +571,205 @@ mod tests {
         let patch = vec![("/secretsX".to_string(), json!("ok"))];
         assert!(filter(&al, &patch).is_ok(), "/secretsX is not under /secrets");
     }
+
+    // ─── Phase 7 — per-section allowlist behaviors (07-01 Task 3) ───
+
+    /// Every one of the 10 Phase-7 Kratos auth sections resolves via `lookup`.
+    #[test]
+    fn all_ten_kratos_auth_sections_resolve() {
+        for section in [
+            "methods",
+            "passwordless",
+            "mfa",
+            "sessions",
+            "recovery",
+            "verification",
+            "smtp",
+            "oidc",
+            "sms",
+            "webhooks",
+        ] {
+            assert!(
+                lookup("kratos", section).is_ok(),
+                "section `{section}` must resolve via the registry"
+            );
+        }
+        // The Phase-4 proof const stays registered alongside the new sections.
+        assert!(lookup("kratos", "session").is_ok());
+    }
+
+    /// Each section accepts a representative allowlisted pointer and rejects an
+    /// out-of-scope pointer (default-deny, full-pointer match).
+    #[test]
+    fn each_section_accepts_allowlisted_rejects_out_of_scope() {
+        // (section const, an allowlisted pointer for that section)
+        let cases: &[(&SectionAllowlist, &str)] = &[
+            (&KRATOS_METHODS, "/selfservice/methods/password/enabled"),
+            (&KRATOS_PASSWORDLESS, "/selfservice/methods/passkey/config/rp/id"),
+            (&KRATOS_MFA, "/selfservice/methods/totp/enabled"),
+            (&KRATOS_SESSIONS, "/session/lifespan"),
+            (&KRATOS_RECOVERY, "/selfservice/flows/recovery/enabled"),
+            (&KRATOS_VERIFICATION, "/selfservice/flows/verification/enabled"),
+            (&KRATOS_SMTP, "/courier/smtp/from_address"),
+            (&KRATOS_OIDC, "/selfservice/methods/oidc/config/providers"),
+            (&KRATOS_SMS, "/courier/channels"),
+            (&KRATOS_WEBHOOKS, "/selfservice/flows/login/after/hooks"),
+        ];
+        for (al, allowed) in cases {
+            let ok = vec![(allowed.to_string(), json!(true))];
+            assert!(
+                filter(al, &ok).is_ok(),
+                "section `{}`: `{allowed}` must be accepted",
+                al.section
+            );
+            // A pointer no section owns is rejected for every section.
+            let oos = vec![("/identity/default_schema_id".to_string(), json!("evil"))];
+            assert!(
+                matches!(filter(al, &oos), Err(AppError::Forbidden)),
+                "section `{}`: out-of-scope pointer must be Forbidden",
+                al.section
+            );
+        }
+    }
+
+    /// `/courier/smtp/connection_uri` is Forbidden through the `smtp` section
+    /// (Gate-1 denylist wins) AND through every other Phase-7 section — it is on
+    /// the hard `SENSITIVE_PREFIXES` denylist and never an allowlist member.
+    #[test]
+    fn connection_uri_denied_via_smtp_and_every_section() {
+        let sections: &[&SectionAllowlist] = &[
+            &KRATOS_METHODS,
+            &KRATOS_PASSWORDLESS,
+            &KRATOS_MFA,
+            &KRATOS_SESSIONS,
+            &KRATOS_RECOVERY,
+            &KRATOS_VERIFICATION,
+            &KRATOS_SMTP,
+            &KRATOS_OIDC,
+            &KRATOS_SMS,
+            &KRATOS_WEBHOOKS,
+        ];
+        for al in sections {
+            let patch = vec![(
+                "/courier/smtp/connection_uri".to_string(),
+                json!("smtps://user:pass@smtp:465"),
+            )];
+            assert!(
+                matches!(filter(al, &patch), Err(AppError::Forbidden)),
+                "section `{}`: connection_uri must stay denied",
+                al.section
+            );
+        }
+        // And it is absent from every Phase-7 allowlist's allowed_paths.
+        for al in sections {
+            assert!(
+                !al.allowed_paths
+                    .contains(&"/courier/smtp/connection_uri"),
+                "section `{}` must not list connection_uri",
+                al.section
+            );
+        }
+    }
+
+    /// Sensitive pointers (`/dsn`, `/secrets/*`, `/serve/admin/*`) are Forbidden
+    /// for every Phase-7 section regardless of allowlist membership.
+    #[test]
+    fn sensitive_pointers_denied_for_every_section() {
+        let sections: &[&SectionAllowlist] = &[
+            &KRATOS_METHODS,
+            &KRATOS_PASSWORDLESS,
+            &KRATOS_MFA,
+            &KRATOS_SESSIONS,
+            &KRATOS_RECOVERY,
+            &KRATOS_VERIFICATION,
+            &KRATOS_SMTP,
+            &KRATOS_OIDC,
+            &KRATOS_SMS,
+            &KRATOS_WEBHOOKS,
+        ];
+        for al in sections {
+            for p in ["/dsn", "/secrets/cipher/0", "/serve/admin/base_url"] {
+                let patch = vec![(p.to_string(), json!("x"))];
+                assert!(
+                    matches!(filter(al, &patch), Err(AppError::Forbidden)),
+                    "section `{}`: `{p}` must be denied",
+                    al.section
+                );
+            }
+        }
+    }
+
+    /// AAL: both enum values pass the allowlist layer; the literal `highest_aal`
+    /// (the CONTEXT typo) appears NOWHERE in the MFA section pointers. Enum-value
+    /// validity is the schema validator's job (Plan 05) — here we only prove the
+    /// `required_aal` pointer exists and accepts the canonical values.
+    #[test]
+    fn mfa_required_aal_pointer_and_no_highest_aal_literal() {
+        for value in ["aal1", "highest_available"] {
+            let patch = vec![(
+                "/selfservice/flows/login/required_aal".to_string(),
+                json!(value),
+            )];
+            assert!(
+                filter(&KRATOS_MFA, &patch).is_ok(),
+                "required_aal must accept `{value}` at the allowlist layer"
+            );
+        }
+        assert!(
+            KRATOS_MFA
+                .allowed_paths
+                .iter()
+                .all(|p| !p.contains("highest_aal")),
+            "no MFA pointer may contain the literal `highest_aal`"
+        );
+        // The pointer itself is present.
+        assert!(KRATOS_MFA
+            .allowed_paths
+            .contains(&"/selfservice/flows/login/required_aal"));
+    }
+
+    /// Array sections allow ONLY the array-root pointer: a per-index pointer is
+    /// Forbidden while the root is accepted (whole-array replace, Pitfall 4).
+    #[test]
+    fn array_sections_root_only_no_per_index() {
+        // OIDC: root Ok, per-index Forbidden.
+        let root = vec![(
+            "/selfservice/methods/oidc/config/providers".to_string(),
+            json!([]),
+        )];
+        assert!(filter(&KRATOS_OIDC, &root).is_ok());
+        let per_index = vec![(
+            "/selfservice/methods/oidc/config/providers/0/client_id".to_string(),
+            json!("leaked"),
+        )];
+        assert!(matches!(
+            filter(&KRATOS_OIDC, &per_index),
+            Err(AppError::Forbidden)
+        ));
+        assert!(!KRATOS_OIDC
+            .allowed_paths
+            .iter()
+            .any(|p| p.contains("providers/0")));
+
+        // SMS: exactly the one array-root pointer.
+        assert_eq!(KRATOS_SMS.allowed_paths, &["/courier/channels"]);
+        let sms_index = vec![("/courier/channels/0/id".to_string(), json!("sms"))];
+        assert!(matches!(
+            filter(&KRATOS_SMS, &sms_index),
+            Err(AppError::Forbidden)
+        ));
+
+        // WEBHOOKS: every pointer is a `hooks` array-root under /selfservice/flows/.
+        assert!(KRATOS_WEBHOOKS.allowed_paths.iter().all(|p| {
+            p.ends_with("/hooks") && p.starts_with("/selfservice/flows/")
+        }));
+        let hook_index = vec![(
+            "/selfservice/flows/login/after/hooks/0/config/url".to_string(),
+            json!("https://evil"),
+        )];
+        assert!(matches!(
+            filter(&KRATOS_WEBHOOKS, &hook_index),
+            Err(AppError::Forbidden)
+        ));
+    }
 }
