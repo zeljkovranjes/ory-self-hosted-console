@@ -423,6 +423,16 @@ services:
       WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-}
       # Backend reaches the Docker engine ONLY through the scoped broker.
       RESTART_BROKER_URL: http://restart-broker:2375
+      # Phase 14 (SSO-02/03/04): the backend is the SOLE client of the Polis admin
+      # API. POLIS_ADMIN_URL is the INTERNAL admin/OIDC base (never host-published,
+      # INFRA-05). POLIS_API_KEY is the write-only `Authorization: Api-Key`
+      # credential (== the Polis container's API_KEYS) — BACK-07: never logged or
+      # returned to the frontend. POLIS_EXTERNAL_URL is the single public OIDC
+      # issuer the generated Kratos generic-provider entry points at (split-horizon
+      # Pattern A — identical for the browser and Kratos server-side).
+      POLIS_ADMIN_URL: http://polis:5225
+      POLIS_API_KEY: ${POLIS_API_KEY:?set POLIS_API_KEY}
+      POLIS_EXTERNAL_URL: ${POLIS_EXTERNAL_URL:?set POLIS_EXTERNAL_URL}
       # Backend's own state DB (Phase 2 owns the schema).
       DATABASE_URL: postgres://console:${CONSOLE_DB_PASSWORD:?set CONSOLE_DB_PASSWORD}@postgres:5432/console?sslmode=disable
     volumes:

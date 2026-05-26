@@ -530,6 +530,30 @@ pub fn build(
                 .get(crate::config_edit::polis::get_polis_settings)
                 .put(crate::config_edit::polis::put_polis_settings),
         )
+        // Phase 14 (SSO-02/03/04/07): the SAML connection CRUD over Ory Polis.
+        // Mounted INSIDE the protected subtree (AFTER the audit/auth/csrf hoops)
+        // and GATED by `FeatureFlagHoop::new("saml")` (seeded OFF) — so a flag-OFF
+        // request 404s even with a valid session + matching CSRF token (FLAG-01 /
+        // SSO-07). The most-specific `connections/{id}` DELETE path is mounted
+        // FIRST so the literal `connections` segment is not captured by `{id}`
+        // (mirrors the api-keys `{id}/revoke`-before-`api-keys` precedent). The
+        // blanket response-phase audit_hoop already on this subtree auto-audits the
+        // state-changing create/delete (actor-from-session) — no second audit path.
+        // GET (list) is csrf-exempt; POST/DELETE inherit `csrf_guard` (403) and
+        // `auth_guard` (401). The handlers reuse the HOOK-02 SSRF guard (SSO-04),
+        // the mandatory-CA pre-flight (SSO-02), the gated Jsonnet mapper + AUTH-04
+        // providers[] write (SSO-03), and the two-sided delete.
+        .push(
+            Router::with_path("api/sso/connections/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("saml"))
+                .delete(crate::sso::routes::delete_connection), // SSO two-sided delete (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/sso/connections")
+                .hoop(crate::features::FeatureFlagHoop::new("saml"))
+                .get(crate::sso::routes::list_connections) // SSO list (secrets stripped)
+                .post(crate::sso::routes::create_connection), // SSO create (CA pre-flight + provider write)
+        )
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
         // allowlisted values; PUT runs the full transactional flow. Both inherit
         // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`

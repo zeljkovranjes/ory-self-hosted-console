@@ -104,7 +104,7 @@ fn has_signing_cert(xml: &str) -> bool {
         let body_start = open_gt + 1;
         let body_end = lower[body_start..]
             .find("</")
-            .and_then(|rel| {
+            .map(|rel| {
                 // Confirm the close tag is a keydescriptor close; otherwise scan onward.
                 let close_pos = body_start + rel;
                 if lower[close_pos..].starts_with("</")
@@ -113,10 +113,10 @@ fn has_signing_cert(xml: &str) -> bool {
                         .map(|d| d < 20)
                         .unwrap_or(false)
                 {
-                    Some(close_pos)
+                    close_pos
                 } else {
                     // Nested or unrelated close: fall back to the rest of the doc.
-                    Some(lower.len())
+                    lower.len()
                 }
             })
             .unwrap_or(lower.len());
