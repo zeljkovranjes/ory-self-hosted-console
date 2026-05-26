@@ -25,8 +25,10 @@
 //! later plans in this phase.
 
 pub mod allowlist;
+pub mod jsonnet;
 pub mod locks;
 pub mod restart;
 pub mod routes;
 pub mod schema;
+pub mod secret_merge;
 pub mod yaml;
