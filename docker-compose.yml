@@ -40,6 +40,15 @@ x-images:
   # first boot (CR-01). It is NOT a long-lived service and is intentionally the
   # non-distroless tag so the `-distroless` INFRA-04 pin grep still counts == 4.
   oathkeeper-tools-image: &oathkeeper-tools-image oryd/oathkeeper:v26.2.0
+  # Phase 16 observability-profile image pins (INFRA-04 — exact tags, no :latest).
+  # These four are NOT part of the Ory v26.2.0 lockstep; they track Grafana Labs /
+  # Prometheus releases and are re-pinned at compose-author time (16-RESEARCH,
+  # [VERIFIED] against the registries 2026-05). They start ONLY under
+  # `--profile observability`.
+  prometheus-image: &prometheus-image prom/prometheus:v3.11.3
+  grafana-image: &grafana-image grafana/grafana:13.1.0
+  loki-image: &loki-image grafana/loki:3.7.2
+  alloy-image: &alloy-image grafana/alloy:v1.16.1
 
 # -----------------------------------------------------------------------------
 # Networks (Pattern 1 — two-network isolation)
@@ -79,6 +88,21 @@ volumes:
   # oathkeeper-jwks-init one-shot (CR-01 — no private key is committed to git).
   # Destroying this volume (`docker compose down -v`) rotates the key on next up.
   oathkeeper-secrets:
+  # Phase 16: Prometheus TSDB + Loki chunk/index store for the opt-in
+  # observability profile. Only created/used when `--profile observability` is up.
+  prometheus-data:
+  loki-data:
+
+# -----------------------------------------------------------------------------
+# Secrets (Phase 16, OBS-05) — Grafana admin password file.
+# -----------------------------------------------------------------------------
+# Used ONLY by the observability-profile Grafana service. The operator copies
+# secrets/grafana_admin_password.example -> secrets/grafana_admin_password (see
+# secrets/README.md). A plain `docker compose up` does not reference this secret
+# (Grafana is profiled), so the file's absence does not affect the base stack.
+secrets:
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password
 
 services:
   # ===========================================================================
@@ -703,6 +727,114 @@ services:
     # internal: Kratos + backend reach; edge: browser reaches the issuer.
     networks: [internal, edge]
     # NO ports: — admin/OIDC port 5225 stays internal-only (INFRA-05).
+
+  # ===========================================================================
+  # OBSERVABILITY PROFILE (Phase 16, OBS-01/02) — opt-in, DEFAULT OFF.
+  # ===========================================================================
+  # Four services gated behind `profiles: ["observability"]` (the echo-receiver
+  # `acceptance`-profile precedent): a plain `docker compose up` does NOT start
+  # them; `docker compose --profile observability up` does. ALL on the `internal`
+  # network with NO `ports:` block — no new host-published port (INFRA-05). Image
+  # tags are pinned via the x-images anchors (INFRA-04). Cross-profile depends_on
+  # uses `required: false` (compose v2.20.2+) so the base stack is NEVER broken
+  # when the profile is absent (Pitfall 3 / T-16-07); NO base-stack service
+  # depends_on any of these.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: *prometheus-image
+    container_name: prometheus
+    profiles: ["observability"]
+    # NB: --web.enable-admin-api is deliberately NOT passed (the management API can
+    # delete all metrics / shut down the server — T-16-02). Default flags + an
+    # explicit config path + the persistent TSDB volume only.
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks: [internal]
+    # NO ports: — Prometheus is never host-published; the backend (16-02) queries
+    # it container-to-container on the internal network.
+
+  loki:
+    image: *loki-image
+    container_name: loki
+    profiles: ["observability"]
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./config/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    networks: [internal]
+    # NO ports: — Loki push (Alloy) + query (backend/Grafana) are internal-only.
+
+  alloy:
+    image: *alloy-image
+    container_name: alloy
+    profiles: ["observability"]
+    # File-tail log source (BACK-05): Alloy reads the Docker json-file log dir
+    # READ-ONLY and ships to Loki. It mounts NO Docker socket (the broker stays the
+    # SOLE socket holder) and is NEVER routed through the wollomatic broker
+    # (grafana/alloy#4246). Run with the config + a writable data dir for positions.
+    command:
+      - "run"
+      - "/etc/alloy/config.alloy"
+      - "--storage.path=/var/lib/alloy/data"
+    volumes:
+      - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # READ-ONLY Docker json-file container logs — the file-tail source. NOT the
+      # socket. Requires the host's default json-file logging driver (16-RESEARCH
+      # A3); the README documents the :ro-socket fallback if a different driver is
+      # in use.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      # Cross-profile dep: start after Loki when the profile is up, but
+      # required:false so the absence of the profile never breaks the base stack.
+      loki:
+        condition: service_started
+        required: false
+    networks: [internal]
+    # NO ports: — Alloy pushes to Loki internally; no host surface.
+
+  grafana:
+    image: *grafana-image
+    container_name: grafana
+    profiles: ["observability"]
+    environment:
+      # Served from a sub-path behind the backend reverse-proxy (16-02).
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # Admin password from the secret FILE — NEVER the default admin/admin (T-16-03).
+      GF_SECURITY_ADMIN_PASSWORD: "$__file{/run/secrets/grafana_admin_password}"
+      # Auth-proxy header auth: only the backend (which injects X-WEBAUTH-USER for
+      # the authenticated console operator) can authenticate; the login form is
+      # disabled so Grafana never terminates its own login (T-16-03).
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: "X-WEBAUTH-USER"
+      GF_AUTH_PROXY_HEADER_PROPERTY: "username"
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # No outbound analytics/update checks from an internal-only service (BACK-07).
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      # Cross-profile deps (required:false — Pitfall 3 / T-16-07): Grafana's
+      # datasources point at prometheus + loki, but their absence must never break
+      # the base stack (it cannot, since grafana is itself profiled).
+      prometheus:
+        condition: service_started
+        required: false
+      loki:
+        condition: service_started
+        required: false
+    networks: [internal]
+    # NO ports: — Grafana is reachable ONLY via the authenticated backend proxy
+    # (16-02); never host-published (INFRA-05 / Pitfall 1).
 
   # ===========================================================================
   # Echo receiver (Phase 11 — TEST/CI ONLY, gated behind the `acceptance`

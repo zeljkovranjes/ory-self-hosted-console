@@ -1,0 +1,27 @@
+# =============================================================================
+# Grafana datasource provisioning (Phase 16, OBS-05) — internal-only.
+# =============================================================================
+# Provisions the Prometheus + Loki datasources as code. Both resolve via internal
+# Docker DNS on the `internal` network; neither Grafana nor its datasources are
+# host-published (INFRA-05) — Grafana is reachable ONLY through the authenticated
+# backend reverse-proxy added in plan 16-02.
+# =============================================================================
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+
+  - name: Loki
+    type: loki
+    access: proxy
+    uid: loki
+    url: http://loki:3100
+    editable: false

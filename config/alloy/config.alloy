@@ -1,0 +1,91 @@
+// ============================================================================
+// Grafana Alloy pipeline (Phase 16, OBS-04) — file-tail, PII-masked → Loki.
+// ============================================================================
+// Mounted into the opt-in `observability`-profile Alloy (grafana/alloy:v1.16.1),
+// internal network only, NO host port (INFRA-05).
+//
+// LOG SOURCE = FILE-TAIL of the Docker json-file log directory, mounted READ-ONLY
+// (`/var/lib/docker/containers:/var/lib/docker/containers:ro`). This deliberately
+// does NOT use `loki.source.docker` / the Docker socket: BACK-05 mandates the
+// wollomatic restart-broker be the SOLE Docker-socket holder, and Alloy must not
+// become a second socket holder. File-tail keeps that invariant intact. (It also
+// avoids grafana/alloy#4246 — the WaitGroup panic when routing Alloy through a
+// docker-socket-proxy; Alloy is NEVER routed through the broker.)
+//
+// REQUIRES the Docker default `json-file` logging driver on the host (the line
+// files are `/var/lib/docker/containers/<id>/<id>-json.log`, each line a JSON
+// object `{"log":"…","stream":"stdout|stderr","time":"…"}`). If the host uses a
+// different driver, the file-tail finds no logs — the documented fallback is a
+// `:ro` socket mount on Alloy ONLY, with the residual risk recorded in the README
+// threat model (see 16-01-SUMMARY.md "Alloy log-source decision").
+//
+// PII / SECRET MASKING (T-16-05) happens in `loki.process.scrub` via `stage.replace`
+// BEFORE `loki.write` — once a secret is persisted in Loki it is queryable, so it
+// must be scrubbed at the shipper, not at query time. Labels are LOW-CARDINALITY
+// and STATIC only (`job`, `stream`) — NEVER an identity/session/email value.
+// ============================================================================
+
+// Discover every container's json-file log on the read-only mount.
+local.file_match "containers" {
+  path_targets = [{
+    __path__ = "/var/lib/docker/containers/*/*-json.log",
+    job      = "docker",
+  }]
+}
+
+// Tail the matched files and forward raw lines to the scrub processor.
+loki.source.file "containers" {
+  targets    = local.file_match.containers.targets
+  forward_to = [loki.process.scrub.receiver]
+}
+
+loki.process "scrub" {
+  // Docker json-file lines wrap the real log in {"log":"…","stream":"…","time":"…"}.
+  // Extract the inner `log` text + the `stream` (stdout/stderr) for a low-card label.
+  stage.json {
+    expressions = {
+      log    = "log",
+      stream = "stream",
+    }
+  }
+
+  // Replace the line body with just the unwrapped log text so masking + storage
+  // operate on the application log, not the json envelope.
+  stage.output {
+    source = "log"
+  }
+
+  // --- PII / secret masking BEFORE ingestion (T-16-05) ----------------------
+  // Emails -> ***REDACTED*** (capture group kept minimal to avoid over-matching).
+  stage.replace {
+    expression = "([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})"
+    replace    = "***REDACTED-EMAIL***"
+  }
+  // Bearer tokens / token= / password= / api-key= / secret= values -> keep the
+  // key prefix, redact the value. Case-insensitive.
+  stage.replace {
+    expression = "(?i)(bearer\\s+|token=|password=|api[_-]?key=|secret=)\\S+"
+    replace    = "${1}***REDACTED***"
+  }
+  // Postgres / other credentialed connection URIs -> redact the userinfo.
+  stage.replace {
+    expression = "(?i)([a-z]+://)[^:/@\\s]+:[^@/\\s]+@"
+    replace    = "${1}***REDACTED***@"
+  }
+
+  // --- Low-cardinality STATIC labels ONLY (never identity/session/email) ----
+  stage.labels {
+    values = {
+      stream = "stream",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    // Internal DNS, never host-published.
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

@@ -1,0 +1,60 @@
+# =============================================================================
+# Prometheus scrape config (Phase 16, OBS-02) — internal-only.
+# =============================================================================
+# Mounted read-only into the opt-in `observability`-profile Prometheus
+# (prom/prometheus:v3.11.3). Every target resolves via internal Docker DNS on the
+# `internal` network; NO host port is published for any target OR for Prometheus
+# itself (INFRA-05). The Prometheus management/admin API is NOT enabled
+# (--web.enable-admin-api is never passed — T-16-02), so these metrics cannot be
+# deleted via a management call.
+#
+# A1 (Ory metrics auth) — RESOLVED via the live check in
+# scripts/verify/phase16-acceptance.sh (16-VALIDATION.md): the Ory admin
+# /metrics/prometheus endpoints are UNAUTHENTICATED on their internal admin ports
+# (the admin ports are never host-published, INFRA-05, so no credential leaves the
+# network). No bearer/credential is therefore attached to any scrape job. If a
+# future Ory upgrade gates a metrics endpoint, add a `authorization:`/`bearer_token`
+# block to the affected job here.
+#
+# A6 (Hydra --dev) — RESOLVED: Hydra runs with --dev (carry-forward), and the
+# metrics path is still `/admin/metrics/prometheus` on the admin port :4445 (--dev
+# only relaxes the HTTPS-issuer requirement; it does not move the admin metrics
+# surface). The `/admin` PREFIX is Hydra-specific — the other three services serve
+# at a bare `/metrics/prometheus`.
+# =============================================================================
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+
+scrape_configs:
+  # --- Ory Kratos: identity service admin metrics (:4434, no /admin prefix) ---
+  - job_name: kratos
+    metrics_path: /metrics/prometheus
+    static_configs:
+      - targets: ["kratos:4434"]
+
+  # --- Ory Hydra: OAuth2 admin metrics. NOTE the /admin PREFIX (A6) ----------
+  - job_name: hydra
+    metrics_path: /admin/metrics/prometheus
+    static_configs:
+      - targets: ["hydra:4445"]
+
+  # --- Ory Keto: permissions service metrics (:4468 metadata port) -----------
+  - job_name: keto
+    metrics_path: /metrics/prometheus
+    static_configs:
+      - targets: ["keto:4468"]
+
+  # --- Ory Oathkeeper: access-proxy metrics (:9000 prometheus port) ----------
+  - job_name: oathkeeper
+    metrics_path: /metrics/prometheus
+    static_configs:
+      - targets: ["oathkeeper:9000"]
+
+  # --- Backend: the Rust/Salvo console API's own /metrics (OBS-02) -----------
+  # Internal-only scrape target; counts/buckets only, no per-identity label.
+  - job_name: backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["backend:8080"]

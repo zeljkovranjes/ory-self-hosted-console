@@ -30,6 +30,17 @@
 # tracked; only the runtime `.bak` churn is ignored.
 /config/**/*.bak
 
+# --- Observability profile secrets (Phase 16, OBS-05) ---
+# The opt-in `observability`-profile Grafana reads its admin password from a
+# Docker secret file (GF_SECURITY_ADMIN_PASSWORD=$__file{/run/secrets/...}). The
+# operator copies secrets/grafana_admin_password.example -> secrets/grafana_admin_password
+# and sets a strong value. NEVER commit the real secret; only the .example is tracked.
+/secrets/grafana_admin_password
+!/secrets/grafana_admin_password.example
+
+# --- Loki / Alloy runtime data (if a bind mount is ever used) ---
+/config/loki/data/
+
 # --- Rust (backend) ---
 /backend/target/
 # Linux build cache used by the documented ORY_LIVE_TESTS container run
