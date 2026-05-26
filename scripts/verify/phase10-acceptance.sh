@@ -340,14 +340,18 @@ _auth_mut() {
 _code_of() { printf '%s' "$1" | tail -n1; }
 _body_of() { printf '%s' "$1" | sed '$d'; }
 
-# Pull a JSON field from a body via node. _json_field "<body>" '<js-over-data>'.
+# Pull a top-level JSON field from a body by KEY. _json_field "<body>" "<key>".
+# WR-03: the KEY is passed as an env var and used as a DIRECT property lookup
+# (`data[process.env.KEY]`) — never `eval`'d. The previous version ran a
+# shell-interpolated expression through `eval()` over the server-returned `data`,
+# an injection-shaped pattern (a pointer/value containing `"]` + JS would execute
+# in the harness node process). The fixed accessor reads the response but never
+# treats any part of it as code.
 _json_field() {
-  printf '%s' "$1" | EXPR="$2" node -e '
-    const expr = process.env.EXPR;
+  printf '%s' "$1" | KEY="$2" node -e '
     let input = require("fs").readFileSync(0, "utf8");
     let data; try { data = JSON.parse(input); } catch (e) { process.exit(0); }
-    let out;
-    try { out = (function(){ return eval(expr); })(); } catch (e) { process.exit(0); }
+    const out = (data && typeof data === "object") ? data[process.env.KEY] : undefined;
     if (out === undefined || out === null) process.exit(0);
     process.stdout.write(typeof out === "string" ? out : JSON.stringify(out));
   ' 2>/dev/null
@@ -441,7 +445,7 @@ assert_only_container_restarted "$KRATOS_CTR" "$HYDRA_CTR" "$KETO_CTR" "$OATHKEE
 wait_container_healthy "$KRATOS_CTR" 90
 # GET reflects the RAW text (NOT a base64:// blob — the codec round-trips).
 tpl_get_body="$(_body_of "$(_auth_get "$EMAIL_TPL_URL")")"
-TPL_BACK="$(_json_field "$tpl_get_body" 'data["'"$TPL_PTR"'"]')"
+TPL_BACK="$(_json_field "$tpl_get_body" "$TPL_PTR")"
 if [ "$TPL_BACK" = "$TPL_RAW" ]; then
   _pass "[BRAND-01] GET email-templates returns the RAW template text (codec decoded; no base64:// blob)"
 elif printf '%s' "$TPL_BACK" | grep -q '^base64://'; then
@@ -468,7 +472,7 @@ fi
 assert_only_container_restarted "$KRATOS_CTR" "$HYDRA_CTR" "$KETO_CTR" "$OATHKEEPER_CTR"
 wait_container_healthy "$KRATOS_CTR" 90
 ui_get_body="$(_body_of "$(_auth_get "$UI_URLS_URL")")"
-UI_BACK="$(_json_field "$ui_get_body" 'data["'"$UI_PTR"'"]')"
+UI_BACK="$(_json_field "$ui_get_body" "$UI_PTR")"
 if [ "$UI_BACK" = "$UI_VAL" ]; then
   _pass "[BRAND-02] GET ui-urls reflects the saved login ui_url"
 else
