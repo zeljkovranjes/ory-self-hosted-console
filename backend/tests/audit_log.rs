@@ -80,6 +80,78 @@ async fn state_change_writes_audit_row_with_session_actor(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn csrf_rejected_mutation_is_audited_as_failure(pool: PgPool) {
+    // WR-05: a state change that CLEARS auth but FAILS csrf (missing X-CSRF-Token)
+    // must still be audited, with outcome=failure and the actor captured (the
+    // session was injected by auth_guard before csrf_guard rejected).
+    let admin_id = common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
+    let service = Service::new(common::build_test_router(pool.clone()));
+    let (raw, _csrf) = login_and_get_session(&service, &pool).await;
+
+    // POST /logout with a valid session cookie but NO CSRF header -> 403.
+    let resp = TestClient::post("http://127.0.0.1:8080/logout")
+        .add_header("Cookie", format!("console_session={raw}"), true)
+        .send(&service)
+        .await;
+    assert_eq!(
+        resp.status_code,
+        Some(StatusCode::FORBIDDEN),
+        "missing CSRF token is rejected with 403"
+    );
+
+    let rows = all_audit(&pool).await;
+    let logout_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.path.as_deref() == Some("/logout"))
+        .collect();
+    assert_eq!(
+        logout_rows.len(),
+        1,
+        "the CSRF-denied POST /logout is still audited; got {rows:?}"
+    );
+    let row = logout_rows[0];
+    assert_eq!(row.outcome, "failure", "a 403 rejection is outcome=failure");
+    assert_eq!(row.method.as_deref(), Some("POST"));
+    assert_eq!(
+        row.actor_id,
+        Some(admin_id),
+        "the probing actor is captured (auth cleared, csrf failed)"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unauthenticated_mutation_is_audited_with_null_actor(pool: PgPool) {
+    // WR-05: a state change with NO/invalid session -> 401 must still be audited,
+    // with a NULL actor (the session was never injected; never fabricated).
+    common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
+    let service = Service::new(common::build_test_router(pool.clone()));
+
+    // POST /logout with no cookie at all -> 401.
+    let resp = TestClient::post("http://127.0.0.1:8080/logout")
+        .send(&service)
+        .await;
+    assert_eq!(
+        resp.status_code,
+        Some(StatusCode::UNAUTHORIZED),
+        "no session is rejected with 401"
+    );
+
+    let rows = all_audit(&pool).await;
+    let logout_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| r.path.as_deref() == Some("/logout"))
+        .collect();
+    assert_eq!(
+        logout_rows.len(),
+        1,
+        "the unauthenticated POST /logout is still audited; got {rows:?}"
+    );
+    let row = logout_rows[0];
+    assert_eq!(row.outcome, "failure", "a 401 rejection is outcome=failure");
+    assert_eq!(row.actor_id, None, "no actor is fabricated on a 401");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn safe_get_writes_no_audit_row(pool: PgPool) {
     common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
     let service = Service::new(common::build_test_router(pool.clone()));

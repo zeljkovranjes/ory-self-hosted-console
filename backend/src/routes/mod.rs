@@ -219,17 +219,22 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
 
     // PROTECTED subtree — the single auth chokepoint + per-session CSRF guard.
     //
-    // Phase 11 (ACT-04): the audit hoop runs AFTER auth_guard + csrf_guard so the
-    // `Session` actor is already injected and the request has cleared auth/CSRF.
-    // It is a RESPONSE-PHASE hoop (`ctrl.call_next` first), so it wraps every
-    // downstream route handler and records each state-changing request's actor +
-    // method + path + outcome into the append-only console_audit_log (T-11-13/14).
-    // GET/HEAD/OPTIONS are not audited. The insert is best-effort and never blocks
-    // or fails the user-facing response.
+    // Phase 11 (ACT-04 / WR-05): the audit hoop runs FIRST, AHEAD of auth_guard +
+    // csrf_guard. It is a RESPONSE-PHASE hoop (`ctrl.call_next` first), so it still
+    // wraps every downstream handler AND both guards, then records the FINAL
+    // outcome. This is the WR-05 fix: when `auth_guard` (401) or `csrf_guard` (403)
+    // calls `skip_rest()`, control unwinds back THROUGH the audit hoop (which sits
+    // above them), so a REJECTED state-changing attempt — failed auth, missing/
+    // forged CSRF token — is still recorded with `outcome:"failure"`. The actor is
+    // read best-effort from the Depot `Session`: on a 401 the session was never
+    // injected, so actor_id is NULL (never fabricated, T-11-14); on a 403 CSRF
+    // failure the session IS present (auth_guard ran first inside call_next), so the
+    // probing actor is captured. GET/HEAD/OPTIONS are still not audited. The insert
+    // is best-effort and never blocks or fails the user-facing response.
     let protected = Router::new()
+        .hoop(crate::audit::audit_hoop)
         .hoop(auth_guard)
         .hoop(csrf_guard)
-        .hoop(crate::audit::audit_hoop)
         .push(Router::with_path("logout").post(login::logout))
         .push(Router::with_path("api/console/me").get(state::me))
         // Phase 11 (ACT-04 / PROJ-01 / ACT-03): console-OWNED read views. All
