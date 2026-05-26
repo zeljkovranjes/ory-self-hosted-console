@@ -3,10 +3,17 @@ import {
   Activity,
   Fingerprint,
   KeyRound,
+  Mail,
   Palette,
+  RefreshCw,
+  RotateCcw,
   Settings,
   ShieldCheck,
+  ShieldQuestion,
+  Smartphone,
+  ToggleLeft,
   Users,
+  Webhook,
 } from "lucide-react";
 
 // FE-01 — the console navigation model (UI-SPEC §1).
@@ -63,13 +70,85 @@ export const NAV_GROUPS: NavGroup[] = [
         // "coming in a later phase" placeholder.
         built: true,
       },
+    ],
+  },
+  {
+    // Phase 7 — the grouped "Authentication" section (UI-SPEC §Pages). Each item
+    // is a SettingsForm page bound to a Kratos config section via the Phase-4
+    // engine. All 10 pages are `built: true` (the scalar pages ship in Plan 03;
+    // the list/secret pages — social/smtp/sms/webhooks — ship in Plan 04, same
+    // wave). Routes live under `/authentication/<slug>`.
+    label: "Authentication",
+    items: [
       {
-        slug: "authentication",
-        label: "Authentication",
-        href: "/authentication",
+        slug: "methods",
+        label: "General / Methods",
+        href: "/authentication/methods",
+        icon: ToggleLeft,
+        built: true,
+      },
+      {
+        slug: "passwordless",
+        label: "Passwordless & Passkeys",
+        href: "/authentication/passwordless",
         icon: Fingerprint,
-        built: false,
-        comingIn: "Phase 7",
+        built: true,
+      },
+      {
+        slug: "mfa",
+        label: "Two-Factor / MFA",
+        href: "/authentication/mfa",
+        icon: ShieldCheck,
+        built: true,
+      },
+      {
+        slug: "social",
+        label: "Social Sign-In",
+        href: "/authentication/social",
+        icon: KeyRound,
+        built: true,
+      },
+      {
+        slug: "sessions",
+        label: "Sessions",
+        href: "/authentication/sessions",
+        icon: RefreshCw,
+        built: true,
+      },
+      {
+        slug: "recovery",
+        label: "Account Recovery",
+        href: "/authentication/recovery",
+        icon: RotateCcw,
+        built: true,
+      },
+      {
+        slug: "verification",
+        label: "Account Verification",
+        href: "/authentication/verification",
+        icon: ShieldQuestion,
+        built: true,
+      },
+      {
+        slug: "smtp",
+        label: "Email / SMTP",
+        href: "/authentication/smtp",
+        icon: Mail,
+        built: true,
+      },
+      {
+        slug: "sms",
+        label: "SMS",
+        href: "/authentication/sms",
+        icon: Smartphone,
+        built: true,
+      },
+      {
+        slug: "webhooks",
+        label: "Actions & Webhooks",
+        href: "/authentication/webhooks",
+        icon: Webhook,
+        built: true,
       },
     ],
   },
