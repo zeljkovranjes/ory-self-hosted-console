@@ -83,8 +83,10 @@ pub async fn grafana_proxy(
         Err(_) => return Err(AppError::Unauthorized),
     };
 
-    // The wildcard path segment (Salvo `{**path}`); normalize + reject traversal.
-    let raw_path = req.param::<String>("**path").unwrap_or_default();
+    // The wildcard path segment (Salvo `{**path}` is retrieved by the NAME
+    // `path` — the `**` is matcher syntax, not part of the key); normalize +
+    // reject traversal.
+    let raw_path = req.param::<String>("path").unwrap_or_default();
     let sub = safe_subpath(&raw_path)
         .ok_or_else(|| AppError::BadRequest("invalid grafana proxy path".into()))?;
 
