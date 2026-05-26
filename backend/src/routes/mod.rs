@@ -272,6 +272,28 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
             Router::with_path("api/kratos/courier/messages/{id}")
                 .get(crate::ory::kratos::get_courier_message), // ACT-02 detail (read-only)
         )
+        // Phase 10 (BRAND-03) console-OWNED branding asset store. This is a
+        // [CUSTOM] concern: it makes NO Ory call and never touches any service
+        // YAML (T-10-14 / CONTEXT invariant) — the console stores its own shell
+        // logo on the mounted console-data volume. All inherit `auth_guard` (401
+        // unauth); the state-changing POST (upload) + DELETE (reset) require
+        // `X-CSRF-Token` via `csrf_guard` (403, T-10-12 — `lib/api.ts` echoes it),
+        // while the GET serve/settings are csrf-exempt. The upload handler is
+        // hardened: size cap before read (T-10-10), magic-byte sniff not the
+        // spoofable content-type (T-10-upload), a SERVER-DEFINED canonical path so
+        // the client filename can never traverse (T-10-09), and the serve route
+        // pins the content-type + a CSP sandbox so a stored SVG cannot run script
+        // (T-10-11). The `{service}/{section}` config allowlist is NEVER reached.
+        .push(
+            Router::with_path("api/console/branding/logo")
+                .post(crate::branding::upload_logo) // BRAND-03 upload (CSRF-guarded)
+                .get(crate::branding::serve_logo) // BRAND-03 serve (404 -> default)
+                .delete(crate::branding::reset_logo), // BRAND-03 reset (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/console/branding")
+                .get(crate::branding::get_branding), // BRAND-03 state (custom|default)
+        )
         // Phase 8 (OAUTH2-01) Hydra OAuth2 client data path. All inherit
         // `auth_guard` (401 unauth); GET is csrf-exempt, while POST/PUT/DELETE
         // require `X-CSRF-Token` via `csrf_guard` (T-08-AUTHZ — `lib/api.ts`

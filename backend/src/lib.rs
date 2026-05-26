@@ -5,6 +5,7 @@
 //! exercise the real router/handlers with Salvo `TestClient`.
 
 pub mod auth;
+pub mod branding;
 pub mod config;
 pub mod config_edit;
 pub mod db;
