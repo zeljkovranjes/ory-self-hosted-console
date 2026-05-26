@@ -10,6 +10,13 @@
 /config/oathkeeper/jwks.json
 !/config/oathkeeper/jwks.json.example
 
+# --- Polis console-generated settings (Phase 13, SSO-01) ---
+# The /api/config/polis writer creates <config_dir>/polis/settings.env at runtime
+# (a KEY=value env file of NON-secret allowlisted settings) on the first edit; it
+# is operator runtime state, never a checked-in default. Keep it (and its .bak)
+# out of git.
+/config/polis/
+
 # --- Rust (backend) ---
 /backend/target/
 # Linux build cache used by the documented ORY_LIVE_TESTS container run

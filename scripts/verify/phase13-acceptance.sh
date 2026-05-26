@@ -112,6 +112,8 @@ teardown() {
   echo
   echo "--- teardown: docker compose down -v ---"
   $DC down -v --remove-orphans >/dev/null 2>&1 || true
+  # Remove the throwaway Polis acceptance env-file (generated secrets, never committed).
+  [ -n "${POLIS_ENV_FILE:-}" ] && rm -f "$POLIS_ENV_FILE" 2>/dev/null || true
 }
 trap teardown EXIT
 
@@ -170,31 +172,91 @@ _gen_b64() { openssl rand -base64 32 2>/dev/null | tr -d '\n' || node -e 'proces
 _gen_rsa_b64() {
   # A base64-encoded RSA-2048 PKCS#8 private key (Polis OPENID_RSA_PRIVATE_KEY) and
   # its public key. Base64 the PEM so the single-line env value carries no newlines.
-  local tmpk tmppub
-  tmpk="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/polis_rsa_$$")"
-  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$tmpk" >/dev/null 2>&1 || return 1
-  tmppub="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/polis_rsa_pub_$$")"
-  openssl pkey -in "$tmpk" -pubout -out "$tmppub" >/dev/null 2>&1 || return 1
-  POLIS_OPENID_RSA_PRIVATE_KEY="$(base64 < "$tmpk" | tr -d '\n')"
-  POLIS_OPENID_RSA_PUBLIC_KEY="$(base64 < "$tmppub" | tr -d '\n')"
-  rm -f "$tmpk" "$tmppub" 2>/dev/null || true
+  #
+  # CRITICAL (Windows/MSYS): the gate runs under MSYS_NO_PATHCONV=1 (so compose
+  # leading-slash URL paths are not mangled). Under that setting, the mingw openssl
+  # `-out <path>` argument is NOT path-translated, so it writes to a path bash can't
+  # read back — leaving a 0-byte file and an empty key (the original RED cause). So
+  # we use NO temp files: pipe the PEM through stdin/stdout entirely (no `-out`/`-in`
+  # path to mangle), which is robust under MSYS_NO_PATHCONV=1.
+  local priv_pem pub_pem
+  priv_pem="$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 2>/dev/null)" || return 1
+  [ -n "$priv_pem" ] || return 1
+  pub_pem="$(printf '%s' "$priv_pem" | openssl pkey -pubout 2>/dev/null)" || return 1
+  [ -n "$pub_pem" ] || return 1
+  POLIS_OPENID_RSA_PRIVATE_KEY="$(printf '%s' "$priv_pem" | base64 | tr -d '\n')"
+  POLIS_OPENID_RSA_PUBLIC_KEY="$(printf '%s' "$pub_pem" | base64 | tr -d '\n')"
+  # Guard: a 2048-bit key base64s to ~2.3k chars; anything tiny means a read failed.
+  [ "${#POLIS_OPENID_RSA_PRIVATE_KEY}" -ge 512 ] && [ "${#POLIS_OPENID_RSA_PUBLIC_KEY}" -ge 200 ]
 }
-export POLIS_DB_PASSWORD="${POLIS_DB_PASSWORD:-acceptance_polis_pw}"
-export POLIS_DB_ENCRYPTION_KEY="${POLIS_DB_ENCRYPTION_KEY:-$(_gen_b64)}"
-export POLIS_API_KEY="${POLIS_API_KEY:-$(_gen_b64)}"
-export POLIS_NEXTAUTH_SECRET="${POLIS_NEXTAUTH_SECRET:-$(_gen_b64)}"
+# IMPORTANT: the `polis` Postgres role is created by db/init/01-init.sql with the
+# STATIC placeholder password `changeme_polis` on the fresh-volume boot (the init
+# SQL does NOT interpolate env). Every other service follows the same convention —
+# the operator `.env` sets `*_DB_PASSWORD=changeme_*` to match. Since this gate
+# always boots a FRESH volume, the polis role password is exactly `changeme_polis`,
+# so Polis MUST connect with that. Default to it (overridable if the operator has
+# customised both the init SQL and their .env in lockstep).
+POLIS_DB_PASSWORD="${POLIS_DB_PASSWORD:-changeme_polis}"
+POLIS_DB_ENCRYPTION_KEY="${POLIS_DB_ENCRYPTION_KEY:-$(_gen_b64)}"
+POLIS_API_KEY="${POLIS_API_KEY:-$(_gen_b64)}"
+POLIS_NEXTAUTH_SECRET="${POLIS_NEXTAUTH_SECRET:-$(_gen_b64)}"
 # Single public issuer. For a localhost acceptance run there is no public edge, so
 # point it at the host-published frontend origin (any reachable URL satisfies the
 # `${VAR:?}` contract; the live issuer-reachability check is ADVISORY this phase).
-export POLIS_EXTERNAL_URL="${POLIS_EXTERNAL_URL:-http://localhost:5225}"
+POLIS_EXTERNAL_URL="${POLIS_EXTERNAL_URL:-http://localhost:5225}"
 if [ -z "${POLIS_OPENID_RSA_PRIVATE_KEY:-}" ] || [ -z "${POLIS_OPENID_RSA_PUBLIC_KEY:-}" ]; then
   if ! _gen_rsa_b64; then
-    _fail "could not generate an ephemeral Polis RSA keypair (openssl unavailable) — cannot bring Polis up"
+    _fail "could not generate an ephemeral Polis RSA keypair (openssl unavailable / read failed) — cannot bring Polis up"
     summary
     exit $?
   fi
 fi
-export POLIS_OPENID_RSA_PRIVATE_KEY POLIS_OPENID_RSA_PUBLIC_KEY
+
+# Write every generated Polis secret to a dedicated, throwaway acceptance env-file
+# and thread it onto EVERY compose invocation via a stacked `--env-file` (the
+# operator `.env` first, then ours last-wins). This is bulletproof against
+# process-env inheritance quirks: `docker compose build/up/config` interpolate the
+# `${POLIS_*:?}` contract straight from the file rather than relying on the exported
+# shell environment reaching the compose child reliably under MSYS. The file is
+# 0600 and removed on teardown; it is never committed.
+#
+# It MUST live at a REPO-RELATIVE path: the gate runs under MSYS_NO_PATHCONV=1, and
+# a `/tmp/...`-style `--env-file` arg is NOT path-translated, so the Windows
+# docker-compose binary cannot find it (verified). A repo-relative `./.<name>` path
+# is passed through verbatim and resolves correctly. `.p13-acceptance-*.env` is
+# also matched by the existing `.env.*` .gitignore rule (never committed); removed
+# on teardown.
+POLIS_ENV_FILE="${REPO_ROOT}/.env.p13-acceptance-$$"
+: > "$POLIS_ENV_FILE"
+chmod 600 "$POLIS_ENV_FILE" 2>/dev/null || true
+{
+  printf 'POLIS_DB_PASSWORD=%s\n'           "$POLIS_DB_PASSWORD"
+  printf 'POLIS_DB_ENCRYPTION_KEY=%s\n'     "$POLIS_DB_ENCRYPTION_KEY"
+  printf 'POLIS_API_KEY=%s\n'               "$POLIS_API_KEY"
+  printf 'POLIS_NEXTAUTH_SECRET=%s\n'       "$POLIS_NEXTAUTH_SECRET"
+  printf 'POLIS_EXTERNAL_URL=%s\n'          "$POLIS_EXTERNAL_URL"
+  printf 'POLIS_OPENID_RSA_PRIVATE_KEY=%s\n' "$POLIS_OPENID_RSA_PRIVATE_KEY"
+  printf 'POLIS_OPENID_RSA_PUBLIC_KEY=%s\n'  "$POLIS_OPENID_RSA_PUBLIC_KEY"
+} > "$POLIS_ENV_FILE"
+
+# Redefine DC so EVERY compose call (here AND inside lib.sh helpers) stacks the
+# operator `.env` + our generated Polis env-file. `--env-file .env` keeps the
+# operator's ADMIN_PASSWORD / *_DB_PASSWORD / HYDRA_SECRETS_SYSTEM contracts.
+# Use REPO-RELATIVE paths (the script runs from / cwd's at the repo root and the
+# prior gates invoke bare `docker compose` from there): under MSYS_NO_PATHCONV=1 an
+# absolute MSYS path would not translate for the Windows compose binary, whereas a
+# `.env` / `./<basename>` relative arg passes through verbatim.
+cd "$REPO_ROOT" || { _fail "could not cd to repo root ${REPO_ROOT}"; summary; exit $?; }
+POLIS_ENV_REL="./$(basename "$POLIS_ENV_FILE")"
+if [ -f "${REPO_ROOT}/.env" ]; then
+  DC="docker compose --env-file .env --env-file ${POLIS_ENV_REL}"
+else
+  DC="docker compose --env-file ${POLIS_ENV_REL}"
+fi
+# Also export so any bare `docker compose` (e.g. the bundle-egress subshell, which
+# does not interpolate polis) and helper edge cases still see the values.
+export POLIS_DB_PASSWORD POLIS_DB_ENCRYPTION_KEY POLIS_API_KEY POLIS_NEXTAUTH_SECRET \
+  POLIS_EXTERNAL_URL POLIS_OPENID_RSA_PRIVATE_KEY POLIS_OPENID_RSA_PUBLIC_KEY
 # The other services' `${VAR:?}` contracts (ADMIN_PASSWORD / *_DB_PASSWORD) are
 # satisfied by the operator .env that the prior phase gates already require.
 
