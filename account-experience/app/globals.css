@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+/*
+ * AX global styles.
+ *
+ * Tailwind v4 `@theme` is the Elements theming contract (15-RESEARCH "Theming
+ * Supply"). The console-written CSS-variable override layer (AX-02) slots in
+ * AFTER this import in a later plan (Plan 02) — declaring the same `--ui-*` /
+ * `--font-*` custom properties to override the Elements defaults at boot/restart.
+ *
+ * `--font-sans` is bound to the vendored local Geist font (see app/layout.tsx);
+ * no remote font is ever fetched (zero-CDN).
+ */
+@theme {
+  --font-sans: var(--font-sans);
+}
+
+html,
+body {
+  font-family: var(--font-sans), system-ui, sans-serif;
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}

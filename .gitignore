@@ -47,6 +47,15 @@
 # Playwright e2e run artifacts (traces, screenshots, HTML report) — generated.
 /frontend/test-results/
 /frontend/playwright-report/
+
+# --- Node / Next.js (account-experience / AX service) ---
+/account-experience/node_modules/
+/account-experience/.next/
+/account-experience/out/
+/account-experience/.turbo/
+/account-experience/next-env.d.ts
+/account-experience/tsconfig.tsbuildinfo
+
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
