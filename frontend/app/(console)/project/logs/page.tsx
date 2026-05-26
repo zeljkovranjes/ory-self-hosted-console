@@ -1,28 +1,46 @@
 "use client";
 
-// ACT-04 — the Logs & events (audit log) read-only view (11-UI-SPEC §C).
+// ACT-04 + OBS-04 — the Logs & events surface.
 //
-// Composes the Phase-5 DataTable in server mode against GET /api/console/audit
-// (the append-only console_audit_log). READ-ONLY — there is NO create/edit/
-// delete affordance anywhere on this surface. A filter block (actor / action /
-// outcome / date range) re-queries server-side; each row opens a Dialog with the
-// full record incl. the metadata jsonb in a read-only Monaco language="json"
-// block.
+// TWO distinct sources on one page, presented as tabs:
+//   1. "Console audit" (ACT-04, unchanged): the append-only console_audit_log —
+//      a READ-ONLY DataTable of console-initiated admin actions (who/what/when/
+//      outcome) with a filter block + a Monaco metadata detail dialog. This is
+//      NOT gated — it is always available, distinct from container logs.
+//   2. "Container logs" (OBS-04): the Loki-backed search of the self-hosted
+//      stack's container logs, gated by <FeatureGate flag="observability">. When
+//      the flag is ON but the profile is DOWN, the backend returns the tolerant
+//      `profile_not_running` state and we render <ProfileNotRunning /> — never a
+//      raw error. The frontend sends only a CLOSED intent (+ allowlisted
+//      service), never raw LogQL. Lines are PII-masked at ingestion (Alloy).
 //
-// All egress via @/lib/api — no Ory host/port literal. (bundle-egress gate)
+// All egress via @/lib/api — no Ory/Loki host literal. (bundle-egress gate)
 
 import * as React from "react";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Eye } from "lucide-react";
 
 import { api } from "@/lib/api";
+import {
+  isProfileNotRunning,
+  lokiLines,
+  useLogs,
+  LOG_SERVICES,
+  type LogFilters,
+  type LogIntent,
+  type LogService,
+  type ObservabilityEnvelope,
+} from "@/lib/observability";
 import type { FetchArgs, FetchResult } from "@/lib/table-types";
 import { DataTable } from "@/components/data-table";
+import { FeatureGate } from "@/components/feature-gate";
+import { ProfileNotRunning } from "@/components/profile-not-running";
 import { MonacoEditor } from "@/components/monaco-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Dialog,
   DialogContent,
@@ -37,6 +55,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const QUERY_KEY = "console-audit";
 
@@ -77,6 +96,14 @@ function fmtTs(ts?: string | null): string {
   if (!ts) return "—";
   const d = new Date(ts);
   return Number.isNaN(d.getTime()) ? ts : d.toLocaleString();
+}
+
+// Loki timestamps are nanosecond UNIX strings — convert to a locale string.
+function fmtNanos(ns: string): string {
+  const ms = Number(ns) / 1_000_000;
+  if (!Number.isFinite(ms)) return ns;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? ns : d.toLocaleString();
 }
 
 // Convert a `datetime-local` value (no timezone) to an RFC3339 string the
@@ -176,7 +203,9 @@ function DetailRow({
   );
 }
 
-export default function LogsPage() {
+// --- Console audit (ACT-04) --------------------------------------------------
+
+function AuditLog() {
   const [applied, setApplied] = React.useState<Filters>(EMPTY_FILTERS);
   const [draft, setDraft] = React.useState<Filters>(EMPTY_FILTERS);
 
@@ -258,14 +287,11 @@ export default function LogsPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">Logs &amp; events</h1>
-        <p className="text-sm text-muted-foreground">
-          An append-only audit log of console-initiated admin actions — who did
-          what, when, and the outcome. This records console operations only.
-        </p>
-      </div>
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground">
+        An append-only audit log of console-initiated admin actions — who did
+        what, when, and the outcome. This records console operations only.
+      </p>
 
       <div className="space-y-3 rounded-md border p-4">
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -355,6 +381,137 @@ export default function LogsPage() {
           </div>
         )}
       />
+    </div>
+  );
+}
+
+// --- Container logs (OBS-04, Loki) ------------------------------------------
+
+const LOG_INTENTS: { value: LogIntent; label: string }[] = [
+  { value: "all", label: "All logs" },
+  { value: "errors", label: "Errors only" },
+  { value: "service", label: "By service" },
+];
+
+function ContainerLogs() {
+  const [filters, setFilters] = React.useState<LogFilters>({ intent: "all" });
+  const { data, isLoading, refetch } = useLogs(filters);
+  const envelope = data as ObservabilityEnvelope | undefined;
+  const lines = React.useMemo(() => lokiLines(envelope), [envelope]);
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground">
+        Container logs from the self-hosted stack, searched through Loki. Lines
+        are PII-masked at ingestion.
+      </p>
+
+      <div className="flex flex-wrap items-end gap-4 rounded-md border p-4">
+        <div className="grid gap-2">
+          <Label htmlFor="log-intent">View</Label>
+          <Select
+            value={filters.intent}
+            onValueChange={(v) =>
+              setFilters((f) => ({
+                intent: v as LogIntent,
+                service: v === "service" ? (f.service ?? "backend") : undefined,
+              }))
+            }
+          >
+            <SelectTrigger id="log-intent" className="w-44">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {LOG_INTENTS.map((i) => (
+                <SelectItem key={i.value} value={i.value}>
+                  {i.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        {filters.intent === "service" ? (
+          <div className="grid gap-2">
+            <Label htmlFor="log-service">Service</Label>
+            <Select
+              value={filters.service ?? "backend"}
+              onValueChange={(v) =>
+                setFilters((f) => ({ ...f, service: v as LogService }))
+              }
+            >
+              <SelectTrigger id="log-service" className="w-44">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {LOG_SERVICES.map((s) => (
+                  <SelectItem key={s} value={s}>
+                    {s}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        ) : null}
+      </div>
+
+      {isLoading ? (
+        <div className="space-y-2">
+          {[0, 1, 2, 3].map((i) => (
+            <Skeleton key={i} className="h-8 w-full" />
+          ))}
+        </div>
+      ) : isProfileNotRunning(envelope) ? (
+        <ProfileNotRunning surface="logs" onRetry={() => void refetch()} />
+      ) : lines.length === 0 ? (
+        <div className="rounded-md border py-8 text-center text-sm text-muted-foreground">
+          No log lines in the current window.
+        </div>
+      ) : (
+        <ul className="divide-y rounded-md border font-mono text-xs">
+          {lines.map((l, i) => (
+            <li key={`${l.ts}-${i}`} className="flex gap-3 px-3 py-1.5">
+              <span className="shrink-0 text-muted-foreground">
+                {fmtNanos(l.ts)}
+              </span>
+              {l.labels.service ? (
+                <Badge variant="secondary" className="shrink-0">
+                  {l.labels.service}
+                </Badge>
+              ) : null}
+              <span className="break-all">{l.line}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+export default function LogsPage() {
+  return (
+    <div className="space-y-6">
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">Logs &amp; events</h1>
+        <p className="text-sm text-muted-foreground">
+          The console audit trail plus the self-hosted stack&apos;s container
+          logs.
+        </p>
+      </div>
+
+      <Tabs defaultValue="audit">
+        <TabsList>
+          <TabsTrigger value="audit">Console audit</TabsTrigger>
+          <TabsTrigger value="container">Container logs</TabsTrigger>
+        </TabsList>
+        <TabsContent value="audit">
+          <AuditLog />
+        </TabsContent>
+        <TabsContent value="container">
+          <FeatureGate flag="observability" title="Container logs">
+            <ContainerLogs />
+          </FeatureGate>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

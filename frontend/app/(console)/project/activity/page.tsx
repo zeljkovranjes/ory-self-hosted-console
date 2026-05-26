@@ -1,21 +1,31 @@
 "use client";
 
-// ACT-03 — the derived recent-activity stub (11-UI-SPEC §E).
+// OBS-03 — the real Prometheus-backed Activity dashboard (Phase-16).
 //
-// A thin, READ-ONLY v1 view, CLEARLY labeled "derived recent activity (v1)" in
-// the description. Fetches GET /api/activity through @/lib/api — the backend
-// folds recent Kratos sessions (authentications) + recent courier messages
-// (sends) into one {source:"derived", version:"v1", items:[{kind, detail}]}
-// envelope (NO new persistence). Each row renders an icon + a one-line who/what
-// label + a font-mono timestamp; identity references deep-link to /users/{id}
-// where feasible. There is NO phantom "coming soon" CRUD.
+// REPLACES the ACT-03 derived-stub body: instead of folding recent Kratos
+// sessions + courier sends into a "derived (v1)" list, this renders metric
+// panels backed by the plan-02 Prometheus route GET /api/console/metrics/activity
+// (closed dashboard intents: login-rate, signup-rate, login-latency). The
+// derived /api/activity stub is RETAINED unflagged by the backend as the OFF
+// fallback — but this page IS the observability surface, so it is wrapped in
+// <FeatureGate flag="observability">. When the flag is ON but the profile is
+// DOWN, the backend returns a tolerant `profile_not_running` state and we render
+// <ProfileNotRunning /> — never a raw error / 502.
 //
-// All egress via @/lib/api — no Ory host/port literal. (bundle-egress gate)
+// All egress via @/lib/api (useActivityMetrics) — no Prometheus host literal.
+// (bundle-egress gate). No CDN chart lib: the panels are Card-based summaries
+// computed from the returned series (counts/buckets only — no per-identity data).
 
-import { useQuery } from "@tanstack/react-query";
-import { LogIn, Send } from "lucide-react";
-
-import { api } from "@/lib/api";
+import {
+  activitySeries,
+  isProfileNotRunning,
+  useActivityMetrics,
+  type ActivityIntent,
+  type ObservabilityEnvelope,
+  type PromSeries,
+} from "@/lib/observability";
+import { FeatureGate } from "@/components/feature-gate";
+import { ProfileNotRunning } from "@/components/profile-not-running";
 import {
   Card,
   CardContent,
@@ -24,153 +34,135 @@ import {
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 
-const QUERY_KEY = "project-activity";
-
-type ActivityEntry = {
-  kind: "authentication" | "courier" | string;
-  detail: Record<string, unknown>;
+type PanelSpec = {
+  intent: ActivityIntent;
+  title: string;
+  description: string;
+  /** How the latest value is rendered. */
+  unit: "per-second" | "seconds";
 };
 
-type ActivityEnvelope = {
-  source: string;
-  version: string;
-  items: ActivityEntry[];
-};
+const PANELS: PanelSpec[] = [
+  {
+    intent: "login-rate",
+    title: "Login attempts / sec",
+    description: "Console login attempts per second (5m rate), by result.",
+    unit: "per-second",
+  },
+  {
+    intent: "signup-rate",
+    title: "Setup completions / sec",
+    description: "Console setup completions per second (5m rate).",
+    unit: "per-second",
+  },
+  {
+    intent: "login-latency",
+    title: "Request latency (p95)",
+    description: "Backend HTTP request latency, 95th percentile (5m).",
+    unit: "seconds",
+  },
+];
 
-function fmtTs(ts?: unknown): string {
-  if (typeof ts !== "string" || !ts) return "—";
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString();
+// The latest value across a Prometheus range series (the last sample). Returns a
+// formatted string + an optional per-series label (e.g. result=success).
+function latestSamples(
+  series: PromSeries[],
+  unit: PanelSpec["unit"],
+): { label: string; value: string }[] {
+  return series.map((s) => {
+    const last = s.values.at(-1);
+    const raw = last ? Number(last[1]) : NaN;
+    const value = Number.isFinite(raw)
+      ? unit === "seconds"
+        ? `${(raw * 1000).toFixed(0)} ms`
+        : raw.toFixed(3)
+      : "—";
+    // Prefer a meaningful metric label (e.g. `result`) for the row label.
+    const label =
+      s.metric.result ??
+      s.metric.le ??
+      Object.values(s.metric)[0] ??
+      "value";
+    return { label, value };
+  });
 }
 
-// Pull a best-effort identity label + id out of a derived session detail.
-function sessionIdentity(detail: Record<string, unknown>): {
-  label: string;
-  id?: string;
-} {
-  const identity = detail.identity as
-    | { id?: string; traits?: Record<string, unknown> }
-    | undefined;
-  const traits = identity?.traits;
-  const email = typeof traits?.email === "string" ? traits.email : undefined;
-  const username =
-    typeof traits?.username === "string" ? traits.username : undefined;
-  return { label: email ?? username ?? identity?.id ?? "an identity", id: identity?.id };
-}
+function MetricPanel({ spec }: { spec: PanelSpec }) {
+  const { data, isLoading, refetch } = useActivityMetrics(spec.intent);
+  const envelope = data as ObservabilityEnvelope | undefined;
 
-// One activity row: an icon, a one-line label, and a timestamp.
-function ActivityRow({ entry }: { entry: ActivityEntry }) {
-  const d = entry.detail;
-  if (entry.kind === "authentication") {
-    const { label, id } = sessionIdentity(d);
-    const ts = d.authenticated_at ?? d.issued_at;
-    return (
-      <li className="flex items-center justify-between gap-3 rounded-md border p-3">
-        <span className="flex min-w-0 items-center gap-2 text-sm">
-          <LogIn className="size-4 shrink-0 text-muted-foreground" />
-          <span className="truncate">
-            Session for{" "}
-            {id ? (
-              <a
-                href={`/users/${id}`}
-                className="text-primary hover:underline"
-              >
-                {label}
-              </a>
-            ) : (
-              <span className="font-medium">{label}</span>
-            )}
-          </span>
-        </span>
-        <span className="shrink-0 font-mono text-xs text-muted-foreground">
-          {fmtTs(ts)}
-        </span>
-      </li>
-    );
-  }
-  // courier
-  const recipient =
-    typeof d.recipient === "string" ? d.recipient : "a recipient";
-  const type =
-    typeof d.type === "string"
-      ? d.type
-      : typeof d.template_type === "string"
-        ? d.template_type
-        : "message";
   return (
-    <li className="flex items-center justify-between gap-3 rounded-md border p-3">
-      <span className="flex min-w-0 items-center gap-2 text-sm">
-        <Send className="size-4 shrink-0 text-muted-foreground" />
-        <span className="truncate">
-          Courier {type} to <span className="font-mono text-xs">{recipient}</span>
-        </span>
-      </span>
-      <span className="shrink-0 font-mono text-xs text-muted-foreground">
-        {fmtTs(d.created_at)}
-      </span>
-    </li>
+    <Card>
+      <CardHeader className="space-y-1">
+        <CardTitle className="text-base">{spec.title}</CardTitle>
+        <p className="text-xs text-muted-foreground">{spec.description}</p>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <Skeleton className="h-12 w-full" />
+        ) : isProfileNotRunning(envelope) ? (
+          <ProfileNotRunning surface="metrics" onRetry={() => void refetch()} />
+        ) : (
+          <MetricRows
+            samples={latestSamples(activitySeries(envelope), spec.unit)}
+          />
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
-export default function ActivityPage() {
-  const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: [QUERY_KEY],
-    queryFn: () => api<ActivityEnvelope>("/api/activity"),
-  });
+function MetricRows({
+  samples,
+}: {
+  samples: { label: string; value: string }[];
+}) {
+  if (samples.length === 0) {
+    return (
+      <p className="py-2 text-sm text-muted-foreground">
+        No data points in the current window.
+      </p>
+    );
+  }
+  return (
+    <ul className="space-y-2">
+      {samples.map((s, i) => (
+        <li
+          key={`${s.label}-${i}`}
+          className="flex items-center justify-between gap-3 text-sm"
+        >
+          <span className="truncate text-muted-foreground">{s.label}</span>
+          <span className="font-mono tabular-nums">{s.value}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
-  const items = data?.items ?? [];
-
+function ActivityDashboard() {
   return (
     <div className="space-y-6">
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">Activity</h1>
         <p className="text-sm text-muted-foreground">
-          A derived recent-activity view (v1) — recent sign-ins, sessions, and
-          courier sends, aggregated from existing data. This is a thin stub; full
-          metrics are not part of this milestone.
+          Live metrics from the observability profile — sign-up/login rates and
+          request latency, scraped from the backend&apos;s Prometheus exporter.
         </p>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Recent activity</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {isError ? (
-            <div className="space-y-3">
-              <p className="text-sm text-destructive" role="alert">
-                Failed to load recent activity.
-              </p>
-              <button
-                type="button"
-                className="text-sm text-primary hover:underline"
-                onClick={() => void refetch()}
-              >
-                Retry
-              </button>
-            </div>
-          ) : isLoading ? (
-            <div className="space-y-2">
-              {[0, 1, 2].map((i) => (
-                <Skeleton key={i} className="h-12 w-full" />
-              ))}
-            </div>
-          ) : items.length === 0 ? (
-            <div className="space-y-1 py-6 text-center">
-              <p className="text-sm font-medium">No recent activity</p>
-              <p className="text-sm text-muted-foreground">
-                There is no recent sign-in or courier activity to show yet.
-              </p>
-            </div>
-          ) : (
-            <ul className="space-y-2">
-              {items.map((entry, i) => (
-                <ActivityRow key={i} entry={entry} />
-              ))}
-            </ul>
-          )}
-        </CardContent>
-      </Card>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {PANELS.map((spec) => (
+          <MetricPanel key={spec.intent} spec={spec} />
+        ))}
+      </div>
     </div>
+  );
+}
+
+export default function ActivityPage() {
+  return (
+    <FeatureGate flag="observability" title="Activity">
+      <ActivityDashboard />
+    </FeatureGate>
   );
 }
