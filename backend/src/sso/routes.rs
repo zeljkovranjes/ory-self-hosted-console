@@ -28,9 +28,14 @@
 //!   `clientSecret` STRIPPED (no GET/list body ever carries a secret value).
 //!
 //! ## delete_connection (DELETE api/sso/connections/{id})
-//!   TWO-SIDED (Pitfall 5 / A6): `DELETE /api/v1/sso` (Polis) AND remove the
-//!   matching `providers[]` entry (array-root replace via merge, preserving the
-//!   other providers' masked secrets) + Kratos restart. Neither side dangles.
+//!   TWO-SIDED (Pitfall 5 / A6), Kratos-FIRST (CR-02): remove the matching Kratos
+//!   `providers[]` entry (array-root replace via merge, preserving the other
+//!   providers' masked secrets) + Kratos restart, and ONLY THEN `DELETE
+//!   /api/v1/sso` (Polis). The Kratos side is the failure-prone, locally
+//!   recoverable side, so removing it first means a partial failure can never
+//!   strand a `saml-<tenant>` provider pointing at a deleted Polis connection. The
+//!   Polis delete is idempotent (a 404 = already-deleted success), so a retry after
+//!   a half-finished delete completes cleanly. Neither side dangles.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -458,12 +463,23 @@ pub async fn delete_connection(
         .filter(|t| !t.trim().is_empty())
         .ok_or(AppError::NotFound)?;
 
-    // Side 1: delete the Polis connection by (tenant, product).
-    polis_admin::delete_connection(&polis_base, &api_key, &tenant, POLIS_PRODUCT, None).await?;
+    // CR-02: ORDER MATTERS — remove the SECURITY-RELEVANT Kratos provider entry
+    // FIRST, then delete the Polis connection. The Kratos side (config write +
+    // restart + health-poll) is the failure-prone but LOCALLY RECOVERABLE side:
+    // if it fails, NOTHING was destroyed (Polis is untouched) and the operator can
+    // retry the same endpoint. The previous Polis-first order could strand a
+    // `saml-<tenant>` provider in kratos.yml pointing at a deleted Polis connection
+    // — a broken sign-in path the UI could not clear (a retry's Polis delete 404'd
+    // *before* the Kratos cleanup ran). With Kratos-first + idempotent Polis delete
+    // (a 404 is treated as success), no partial failure leaves a dangling provider:
+    //   - Kratos remove fails  → Polis intact, provider intact → retry is clean.
+    //   - Kratos remove ok, Polis delete fails → provider already gone (the
+    //     security-relevant side is clean); a retry finds no provider, then the
+    //     idempotent Polis delete completes (404 = success).
 
-    // Side 2: remove the matching Kratos providers[] entry (array-root replace,
-    // preserving the other providers' masked secrets) + restart Kratos. No
-    // dangling provider (Pitfall 5).
+    // Side 1 (security-relevant, recoverable): remove the matching Kratos
+    // providers[] entry (array-root replace, preserving the other providers'
+    // masked secrets) + restart Kratos. If it fails, Polis is still intact.
     let id = provider_id(&tenant);
     let path = kratos_config_path(&cfg.config_dir);
     let stored = read_providers(&yaml::load(&path)?);
@@ -473,6 +489,11 @@ pub async fn delete_connection(
     } else {
         tracing::info!(provider = %id, "saml delete: no matching kratos provider entry (already absent)");
     }
+
+    // Side 2: only now delete the Polis connection. The Polis delete is idempotent
+    // (a 404 is treated as success), so a retry after a Kratos-first partial
+    // failure still completes cleanly.
+    polis_admin::delete_connection(&polis_base, &api_key, &tenant, POLIS_PRODUCT, None).await?;
 
     Ok(Json(json!({ "deleted": tenant, "provider_id": id })))
 }

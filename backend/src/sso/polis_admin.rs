@@ -255,6 +255,14 @@ pub async fn delete_connection(
             tracing::warn!(error = %e, "polis delete_connection transport error");
             AppError::Upstream("polis admin api unreachable".to_string())
         })?;
+    // CR-02 (idempotency): a Polis 404 means the connection is already gone, which
+    // is the desired post-state of a delete. Treat it as SUCCESS so a retry after a
+    // half-finished delete (Kratos side already cleaned, Polis already gone) can
+    // complete rather than 502 — the two-sided delete must be retry-safe.
+    if resp.status() == reqwest_012::StatusCode::NOT_FOUND {
+        tracing::info!("polis delete_connection: connection already absent (404) — treating as deleted");
+        return Ok(());
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         tracing::warn!(status = %status, "polis delete_connection non-2xx");
@@ -423,5 +431,25 @@ mod tests {
             .await
             .expect_err("non-2xx delete must be an upstream error");
         assert!(matches!(err, AppError::Upstream(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_treats_404_as_success_for_idempotent_retry() {
+        // CR-02: a Polis 404 (connection already gone) must be SUCCESS so a retry
+        // after a half-finished two-sided delete can complete the Kratos cleanup
+        // instead of 502'ing before it runs.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("DELETE", "/api/v1/sso")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .with_body("Not Found")
+            .expect(1)
+            .create_async()
+            .await;
+        delete_connection(&server.url(), "k", "org-1", "ory-console", None)
+            .await
+            .expect("a Polis 404 must be treated as an already-deleted success");
+        m.assert_async().await;
     }
 }
