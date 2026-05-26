@@ -171,78 +171,12 @@ else
   printf '%s\n' "$NEXTPUB_HITS"
 fi
 
-# =============================================================================
-# WR-03 — BUILD-TIME assertion: the emitted EDGE MIDDLEWARE chunk carries NO
-# `node:fs` / `node:path` reference. This is the robust guard the review asked for:
-# the NEXT_RUNTIME runtime guard in lib/overrides.ts is correct but enforced only
-# by convention; a future static `import` of node:fs/node:path into a module
-# reachable from ory.config.ts -> middleware.ts would silently re-bundle it into
-# the edge chunk and 500 every Kratos self-service call (the bug that bit 15-02 +
-# 15-04). We read the AUTHORITATIVE edge-chunk list from
-# .next/server/middleware-manifest.json and grep ONLY those chunks for node:fs /
-# node:path specifically — so this fails fast at build time (not at runtime).
-#
-# We deliberately scope to node:fs/node:path (NOT a blanket `node:` match):
-# Next's edge-runtime wrapper legitimately references framework polyfills like
-# `node:buffer` / `node:async_hooks` that the edge runtime PROVIDES — those are
-# not the filesystem builtins the override reader could drag in, and matching them
-# would be a false FAIL. node:fs / node:path are the exact 15-02/15-04 regression
-# class, so they are what we forbid.
-# =============================================================================
-echo
-echo "--- [WR-03] the emitted EDGE MIDDLEWARE chunk carries no node:fs / node:path ---"
-AX_DIR="${REPO_ROOT}/account-experience"
-MW_MANIFEST="${AX_DIR}/.next/server/middleware-manifest.json"
-# Helper: extract the edge middleware chunk file list (relative to `.next/`) from
-# the manifest. Empty output means "no edge chunks listed".
-_edge_chunks_from_manifest() {
-  node -e '
-    const fs = require("fs");
-    let m; try { m = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { process.exit(0); }
-    const mw = (m && m.middleware) || {};
-    const files = new Set();
-    for (const k of Object.keys(mw)) {
-      for (const f of (mw[k].files || [])) files.add(f);
-    }
-    process.stdout.write([...files].join("\n"));
-  ' "$1" 2>/dev/null
-}
-EDGE_CHUNKS=""
-[ -f "$MW_MANIFEST" ] && EDGE_CHUNKS="$(_edge_chunks_from_manifest "$MW_MANIFEST")"
-# A missing manifest OR an empty/stale edge-chunk list both mean we must (re)build
-# the AX so the assertion runs against the CURRENT source (anti-false-green: never
-# pass on a stale/absent build, never fail on a stale one either — rebuild first).
-if [ ! -f "$MW_MANIFEST" ] || [ -z "$EDGE_CHUNKS" ]; then
-  echo "    (building the AX once so the edge-chunk scan runs against current source)"
-  ( cd "$AX_DIR" && npm run build ) >/dev/null 2>&1 || true
-  EDGE_CHUNKS=""
-  [ -f "$MW_MANIFEST" ] && EDGE_CHUNKS="$(_edge_chunks_from_manifest "$MW_MANIFEST")"
-fi
-if [ -f "$MW_MANIFEST" ]; then
-  if [ -z "$EDGE_CHUNKS" ]; then
-    _fail "[WR-03] middleware-manifest.json lists NO edge chunks even after a build — cannot assert the edge bundle (anti-false-green)"
-  else
-    # Resolve each chunk under .next/ and grep for any node built-in reference.
-    EDGE_NODE_HITS=""
-    while IFS= read -r chunk; do
-      [ -z "$chunk" ] && continue
-      cf="${AX_DIR}/.next/${chunk}"
-      [ -f "$cf" ] || continue
-      # Match node:fs / node:path in either the static-import (`"node:fs"`) or the
-      # require (`require("node:fs")`) form. Scoped to fs/path ONLY (see header).
-      h="$(grep -lE 'node:fs|node:path' "$cf" 2>/dev/null || true)"
-      [ -n "$h" ] && EDGE_NODE_HITS="${EDGE_NODE_HITS}\n${h}"
-    done <<< "$EDGE_CHUNKS"
-    if [ -z "$EDGE_NODE_HITS" ]; then
-      _pass "[WR-03] the edge middleware chunk(s) carry no node:fs / node:path — the NEXT_RUNTIME guard holds at build time"
-    else
-      _fail "[WR-03] node:fs/node:path leaked into the EDGE MIDDLEWARE chunk (would 500 every Kratos self-service call):"
-      printf '%b\n' "$EDGE_NODE_HITS"
-    fi
-  fi
-else
-  _fail "[WR-03] no middleware-manifest.json after build — cannot assert the edge chunk is node-builtin-free (anti-false-green)"
-fi
+# WR-03 — the EDGE-MIDDLEWARE-chunk node:fs/node:path assertion runs LATER,
+# against the AUTHORITATIVE shipped bundle INSIDE the built AX container (after the
+# stack is up). Reading the container's `/app/.next/server/middleware-manifest.json`
+# + edge chunks avoids any flakiness of a host-side `npm run build` racing a stale
+# `.next` — the container holds exactly the `next build` output that ships. See the
+# "[WR-03]" block after the preflight-healthy check below.
 
 # =============================================================================
 # AX-01 (static) — Kratos ui_url keys point at the AX origin; NO logout.ui_url.
@@ -361,6 +295,60 @@ echo
 echo "--- preflight: account-experience + kratos healthy ---"
 assert_healthy account-experience
 assert_healthy "$KRATOS_CONTAINER"
+
+# =============================================================================
+# WR-03 — the SHIPPED EDGE MIDDLEWARE chunk (inside the built AX container) carries
+# NO `node:fs` / `node:path`. The NEXT_RUNTIME guard in lib/overrides.ts is correct
+# but enforced only by convention; a future static `import` of node:fs/node:path
+# into a module reachable from ory.config.ts -> middleware.ts would re-bundle it
+# into the edge chunk and 500 every Kratos self-service call (the bug that bit
+# 15-02 + 15-04). We read the AUTHORITATIVE edge-chunk list from the AX container's
+# /app/.next/server/middleware-manifest.json and grep ONLY those chunks for
+# node:fs / node:path — failing fast if either lands in the edge bundle.
+#
+# Scoped to node:fs/node:path (NOT a blanket `node:` match): Next's edge-runtime
+# wrapper legitimately references framework polyfills (`node:buffer`,
+# `node:async_hooks`) the edge runtime PROVIDES — matching those would be a false
+# FAIL. node:fs/node:path are the exact 15-02/15-04 regression class.
+#
+# Reading from the CONTAINER (not the host `.next`) makes this robust: it is the
+# exact `next build` output that ships, with no host-build race.
+# =============================================================================
+echo
+echo "--- [WR-03] the SHIPPED edge middleware chunk (in the AX container) carries no node:fs / node:path ---"
+WR03_VERDICT="$($DC exec -T "$AX_CONTAINER" node -e '
+  const fs = require("fs");
+  const root = "/app/.next";
+  const manifest = root + "/server/middleware-manifest.json";
+  let m;
+  try { m = JSON.parse(fs.readFileSync(manifest, "utf8")); }
+  catch (e) { process.stdout.write("NOMANIFEST"); process.exit(0); }
+  const mw = (m && m.middleware) || {};
+  const files = new Set();
+  for (const k of Object.keys(mw)) for (const f of (mw[k].files || [])) files.add(f);
+  if (files.size === 0) { process.stdout.write("NOCHUNKS"); process.exit(0); }
+  const re = /node:fs|node:path/;
+  const hits = [];
+  for (const f of files) {
+    const p = root + "/" + f;
+    let c = "";
+    try { c = fs.readFileSync(p, "utf8"); } catch (e) { continue; }
+    if (re.test(c)) hits.push(f);
+  }
+  process.stdout.write(hits.length ? ("HITS:" + hits.join(",")) : "CLEAN");
+' 2>/dev/null)"
+case "$WR03_VERDICT" in
+  CLEAN)
+    _pass "[WR-03] the shipped edge middleware chunk(s) carry no node:fs / node:path (the NEXT_RUNTIME guard holds in the built bundle)" ;;
+  NOMANIFEST)
+    _fail "[WR-03] no middleware-manifest.json in the AX container — cannot assert the edge bundle (anti-false-green)" ;;
+  NOCHUNKS)
+    _fail "[WR-03] the AX container's middleware-manifest.json lists NO edge chunks — cannot assert the edge bundle (anti-false-green)" ;;
+  HITS:*)
+    _fail "[WR-03] node:fs/node:path leaked into the SHIPPED edge middleware chunk (would 500 every Kratos self-service call): ${WR03_VERDICT#HITS:}" ;;
+  *)
+    _fail "[WR-03] could not scan the AX edge bundle (verdict='${WR03_VERDICT}')" ;;
+esac
 
 # =============================================================================
 # A1 — THE GATING LOGIN SMOKE. Drive a real Kratos v26.2.0 login flow through the
