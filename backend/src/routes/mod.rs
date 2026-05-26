@@ -66,11 +66,18 @@ fn request_origin(req: &Request) -> Option<String> {
         }
     }
     // Referer fallback: keep only scheme://host[:port] (strip path/query).
+    // WR-03: parse with `url::Url` (already a dependency) instead of hand-rolled
+    // byte-index slicing. An attacker controls `Referer` on the unauthenticated
+    // `/setup` + `/login` hoop, so a malformed/multibyte value must never panic
+    // (Rust string slicing panics on a non-char-boundary index) or mis-parse —
+    // `url::Url` reconstructs the origin from validated components safely.
     let referer = req.header::<String>("referer")?;
-    let after_scheme = referer.find("://")? + 3;
-    let rest = &referer[after_scheme..];
-    let host_end = rest.find('/').unwrap_or(rest.len());
-    Some(format!("{}{}", &referer[..after_scheme], &rest[..host_end]))
+    let url = url::Url::parse(&referer).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    })
 }
 
 /// Pre-session Origin allowlist hoop (Plan-checker Warning 2). Mounted on the
