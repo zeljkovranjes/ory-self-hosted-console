@@ -826,6 +826,129 @@ The gate exits `0` only when:
 
 ---
 
+## Webhooks, Console Features & Gated Pages (Phase 11)
+
+Phase 11 adds the console's **own** webhook dispatcher (an outbound delivery
+queue with HMAC signing and an SSRF guard — `HOOK-01/02/03`), plus the remaining
+console-owned surfaces: an append-only **audit log** (`ACT-04`), a per-service
+**Overview** of version + health (`PROJ-01`), a derived **Activity** feed
+(`ACT-03`), one-way-hashed console **API keys** (`PROJ-02`), a **Members** list
+(`PROJ-04`), and three labeled **gated pages** — Event streams (`PROJ-03`),
+Organizations (`ORG-01`), and SAML Sign-In (`AUTH-05`).
+
+### Caveats (read before relying on Phase-11 surfaces)
+
+- **The webhook dispatcher is the console's OWN dispatcher — NOT an Ory hook.**
+  Self-hosted Ory has no webhook/actions primitive, so the queue, signing, retry,
+  and delivery log all live in the backend's own `console` Postgres schema
+  (`webhooks` + `webhook_deliveries`). A boot-spawned worker claims due rows
+  (`FOR UPDATE SKIP LOCKED`), delivers them, and records the outcome.
+- **SSRF guard posture (the security headline, `HOOK-02`).** A webhook URL is
+  operator input crossing the highest-risk outbound trust boundary. The guard
+  **resolves the host and validates EVERY resolved IP** against a deny set
+  (loopback / RFC1918 private incl. the docker bridge / link-local incl.
+  `169.254.169.254` cloud metadata / ULA / CGNAT / benchmarking / IPv4-mapped-IPv6)
+  at **webhook create** (fast `422`) **and again, authoritatively, at delivery
+  time** (DNS-rebind defense). At delivery it **pins** the connection to the
+  just-validated addresses (`resolve_to_addrs`, closing the TOCTOU window) and
+  **following redirects is intentionally OFF** (`redirect(Policy::none())`) in v1 —
+  a `3xx` to an internal `Location` is never followed; it is recorded as a non-2xx
+  failure. A blocked target is an **explicit recorded failure**, never a silent
+  no-op. (The std `is_global`/`is_shared`/`is_benchmarking` classifiers are
+  nightly-only on the pinned stable Rust, so the guard is composed from stable
+  classifiers + a couple of manual octet ranges — see the SSRF module header.)
+- **The webhook signing secret is stored RECOVERABLE, the API key one-way hash.**
+  The per-webhook HMAC secret must be readable by the worker to **re-sign every
+  delivery**, so it is stored recoverably (column `secret`, never `secret_hash`).
+  It is **write-only over the API**: it is revealed exactly **once** in the
+  create/rotate response and never again — `GET`/list return only a `secret_set`
+  badge. By contrast, console **API keys are one-way SHA-256 hashed at rest**
+  (`PROJ-02`): the raw key is shown once on issue and is unrecoverable thereafter
+  (list shows a masked `prefix••••`; revoke flips the state to `Revoked`).
+- **Signature header.** Each delivery carries
+  `X-Console-Signature: sha256=<hex>` — `HMAC-SHA256(secret, raw_request_body)`.
+  A receiver verifies a delivery by recomputing the HMAC over the exact body bytes
+  with its copy of the secret. The delivery id is stable across retries so a
+  receiver can dedupe.
+- **Retry / backoff / dead-letter and retention (chosen v1 defaults, `HOOK-01/03`).**
+  A failed delivery retries with exponential backoff (**base 30 s × 2^attempt,
+  capped at 1 h**) and becomes terminal **`dead` at `max_attempts` (default 8)**.
+  Terminal rows (`delivered`/`dead`) are pruned after a **30-day** retention
+  window by an hourly maintenance task (which also reaps rows stuck `delivering`
+  past a crash). These are tunable defaults, not hard limits.
+- **The audit log is append-only and console-only.** A response-phase hoop on the
+  protected subtree records every state-changing console request (actor read from
+  the **session**, never client input; method; path; outcome). There is a
+  read-only list view and an age-based backend prune — and **deliberately no
+  create/update/delete-by-id route**. It records **console** actions only, not Ory
+  service events.
+- **Members and API keys are CONSOLE accounts/keys, not Ory primitives.** Members
+  lists the console operator accounts (mapped to a secret-free DTO — no
+  `password_hash` ever leaves Postgres); API keys are credentials for **this
+  backend**, not Ory credentials. To manage end users, use the Users pages.
+- **SAML / Organizations / Event-streams are clearly-labeled gated pages.** They
+  are static server components that render a labeled explanation + a CTA and make
+  **no backend call** (Organizations + SAML link out to the Ory docs; Event
+  streams links inward to the built-in Webhooks page). They are intentionally not
+  CRUD stubs.
+- **The acceptance echo receiver is test-only.** `docker-compose.yml` defines an
+  `echo-receiver` sidecar **behind the `acceptance` compose profile** and **only
+  on the internal network** (never host-published). A normal `docker compose up`
+  does **not** start it; it exists solely as the delivery success target for the
+  Phase-11 gate. That gate also sets a **double-gated, test-only**
+  `WEBHOOK_ALLOW_PRIVATE_TARGETS` so the worker can reach the internal (RFC1918)
+  echo — it is honored **only** together with `CONSOLE_INSECURE_COOKIES`, so it can
+  never relax the SSRF guard in production, and the pin + redirects-off hardening
+  applies regardless.
+
+### Verifying Phase 11 — Webhooks / Console / Gated (`HOOK-01/02/03` / `ACT-03/04` / `PROJ-01..04` / `ORG-01` / `AUTH-05`)
+
+A single fail-closed gate brings up the full stack **plus the internal echo
+sidecar** (the `acceptance` profile), proves every requirement end-to-end, and
+tears the stack down cleanly afterward (`docker compose --profile acceptance
+down -v` on exit):
+
+```bash
+docker compose --profile acceptance down -v
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase11-acceptance.sh   # Git Bash on Windows
+# (the gate does the full build -> up --wait -> drive -> down -v itself;
+#  pass KEEP_STACK=1 to keep the stack up for debugging)
+```
+
+The gate exits `0` only when:
+
+- **`HOOK-01/02/03` delivery + HMAC.** A webhook created against the internal echo
+  receiver delivers successfully (`status=delivered`, `last_status_code=200`), and
+  the gate **recomputes the HMAC-SHA256 over the exact stored payload bytes and
+  confirms it matches** the `X-Console-Signature` the receiver actually recorded —
+  a genuinely valid signature, not merely a present header.
+- **`HOOK-02` SSRF (anti-false-green).** Creating a webhook at `169.254.169.254`,
+  `127.0.0.1`, and an internal Ory admin `host:port` is each refused with an
+  explicit **`422`**; a delivery whose target is rebound to a metadata address at
+  delivery time is **blocked** — it never reaches `delivered`, the echo receiver
+  records **no hit** for it, and a `last_error` reason is recorded (never a silent
+  pass).
+- **`HOOK-01` backoff → dead.** A delivery to a failing target records a failure,
+  schedules a retry with `next_attempt_at` pushed into the future (exponential
+  backoff), and reaches the terminal **`dead`** state at `max_attempts` (observed
+  deterministically without waiting the full backoff).
+- **`PROJ-02`.** An API key is **issued** (raw shown once), **masked** on the list
+  (the raw never re-appears), and **revoked** (state → `Revoked`).
+- **`ACT-04`.** The state-changing webhook create is recorded in the **audit log**
+  with the authenticated admin as the actor and `outcome=success`.
+- **`PROJ-01` / `ACT-03` / `PROJ-04`.** `GET /api/overview` reports a version +
+  health for all four services; `GET /api/activity` returns a derived list
+  envelope (v1); `GET /api/console/members` lists ≥1 operator with **no
+  `password_hash`**.
+- **`PROJ-03` / `ORG-01` / `AUTH-05`.** Each gated page carries labeled
+  `GatedFeature` copy + a CTA and has **no CRUD form control and no backend call**.
+- **Negatives.** Unauthenticated reads/writes are refused `401`; authenticated
+  state changes without `X-CSRF-Token` are refused `403`; the webhook **secret is
+  never present** in any `GET`/list response; and the **bundle-egress** gate stays
+  clean. Every negative passes ONLY on the explicit refusal.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
