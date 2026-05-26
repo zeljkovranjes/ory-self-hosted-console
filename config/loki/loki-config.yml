@@ -28,7 +28,10 @@ common:
       rules_directory: /loki/rules
   replication_factor: 1
   ring:
-    kind: inmemory
+    # Loki 3.x ring uses `store` (not `kind`); inmemory is correct for single-binary.
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
 
 schema_config:
   configs:

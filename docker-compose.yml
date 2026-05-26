@@ -46,7 +46,12 @@ x-images:
   # [VERIFIED] against the registries 2026-05). They start ONLY under
   # `--profile observability`.
   prometheus-image: &prometheus-image prom/prometheus:v3.11.3
-  grafana-image: &grafana-image grafana/grafana:13.1.0
+  # Grafana: the plain `13.1.0` tag is NOT published on Docker Hub (only
+  # build-suffixed `13.1.0-<build>` variants + the explicit security-patched
+  # `13.0.1-security-01`). Per 16-RESEARCH's tag-pin discipline ("pick the highest
+  # PATCHED tag"), pin the security-patched stable tag — verified to resolve via
+  # `docker manifest inspect` at execution (A5 resolved).
+  grafana-image: &grafana-image grafana/grafana:13.0.1-security-01
   loki-image: &loki-image grafana/loki:3.7.2
   alloy-image: &alloy-image grafana/alloy:v1.16.1
 
@@ -805,7 +810,10 @@ services:
       GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       # Admin password from the secret FILE — NEVER the default admin/admin (T-16-03).
-      GF_SECURITY_ADMIN_PASSWORD: "$__file{/run/secrets/grafana_admin_password}"
+      # The `$$` escapes compose's own variable interpolation so Grafana receives
+      # the LITERAL `$__file{...}` directive (a single `$` would make compose try to
+      # expand a `__file` variable and pass an empty password).
+      GF_SECURITY_ADMIN_PASSWORD: "$$__file{/run/secrets/grafana_admin_password}"
       # Auth-proxy header auth: only the backend (which injects X-WEBAUTH-USER for
       # the authenticated console operator) can authenticate; the login form is
       # disabled so Grafana never terminates its own login (T-16-03).
