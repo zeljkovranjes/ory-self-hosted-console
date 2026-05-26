@@ -218,11 +218,31 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
     public = attach_github(public, &cfg);
 
     // PROTECTED subtree — the single auth chokepoint + per-session CSRF guard.
+    //
+    // Phase 11 (ACT-04): the audit hoop runs AFTER auth_guard + csrf_guard so the
+    // `Session` actor is already injected and the request has cleared auth/CSRF.
+    // It is a RESPONSE-PHASE hoop (`ctrl.call_next` first), so it wraps every
+    // downstream route handler and records each state-changing request's actor +
+    // method + path + outcome into the append-only console_audit_log (T-11-13/14).
+    // GET/HEAD/OPTIONS are not audited. The insert is best-effort and never blocks
+    // or fails the user-facing response.
     let protected = Router::new()
         .hoop(auth_guard)
         .hoop(csrf_guard)
+        .hoop(crate::audit::audit_hoop)
         .push(Router::with_path("logout").post(login::logout))
         .push(Router::with_path("api/console/me").get(state::me))
+        // Phase 11 (ACT-04 / PROJ-01 / ACT-03): console-OWNED read views. All
+        // inherit `auth_guard` (401 unauth) and are GET-only (csrf-exempt).
+        //   - audit: read-only, append-only log view (NO create/edit/delete route,
+        //     T-11-13). Written only by the response-phase audit hoop above.
+        //   - overview: version + health aggregation for all four services; an
+        //     unreachable service yields reachable:false, never a 500 (PROJ-01).
+        //   - activity: derived recent-activity (sessions + courier), no new
+        //     persistence (ACT-03 v1).
+        .push(Router::with_path("api/console/audit").get(crate::audit::routes::list_audit))
+        .push(Router::with_path("api/overview").get(crate::overview::get_overview))
+        .push(Router::with_path("api/activity").get(crate::activity::get_activity))
         // Phase 3 (BACK-02) Ory Admin proof wrappers. GET-only, so `csrf_guard`
         // auto-exempts them; they inherit `auth_guard` (401 when unauthenticated)
         // by sitting on this protected subtree. Thin pass-throughs to the typed
