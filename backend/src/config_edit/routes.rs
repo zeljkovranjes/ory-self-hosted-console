@@ -98,6 +98,72 @@ pub fn identity_schema_path(config_dir: &str) -> PathBuf {
         .join("identity.schema.json")
 }
 
+/// The server-defined path of the ACTIVE Keto OPL/namespaces FILE
+/// (`{config_dir}/keto/namespaces.ts`).
+///
+/// PERM-01: the permission-model editor targets THIS file only — it is NOT routed
+/// through the `{service}/{section}` allowlist, so it can never write an arbitrary
+/// `keto.yml` key (config-injection guard, threat T-9-path-traversal). The path is
+/// built purely from `Config::config_dir` + fixed segments; NO part is ever client
+/// input. The file is TypeScript-like OPL source, written RAW (never serialised as
+/// JSON/YAML — RESEARCH anti-pattern).
+pub fn opl_file_path(config_dir: &str) -> PathBuf {
+    PathBuf::from(config_dir).join("keto").join("namespaces.ts")
+}
+
+/// The server-defined path of the ACTIVE Oathkeeper access-rules FILE
+/// (`{config_dir}/oathkeeper/rules.json`).
+///
+/// OATH-01: the access-rules editor targets THIS file only — it is NOT routed
+/// through the `{service}/{section}` allowlist, so it can never write an arbitrary
+/// `config.yaml` key (config-injection guard, threat T-9-path-traversal). The path
+/// is built purely from `Config::config_dir` + fixed segments; NO part is ever
+/// client input. The file is a JSON ARRAY of rule objects, serialised with
+/// `serde_json::to_string_pretty` (same precedent as the identity schema `.json`).
+pub fn oathkeeper_rules_path(config_dir: &str) -> PathBuf {
+    PathBuf::from(config_dir)
+        .join("oathkeeper")
+        .join("rules.json")
+}
+
+/// Map a populated `CheckOplSyntaxResult.errors` list to an [`AppError::Validation`]
+/// (422), one [`schema::FieldError`] per parse error. Each message carries the
+/// Keto-reported `message` plus the `start` line/column when present, so the
+/// operator can locate the syntax error in the OPL source. The OPL SOURCE itself is
+/// never echoed (only Keto's own positional diagnostics).
+///
+/// Pulled out of the handler so the pre-save gate's short-circuit (a populated
+/// errors list MUST return BEFORE any backup/`write_atomic`) is unit-testable
+/// without a live `:4469` Keto or a router/filesystem (Pitfall 4 — bad OPL must
+/// never reach disk). Returns `Ok(())` for a clean parse (`errors` is `None`/empty).
+fn opl_errors_to_validation(
+    result: &ory_keto_client::models::CheckOplSyntaxResult,
+) -> Result<(), AppError> {
+    let Some(errors) = result.errors.as_ref().filter(|e| !e.is_empty()) else {
+        return Ok(());
+    };
+    let fields = errors
+        .iter()
+        .map(|e| {
+            let message = e.message.clone().unwrap_or_else(|| "OPL syntax error".into());
+            // Append the start line/column when Keto reported a position.
+            let located = match e.start.as_deref() {
+                Some(pos) => match (pos.line, pos.column) {
+                    (Some(line), Some(col)) => format!("{message} (line {line}, column {col})"),
+                    (Some(line), None) => format!("{message} (line {line})"),
+                    _ => message,
+                },
+                None => message,
+            };
+            schema::FieldError {
+                path: String::new(),
+                message: located,
+            }
+        })
+        .collect();
+    Err(AppError::Validation(fields))
+}
+
 /// Pull the `(service, section)` path params, mapping a missing/empty segment to
 /// 404 (an unrecognised route shape must not fall through).
 fn path_params(req: &Request) -> Result<(String, String), AppError> {
@@ -536,6 +602,148 @@ pub async fn put_identity_schema(
     // Restore the .bak, restart again, re-poll to bring it back onto the
     // last-known-good schema. The detail is never in the body.
     tracing::warn!(service = svc.key(), "identity-schema put: health failed; rolling back");
+    rollback_and_restart(&http, &path, &cfg, svc).await;
+    Err(AppError::HealthFailed)
+}
+
+/// Obtain the injected [`OryClients`] clone from the depot (mirrors keto.rs;
+/// the clone is taken BEFORE any `.await` so no `Depot` borrow is held across the
+/// `check_opl_syntax` call — 09-RESEARCH Pitfall 6).
+fn ory_clients_from(depot: &Depot) -> Result<crate::ory::clients::OryClients, AppError> {
+    depot
+        .obtain::<crate::ory::clients::OryClients>()
+        .cloned()
+        .map_err(|_| AppError::Internal("ory clients not injected".into()))
+}
+
+/// `GET /api/keto/permission-model` — return the current OPL/namespaces source as
+/// a raw string for the editor (PERM-01).
+///
+/// Reads the server-built [`opl_file_path`] and returns `{ "source": "…" }`. The
+/// file is TypeScript-like OPL text, returned VERBATIM (never parsed/serialised).
+/// On the protected subtree: `auth_guard` (401). GET is csrf-exempt.
+#[handler]
+pub async fn get_permission_model(
+    _req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    let cfg = config_from(depot)?;
+    let path = opl_file_path(&cfg.config_dir);
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| AppError::Internal(format!("read permission model: {e}")))?;
+    Ok(Json(serde_json::json!({ "source": source })))
+}
+
+/// `PUT /api/keto/permission-model` — pre-save OPL syntax-validate (`:4469`) +
+/// atomic-write the `namespaces.ts` FILE + restart Keto + rollback on failure
+/// (PERM-01).
+///
+/// This REUSES the Phase-4 engine's transactional machinery (lock -> validate ->
+/// backup -> atomic-write -> restart -> health-poll -> rollback) but differs from
+/// [`put_config`] / mirrors [`put_identity_schema`] in four ways:
+///   1. the target is the FIXED OPL file ([`opl_file_path`]), NOT a
+///      `{service}/{section}` allowlist lookup — the editor can only write the OPL
+///      file, never an arbitrary `keto.yml` key (T-9-path-traversal /
+///      T-9-section-bypass);
+///   2. the body is the OPL SOURCE as a raw string (`{ "source": "…" }`);
+///   3. validation is the **pre-save `check_opl_syntax` against `keto_opl`
+///      (`:4469`)** — a populated `CheckOplSyntaxResult.errors` is `AppError::
+///      Validation` (422) and NO file is written (Pitfall 4 / T-9-opl). The engine
+///      rollback is the backstop for a syntactically-valid-but-bad model, not the
+///      primary guard;
+///   4. the file is TypeScript-like OPL text, so it is written RAW via
+///      `yaml::write_atomic` — NEVER `serde_json::to_string_pretty`, NEVER
+///      `yaml::serialize` (RESEARCH anti-pattern).
+///
+/// Restarts `Service::Keto` ONLY (T-9-restart-scope). On the protected subtree:
+/// `auth_guard` (401) + `csrf_guard` (403 without `X-CSRF-Token`, state-changing —
+/// T-9-csrf-file).
+#[handler]
+pub async fn put_permission_model(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Value>, AppError> {
+    #[derive(serde::Deserialize)]
+    struct ModelBody {
+        source: String,
+    }
+
+    let cfg = config_from(depot)?;
+    let svc = restart::Service::Keto;
+
+    // Obtain the OPL client clone BEFORE the lock / any await (Pitfall 6).
+    let clients = ory_clients_from(depot)?;
+
+    // Parse the body as the raw OPL source (malformed -> 400 before the lock).
+    let body: ModelBody = req
+        .parse_json()
+        .await
+        .map_err(|_| AppError::BadRequest("invalid JSON body".into()))?;
+    let source = body.source;
+
+    // --- Step 1: keto write lock (busy -> 409 config_busy) -------------------
+    // Shares the per-service lock with put_config so an OPL edit and a keto config
+    // edit can never interleave.
+    let _guard = locks::try_acquire("keto").await?;
+    tracing::info!(service = svc.key(), "permission-model put: lock acquired");
+
+    // --- Step 2: PRE-SAVE OPL SYNTAX VALIDATE on :4469 -----------------------
+    // T-9-opl / Pitfall 4: a populated CheckOplSyntaxResult.errors short-circuits
+    // here with 422 — BEFORE any backup or atomic write, so a syntactically-bad
+    // model NEVER reaches disk. A :4469 upstream failure maps to Upstream(502).
+    let result = ory_keto_client::apis::relationship_api::check_opl_syntax(
+        &clients.keto_opl,
+        Some(&source),
+    )
+    .await
+    .map_err(crate::ory::error::map_keto_err)?;
+    opl_errors_to_validation(&result)?;
+    tracing::info!(service = svc.key(), "permission-model put: OPL syntax clean");
+
+    // --- Step 3: BACKUP the live OPL file (last-known-good) ------------------
+    let path = opl_file_path(&cfg.config_dir);
+    yaml::backup(&path)?;
+
+    // WR-02: never commit a write we cannot reverse. Assert the backup landed
+    // BEFORE the atomic write so every rollback path has a last-known-good.
+    if !yaml::backup_exists(&path) {
+        tracing::error!(
+            service = svc.key(),
+            "permission-model put: backup missing after backup(); refusing reversible write"
+        );
+        return Err(AppError::Internal("permission model backup missing".into()));
+    }
+
+    // --- Step 4: ATOMIC WRITE the RAW OPL source (NOT JSON, NOT YAML) --------
+    // namespaces.ts is TypeScript-like OPL text consumed by Keto verbatim —
+    // write the editor's raw string (RESEARCH anti-pattern: never JSON/YAML it).
+    yaml::write_atomic(&path, &source)?;
+    tracing::info!(service = svc.key(), status = "applied", "permission-model put: written");
+
+    // --- Step 5: RESTART keto via the scoped broker -------------------------
+    let http = restart::restart_client()?;
+    tracing::info!(service = svc.key(), status = "restarting", "permission-model put: restarting");
+    if let Err(e) = restart::restart(&http, &cfg.restart_broker_url, svc).await {
+        // BROKER-FAILURE: keto never restarted, so it still runs its old (good)
+        // model; restore disk only so disk matches the running service.
+        tracing::warn!(
+            service = svc.key(),
+            "permission-model put: broker restart failed; restoring disk (no re-restart)"
+        );
+        restore_only(&path, svc);
+        return Err(e);
+    }
+
+    // --- Step 6: HEALTH-POLL until ready or timeout --------------------------
+    if restart::wait_healthy(&http, svc, HEALTH_TIMEOUT, None).await {
+        tracing::info!(service = svc.key(), status = "healthy", "permission-model put: healthy");
+        return Ok(Json(serde_json::json!({ "status": "healthy" })));
+    }
+
+    // --- Step 7: ROLLBACK on health failure ----------------------------------
+    // HEALTH-FAILURE: keto restarted into a model it cannot load. Restore the
+    // .bak, restart again, re-poll to bring it back onto the last-known-good.
+    tracing::warn!(service = svc.key(), "permission-model put: health failed; rolling back");
     rollback_and_restart(&http, &path, &cfg, svc).await;
     Err(AppError::HealthFailed)
 }
@@ -1284,6 +1492,62 @@ mod tests {
                 assert!(fields[0].message.contains("g00gle"));
                 assert!(fields[0].message.contains("re-enter the secret"));
                 assert!(!fields[0].message.contains(secret_merge::MASKED));
+            }
+            other => panic!("expected Validation 422, got {other:?}"),
+        }
+    }
+
+    // ─── 09-02 Task 1: PERM-01 OPL pre-save gate + path helper ───
+
+    #[test]
+    fn opl_and_rules_paths_are_server_defined() {
+        // Both dedicated-file paths are built ENTIRELY from config_dir + fixed
+        // segments — no client input can enter them (T-9-path-traversal).
+        assert!(opl_file_path("/etc/config").ends_with("keto/namespaces.ts"));
+        assert!(oathkeeper_rules_path("/etc/config").ends_with("oathkeeper/rules.json"));
+    }
+
+    #[test]
+    fn opl_clean_parse_does_not_short_circuit() {
+        use ory_keto_client::models::CheckOplSyntaxResult;
+        // A clean parse (errors None) and an empty-errors result both return Ok —
+        // the handler then proceeds to backup/write.
+        let none = CheckOplSyntaxResult { errors: None };
+        assert!(opl_errors_to_validation(&none).is_ok());
+        let empty = CheckOplSyntaxResult {
+            errors: Some(vec![]),
+        };
+        assert!(opl_errors_to_validation(&empty).is_ok());
+    }
+
+    #[test]
+    fn opl_populated_errors_short_circuit_before_any_write() {
+        use ory_keto_client::models::{CheckOplSyntaxResult, ParseError, SourcePosition};
+        // Pitfall 4 / T-9-opl: a populated CheckOplSyntaxResult.errors MUST map to
+        // a 422 Validation. The handler calls this helper with `?` immediately
+        // after check_opl_syntax and BEFORE yaml::backup / yaml::write_atomic, so a
+        // populated list can never reach disk (the gate ORDERING guarantee).
+        let result = CheckOplSyntaxResult {
+            errors: Some(vec![ParseError {
+                message: Some("expected '{'".into()),
+                start: Some(Box::new(SourcePosition {
+                    line: Some(7),
+                    column: Some(3),
+                })),
+                end: None,
+            }]),
+        };
+        let err = opl_errors_to_validation(&result)
+            .expect_err("populated OPL errors must 422 (no write)");
+        assert_eq!(err.machine_code(), "validation_failed");
+        match err {
+            AppError::Validation(fields) => {
+                assert_eq!(fields.len(), 1);
+                // The message carries Keto's diagnostic + the reported position so
+                // the operator can locate it; the OPL source itself is never echoed.
+                assert!(fields[0].message.contains("expected '{'"));
+                assert!(fields[0].message.contains("line 7"));
+                assert!(fields[0].message.contains("column 3"));
             }
             other => panic!("expected Validation 422, got {other:?}"),
         }
