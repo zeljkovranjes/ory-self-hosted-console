@@ -5,6 +5,7 @@
 //! exercise the real router/handlers with Salvo `TestClient`.
 
 pub mod activity;
+pub mod apikeys;
 pub mod audit;
 pub mod auth;
 pub mod branding;
@@ -12,6 +13,7 @@ pub mod config;
 pub mod config_edit;
 pub mod db;
 pub mod error;
+pub mod members;
 pub mod overview;
 pub mod ory;
 pub mod routes;

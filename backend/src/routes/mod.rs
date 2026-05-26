@@ -243,6 +243,25 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
         .push(Router::with_path("api/console/audit").get(crate::audit::routes::list_audit))
         .push(Router::with_path("api/overview").get(crate::overview::get_overview))
         .push(Router::with_path("api/activity").get(crate::activity::get_activity))
+        // Phase 11 (PROJ-02 / PROJ-04): console API keys + members. API keys are
+        // ONE-WAY SHA-256 hashed at rest (raw shown once on issue, masked on list,
+        // revoke flips revoked_at) — the INVERSE of the recoverable webhook secret
+        // (T-11-11). Members lists console operator accounts mapped to a secret-
+        // free DTO (no password_hash, T-11-12); multiple operators permitted (the
+        // single-admin guard was dropped in 11-01). Issue/revoke are state changes
+        // (csrf_guard 403, T-11-17); list + members are GET (csrf-exempt). The
+        // most-specific `{id}/revoke` path is mounted FIRST so it is not captured
+        // by the broader `api-keys` match.
+        .push(
+            Router::with_path("api/console/api-keys/{id}/revoke")
+                .post(crate::apikeys::routes::revoke_api_key), // PROJ-02 revoke (CSRF-guarded)
+        )
+        .push(
+            Router::with_path("api/console/api-keys")
+                .get(crate::apikeys::routes::list_api_keys) // PROJ-02 list (masked)
+                .post(crate::apikeys::routes::issue_api_key), // PROJ-02 issue (one-time reveal)
+        )
+        .push(Router::with_path("api/console/members").get(crate::members::list_members))
         // Phase 3 (BACK-02) Ory Admin proof wrappers. GET-only, so `csrf_guard`
         // auto-exempts them; they inherit `auth_guard` (401 when unauthenticated)
         // by sitting on this protected subtree. Thin pass-throughs to the typed

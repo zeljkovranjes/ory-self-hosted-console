@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO admins (email, name, password_hash, github_user_id)\n        VALUES ($1, $2, NULL, $3)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "citext",
+            "kind": "Simple"
+          }
+        },
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "75fa6c1f81406d210f13131400a682ddee95dd01ca2a840541d2f6a8ac3442ee"
+}
