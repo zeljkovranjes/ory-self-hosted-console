@@ -377,6 +377,11 @@ services:
       HYDRA_PUBLIC_URL: http://hydra:4444
       KETO_READ_URL: http://keto:4466
       KETO_WRITE_URL: http://keto:4467
+      # PERM-01: Keto serves its OPL syntax-check API on a THIRD port (:4469),
+      # distinct from read (:4466) and write (:4467). Used by the Permission-Model
+      # editor's pre-save validate. Already reachable internally (the Keto
+      # healthcheck + Phase-4 health-poll hit :4469); no new published port.
+      KETO_OPL_URL: http://keto:4469
       OATHKEEPER_API_URL: http://oathkeeper:4456
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}

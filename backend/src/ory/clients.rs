@@ -55,6 +55,13 @@ pub struct OryClients {
     pub keto_read: KetoCfg,
     /// Keto WRITE API (`KETO_WRITE_URL`, default `http://keto:4467`).
     pub keto_write: KetoCfg,
+    /// NET-NEW (PERM-01): Keto OPL Syntax API (`KETO_OPL_URL`, default
+    /// `http://keto:4469`). Keto serves OPL syntax checking on a THIRD port,
+    /// distinct from read (`:4466`) and write (`:4467`). Serves
+    /// `POST /opl/syntax/check` — used ONLY by `check_opl_syntax` for the
+    /// Permission-Model editor's pre-save validate. A relation-tuple READ or WRITE
+    /// MUST NEVER use this client.
+    pub keto_opl: KetoCfg,
     /// Oathkeeper API (`OATHKEEPER_API_URL`, default `http://oathkeeper:4456`).
     pub oathkeeper: OathCfg,
 }
@@ -110,14 +117,15 @@ impl OryClients {
     pub fn from_config(cfg: &Config) -> Result<Self, AppError> {
         // WR-03 + WR-01: fail fast on a malformed admin/public URL. Validate from
         // a single iterated list so the count can never drift from the docs (the
-        // SIX admin/public URLs — Kratos, Hydra admin, Hydra public, Keto read,
-        // Keto write, Oathkeeper).
+        // SEVEN admin/public URLs — Kratos, Hydra admin, Hydra public, Keto read,
+        // Keto write, Keto OPL [PERM-01], Oathkeeper).
         for (env_key, value) in [
             ("KRATOS_ADMIN_URL", &cfg.kratos_admin_url),
             ("HYDRA_ADMIN_URL", &cfg.hydra_admin_url),
             ("HYDRA_PUBLIC_URL", &cfg.hydra_public_url),
             ("KETO_READ_URL", &cfg.keto_read_url),
             ("KETO_WRITE_URL", &cfg.keto_write_url),
+            ("KETO_OPL_URL", &cfg.keto_opl_url),
             ("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url),
         ] {
             validate_admin_url(env_key, value)?;
@@ -157,6 +165,11 @@ impl OryClients {
                 client: http.clone(),
                 ..KetoCfg::new()
             },
+            keto_opl: KetoCfg {
+                base_path: cfg.keto_opl_url.clone(),
+                client: http.clone(),
+                ..KetoCfg::new()
+            },
             oathkeeper: OathCfg {
                 base_path: cfg.oathkeeper_api_url.clone(),
                 client: http,
@@ -184,6 +197,17 @@ mod tests {
     fn rejects_empty() {
         assert!(matches!(
             validate_admin_url("KETO_READ_URL", ""),
+            Err(AppError::Config(_))
+        ));
+    }
+
+    /// PERM-01: a malformed/empty `KETO_OPL_URL` is rejected at boot exactly like
+    /// the other admin URLs, so the new third Keto port fails fast rather than
+    /// degrading to opaque per-request 502s on OPL validate.
+    #[test]
+    fn rejects_empty_keto_opl_url() {
+        assert!(matches!(
+            validate_admin_url("KETO_OPL_URL", ""),
             Err(AppError::Config(_))
         ));
     }

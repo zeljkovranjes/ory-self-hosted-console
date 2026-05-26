@@ -34,6 +34,11 @@ const DEFAULT_HYDRA_ADMIN_URL: &str = "http://hydra:4445";
 const DEFAULT_HYDRA_PUBLIC_URL: &str = "http://hydra:4444";
 const DEFAULT_KETO_READ_URL: &str = "http://keto:4466";
 const DEFAULT_KETO_WRITE_URL: &str = "http://keto:4467";
+/// Keto OPL Syntax base URL (env `KETO_OPL_URL`, default `http://keto:4469`).
+/// PERM-01: Keto serves its OPL syntax-check API (`POST /opl/syntax/check`) on a
+/// THIRD port distinct from read (`:4466`) and write (`:4467`). Internal network
+/// only; never host-published (INFRA-05).
+const DEFAULT_KETO_OPL_URL: &str = "http://keto:4469";
 const DEFAULT_OATHKEEPER_API_URL: &str = "http://oathkeeper:4456";
 
 /// Internal-network default for the Phase-1 restart broker (`wollomatic`
@@ -112,6 +117,11 @@ pub struct Config {
     pub keto_read_url: String,
     /// Keto WRITE base URL (env `KETO_WRITE_URL`, default `http://keto:4467`).
     pub keto_write_url: String,
+    /// Keto OPL Syntax base URL (env `KETO_OPL_URL`, default `http://keto:4469`).
+    /// PERM-01: the dedicated OPL server serving `POST /opl/syntax/check`, used by
+    /// the Permission-Model editor's pre-save validate. A THIRD port distinct from
+    /// read/write.
+    pub keto_opl_url: String,
     /// Oathkeeper API base URL (env `OATHKEEPER_API_URL`, default `http://oathkeeper:4456`).
     pub oathkeeper_api_url: String,
 
@@ -144,6 +154,7 @@ impl fmt::Debug for Config {
             .field("hydra_public_url", &self.hydra_public_url)
             .field("keto_read_url", &self.keto_read_url)
             .field("keto_write_url", &self.keto_write_url)
+            .field("keto_opl_url", &self.keto_opl_url)
             .field("oathkeeper_api_url", &self.oathkeeper_api_url)
             // Config-edit subsystem URLs/paths are non-secret: print in cleartext.
             .field("restart_broker_url", &self.restart_broker_url)
@@ -233,6 +244,8 @@ impl Config {
             env::var("KETO_READ_URL").unwrap_or_else(|_| DEFAULT_KETO_READ_URL.to_string());
         let keto_write_url =
             env::var("KETO_WRITE_URL").unwrap_or_else(|_| DEFAULT_KETO_WRITE_URL.to_string());
+        let keto_opl_url =
+            env::var("KETO_OPL_URL").unwrap_or_else(|_| DEFAULT_KETO_OPL_URL.to_string());
         let oathkeeper_api_url = env::var("OATHKEEPER_API_URL")
             .unwrap_or_else(|_| DEFAULT_OATHKEEPER_API_URL.to_string());
 
@@ -257,6 +270,7 @@ impl Config {
             hydra_public_url,
             keto_read_url,
             keto_write_url,
+            keto_opl_url,
             oathkeeper_api_url,
             restart_broker_url,
             config_dir,
@@ -400,5 +414,37 @@ mod tests {
         let cfg = with_session_env(None, None).expect("defaults are valid");
         assert_eq!(cfg.session_idle_secs, DEFAULT_SESSION_IDLE_SECS);
         assert_eq!(cfg.session_absolute_secs, DEFAULT_SESSION_ABSOLUTE_SECS);
+    }
+
+    /// PERM-01: with `KETO_OPL_URL` unset, `from_env` falls back to the internal
+    /// default `http://keto:4469`; with it set, the value is honored. Mirrors the
+    /// read/write env-default contract for the new third Keto port.
+    #[test]
+    fn keto_opl_url_defaults_then_honors_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dsn = env::var("DATABASE_URL").ok();
+        let prev_opl = env::var("KETO_OPL_URL").ok();
+
+        env::set_var("DATABASE_URL", "postgres://u:p@localhost/console");
+
+        // Unset -> default.
+        env::remove_var("KETO_OPL_URL");
+        let cfg = Config::from_env().expect("defaults are valid");
+        assert_eq!(cfg.keto_opl_url, DEFAULT_KETO_OPL_URL);
+
+        // Set -> honored.
+        env::set_var("KETO_OPL_URL", "http://keto-opl.internal:4469");
+        let cfg = Config::from_env().expect("explicit opl url is valid");
+        assert_eq!(cfg.keto_opl_url, "http://keto-opl.internal:4469");
+
+        // Restore.
+        match prev_dsn {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match prev_opl {
+            Some(v) => env::set_var("KETO_OPL_URL", v),
+            None => env::remove_var("KETO_OPL_URL"),
+        }
     }
 }
