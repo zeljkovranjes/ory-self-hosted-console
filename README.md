@@ -1056,6 +1056,129 @@ The gate exits `0` only when:
 
 ---
 
+## Ory Polis — SAML bridge (Phase 13)
+
+[Ory Polis](https://www.ory.sh/docs/polis) is the SAML→OAuth2/OIDC bridge that
+lets the stack accept enterprise SAML identity providers and present them to
+Kratos as a single OIDC provider. It runs as the `polis` compose service and is
+managed entirely through the backend — the frontend never talks to it directly.
+
+### Image pin — `boxyhq/jackson:26.2.0` (and the `ory/polis` 404 caveat)
+
+Ory Polis **is** BoxyHQ Jackson, re-versioned into the Ory `v26.2.0` line. At the
+time this was wired (2026-05-26) the **`ory/polis` Docker Hub repository returns
+404** and `ghcr.io/ory/polis:v26.2.0` denied anonymous auth, so the service is
+pinned to the registry-pullable, manifest-verified **`boxyhq/jackson:26.2.0`**
+(no `:latest`, per `INFRA-04`). **Re-verify the canonical image at deploy time** —
+if Ory later publishes `ory/polis` under the `v26.2.0` line, prefer it and keep
+the tag in lockstep with the other Ory images.
+
+### ENV-configured (NOT YAML) — a dedicated settings writer
+
+Unlike Kratos/Hydra/Keto/Oathkeeper, **Polis has no mounted JSON-Schema'd YAML**;
+it is configured purely through environment variables. The console therefore edits
+it with a **dedicated `KEY=value` settings writer** (`/api/config/polis`, persisting
+to `config/polis/settings.env`), **not** the Phase-4 `{service}/{section}` YAML
+schema engine. Only a small, fixed allowlist of **non-secret** keys is editable
+(`LOG_LEVEL`, `OPENID_REDIRECT_EXACT_MATCH`, telemetry toggles); a valid edit
+restarts **only** the `polis` container and rolls back on a failed health probe.
+The `/api/config/polis` route is gated behind the `saml` **feature flag** (seeded
+OFF) — it server-side `404`s until an operator enables `saml`.
+
+### Single public issuer — split-horizon (Pattern A)
+
+Polis derives **every** OIDC discovery / OAuth endpoint from one base, `EXTERNAL_URL`.
+That single public issuer URL **must be reachable identically by the browser AND by
+Kratos server-side** (split-horizon, Pattern A) — set it to your public edge origin
+(e.g. `https://sso.example.com`), reachable on both the user's browser and the
+internal network. **The exact Kratos→issuer egress wiring (and the SAML provider
+entry) lands in Phase 14**; Phase 13 ships the running, console-configurable bridge.
+
+### Write-only, IMMUTABLE-after-first-boot secrets
+
+`DB_ENCRYPTION_KEY` and `OPENID_RSA_PRIVATE_KEY` (with its matching public key) are
+**deploy-time secrets the console can never mint, read back, or rotate** (`BACK-07`).
+They are write-only: the settings writer **explicitly refuses** any PUT touching a
+secret key (`403`), and a GET never reads them into a returnable value. They are
+**IMMUTABLE after first boot** — rotating `DB_ENCRYPTION_KEY` strands every encrypted
+connection row, and rotating the RSA private key invalidates every already-issued
+token. Generate them once, set them in `.env`, and never change them:
+
+```bash
+# 32-byte base64 secrets:
+openssl rand -base64 32   # -> POLIS_DB_ENCRYPTION_KEY  (immutable!)
+openssl rand -base64 32   # -> POLIS_NEXTAUTH_SECRET
+openssl rand -base64 32   # -> POLIS_API_KEY (or a strong token)
+# RS256 keypair, base64-encoded onto single env lines (private key immutable!):
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out polis.key
+openssl pkey -in polis.key -pubout -out polis.pub
+base64 -w0 polis.key   # -> POLIS_OPENID_RSA_PRIVATE_KEY
+base64 -w0 polis.pub   # -> POLIS_OPENID_RSA_PUBLIC_KEY
+```
+
+### Internal-only admin/OIDC port (`INFRA-05`)
+
+Polis serves its admin **and** OIDC surface on port **`5225`, which is never
+host-published** — there is no `ports:` entry on the `polis` service. The backend
+is the **sole** admin client (it reaches `http://polis:5225` over the `internal`
+network using `Authorization: Api-Key`); browsers reach the *issuer* only via your
+operator edge proxy. The service is **dual-homed** (`internal` + `edge`): `internal`
+so Kratos and the backend can reach it, `edge` so the public issuer is routable.
+
+### Fresh-volume requirement (Pitfall 2)
+
+The `polis` logical Postgres database + least-privilege role are created by
+`db/init/01-init.sql` **only on a fresh-volume first boot**. If you add Polis to a
+stack that already has a populated Postgres volume, the init script does **not**
+re-run and Polis will fail to connect. Bring the new service up on a fresh volume:
+
+```bash
+docker compose down -v && docker compose up -d --wait
+```
+
+(This is the standard `db/init` first-boot caveat — see the Quick-start fresh-volume
+note above.)
+
+### Verifying Phase 13 — Ory Polis (`SSO-01`)
+
+A single fail-closed gate brings up the full stack **incl. Polis on a fresh volume**,
+proves `SSO-01` end to end, **re-runs the three v1 invariants** (INFRA-05 / BACK-05 /
+BACK-01) with Polis present, and tears the stack down cleanly afterward:
+
+```bash
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase13-acceptance.sh   # Git Bash on Windows
+# (the gate does the full build -> up --wait -> drive -> down -v itself, and
+#  GENERATES throwaway Polis secrets for its ephemeral run; pass KEEP_STACK=1 to
+#  keep the stack up for debugging)
+```
+
+The gate exits `0` only when:
+
+- **Polis healthy.** The `polis` container reaches Docker `healthy` on a fresh
+  `docker compose up --wait`.
+- **`INFRA-05`.** Port `5225` is **not host-published** (`docker inspect` shows no
+  host binding AND a host connect to `:5225` is **refused**), while it remains
+  reachable internally from the trusted backend container.
+- **`BACK-05`.** The running restart-broker **allows** a scoped `polis` restart but
+  **denies** list / stop / other-container restarts; the backend (and `polis`) hold
+  **no** Docker socket.
+- **Dual-homed.** `polis` is attached to **both** the `internal` and `edge` networks.
+- **`saml` gate.** With a valid session + CSRF, `GET`/`PUT /api/config/polis` returns
+  **`404`** while `saml` is OFF, and is **reachable** (`200`) once `saml` is flipped
+  ON; a write-only **secret** key on `PUT` is refused **`403`**. `saml` is restored
+  to its seeded default (OFF) at the end and the gate re-closes.
+- **Polis-only restart.** A valid non-secret `PUT /api/config/polis` restarts **only**
+  the `polis` container (every other container's `StartedAt` is unchanged) and the
+  edit round-trips on a re-GET.
+- **v1 invariants.** INFRA-05 (Ory admin ports), BACK-05 (broker scope), and BACK-01
+  (bundle-egress: no Ory/Polis host/port/SDK in the built bundle) all re-run green.
+
+Every negative passes ONLY on the explicit refusal (anti-false-green). The
+cross-network issuer-reachability check is an **advisory echo** this phase (Phase 14
+wires the Kratos egress).
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
