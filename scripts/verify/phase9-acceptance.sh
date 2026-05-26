@@ -54,10 +54,11 @@
 #   UP_TIMEOUT=1500  seconds to allow `docker compose up -d --wait` (default 1500
 #                    = 25min — the frontend image build + boot is heavy)
 #
-# STATUS: Wave-0 SCAFFOLD. The lifecycle + auth + helper wiring below is the live
-# harness cloned from phase8-acceptance.sh; the phase-9-specific assertion BODY is
-# a clearly-marked `# TODO(09-04): fill assertions` placeholder. Plan 09-04 owns
-# the full gate. The scaffold MUST stay `bash -n` clean and source lib.sh.
+# STATUS: FULL LIVE GATE (owned by 09-04). The lifecycle + auth + helper wiring
+# is the live harness derived from phase8-acceptance.sh; the phase-9-specific
+# assertion body below implements the complete PERM-01/02/03 + OATH-01 + negatives
+# gate (no TODO placeholder remains). The script stays `bash -n` clean and sources
+# lib.sh.
 # -----------------------------------------------------------------------------
 set -u
 
