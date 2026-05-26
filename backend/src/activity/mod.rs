@@ -11,6 +11,18 @@
 //! Ory has no `events_api` (that lives only in the Network `ory-client`), so a
 //! true activity feed would require backend event capture. v1 derives what it
 //! can from sessions + courier without persisting anything.
+//!
+//! # OBS-03 supersession (Phase 16)
+//!
+//! When the `observability` profile + flag are ON, the LIVE Activity surface is
+//! the Prometheus-backed series at `GET /api/console/metrics/activity`
+//! (`observability::prometheus::get_metrics_activity`) — real login/sign-up rates
+//! and latency from the scraped metrics, profile-health-probed (FLAG-04). This
+//! derived `GET /api/activity` route is RETAINED UNFLAGGED as the documented v1
+//! fallback so the existing Project→Activity page keeps working when the
+//! observability profile is OFF (it is not silently broken). The two are distinct
+//! routes: `/api/activity` (derived, always available) vs
+//! `/api/console/metrics/activity` (Prometheus-backed, observability-gated).
 
 use ory_kratos_client::apis::{courier_api, identity_api};
 use salvo::prelude::*;

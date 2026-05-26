@@ -372,6 +372,50 @@ pub fn build(
         .push(Router::with_path("api/console/audit").get(crate::audit::routes::list_audit))
         .push(Router::with_path("api/overview").get(crate::overview::get_overview))
         .push(Router::with_path("api/activity").get(crate::activity::get_activity))
+        // Phase 16 (OBS-03/04/05): the observability console surfaces. All three
+        // are mounted INSIDE the protected subtree (AFTER the audit/auth/csrf
+        // hoops) and GATED by `FeatureFlagHoop::new("observability")` (seeded
+        // OFF), so a flag-OFF request 404s even with a valid session + matching
+        // CSRF token (FLAG-01 / T-16-12). Each handler is probe-FIRST: flag-ON +
+        // profile-DOWN returns a structured `profile_not_running` 200 payload,
+        // NEVER a raw 502 (FLAG-04 / T-16-08).
+        //
+        //   - metrics/activity (OBS-03): the Prometheus-backed Activity series
+        //     (login/sign-up rate, latency) via a CLOSED PromQL intent set — no
+        //     raw operator query passthrough (T-16-09). A NEW path distinct from
+        //     the derived `/api/activity` above, which is retained UNFLAGGED as
+        //     the v1 fallback so the existing Project→Activity page is never
+        //     silently broken when observability is OFF.
+        //   - logs (OBS-04): the Loki-backed log search via a CLOSED LogQL intent
+        //     set (Alloy-PII-masked, low-cardinality lines).
+        //   - grafana/{**path} (OBS-05): the authenticated reverse-proxy to the
+        //     FIXED internal Grafana origin, injecting X-WEBAUTH-USER from the
+        //     Depot Session and stripping any client-supplied X-WEBAUTH-* header
+        //     (T-16-10); the wildcard path is normalized + traversal-rejected so
+        //     it cannot escape the Grafana origin (T-16-11). Grafana is reachable
+        //     ONLY through this route — never host-published (BACK-01 / INFRA-05).
+        //     All five methods are wired (GET/POST/PUT/PATCH/DELETE): the
+        //     csrf_guard auto-exempts GET/HEAD and enforces X-CSRF-Token on the
+        //     mutating verbs (403); auth_guard enforces 401.
+        .push(
+            Router::with_path("api/console/metrics/activity")
+                .hoop(crate::features::FeatureFlagHoop::new("observability"))
+                .get(crate::observability::get_metrics_activity), // OBS-03 (read-only)
+        )
+        .push(
+            Router::with_path("api/console/logs")
+                .hoop(crate::features::FeatureFlagHoop::new("observability"))
+                .get(crate::observability::get_logs), // OBS-04 (read-only)
+        )
+        .push(
+            Router::with_path("api/console/grafana/{**path}")
+                .hoop(crate::features::FeatureFlagHoop::new("observability"))
+                .get(crate::observability::grafana_proxy_handler)
+                .post(crate::observability::grafana_proxy_handler)
+                .put(crate::observability::grafana_proxy_handler)
+                .patch(crate::observability::grafana_proxy_handler)
+                .delete(crate::observability::grafana_proxy_handler), // OBS-05 authed proxy
+        )
         // Phase 11 (PROJ-02 / PROJ-04): console API keys + members. API keys are
         // ONE-WAY SHA-256 hashed at rest (raw shown once on issue, masked on list,
         // revoke flips revoked_at) — the INVERSE of the recoverable webhook secret
