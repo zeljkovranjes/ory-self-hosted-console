@@ -12,8 +12,14 @@
 //!
 //! ## Upload hardening (STRIDE register, 10-03 PLAN)
 //!
-//! - **T-10-10 DoS:** the multipart `FilePart.size()` is checked against
-//!   [`MAX_LOGO_BYTES`] BEFORE the file bytes are read.
+//! - **T-10-10 DoS:** Salvo spools each multipart part to a temp FILE before the
+//!   handler runs, so the on-disk part is the authoritative size. The upload
+//!   handler checks the declared `FilePart.size()` AND the spooled file's actual
+//!   on-disk length (`fs::metadata().len()`) against [`MAX_LOGO_BYTES`] BEFORE it
+//!   `fs::read`s the file into RAM — an oversized part is never fully buffered in
+//!   memory. The authoritative request-body bound is the Salvo body/`max_size`
+//!   limit; these per-part checks are the in-handler defense-in-depth on top of
+//!   it, and the post-read `bytes.len()` re-check is a final belt-and-braces.
 //! - **T-10-upload spoofing:** the image kind is decided by a hand-rolled
 //!   MAGIC-BYTE sniff of the temp-file bytes ([`sniff_image`]), NEVER by the
 //!   spoofable `Content-Type` header.
@@ -114,10 +120,19 @@ pub fn sniff_image(bytes: &[u8]) -> Option<ImageKind> {
 }
 
 /// SVG content sniff: strip an optional UTF-8 BOM and leading ASCII whitespace,
-/// then require the document to be a `<svg` element (optionally preceded by an
-/// `<?xml …?>` declaration or an `<!DOCTYPE …>`/comment). We scan a bounded
+/// then require the document to be a benign `<svg` element (optionally preceded
+/// by a bare `<?xml …?>` declaration or an XML comment). We scan a bounded
 /// prefix and look for the `<svg` tag near the start so a text file that merely
 /// mentions "svg" somewhere deep is not accepted.
+///
+/// WR-02 (XXE-shaped acceptance): the accept gate's job is to admit *images*,
+/// not arbitrary attacker-authored XML. A document carrying a `<!DOCTYPE …>` or
+/// `<!ENTITY …>` declaration is REJECTED outright — those are the lead-in for
+/// external-entity / billion-laughs / `file://` resolution that some renderers
+/// honour even when the served document is sandboxed. The serve path still pins
+/// `Content-Type: image/svg+xml` + `Content-Security-Policy: sandbox` as the
+/// script-execution backstop, but we refuse to PERSIST a DOCTYPE/entity document
+/// as a first-class branding asset in the first place.
 fn sniff_svg(bytes: &[u8]) -> bool {
     // Strip a UTF-8 BOM.
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
@@ -129,12 +144,19 @@ fn sniff_svg(bytes: &[u8]) -> bool {
     };
     let trimmed = text.trim_start();
     let lower = trimmed.to_ascii_lowercase();
+    // WR-02: reject XXE-shaped documents. A DOCTYPE or ENTITY declaration anywhere
+    // in the bounded prefix disqualifies the upload — a benign SVG image needs
+    // neither. Checked BEFORE any accept branch so a `<?xml?>`/comment lead-in
+    // cannot smuggle a DOCTYPE past the gate.
+    if lower.contains("<!doctype") || lower.contains("<!entity") {
+        return false;
+    }
     if lower.starts_with("<svg") {
         return true;
     }
-    // Allow a leading XML declaration / doctype / comment, then require <svg to
-    // appear in the bounded prefix.
-    if lower.starts_with("<?xml") || lower.starts_with("<!doctype") || lower.starts_with("<!--") {
+    // Allow only a bare XML declaration / comment lead-in (NO doctype), then
+    // require <svg to appear in the bounded prefix.
+    if lower.starts_with("<?xml") || lower.starts_with("<!--") {
         return lower.contains("<svg");
     }
     false
@@ -247,7 +269,11 @@ fn write_bytes_atomic(target: &Path, bytes: &[u8]) -> Result<(), AppError> {
 ///
 /// Hardened multipart handler (CSRF-guarded by the protected subtree):
 /// 1. obtain the `logo` file part; absent -> 400.
-/// 2. SIZE CAP: reject `part.size() > MAX_LOGO_BYTES` BEFORE reading bytes (DoS).
+/// 2. SIZE CAP: reject an oversized part BEFORE reading it into RAM — both the
+///    declared `part.size()` AND the spooled temp file's on-disk
+///    `fs::metadata().len()` are checked against [`MAX_LOGO_BYTES`], so a part
+///    whose declared size understates the real bytes is still caught before
+///    `fs::read` buffers the whole file in memory (T-10-10 DoS).
 /// 3. read the temp-file bytes and MAGIC-BYTE sniff; non-image -> 422 (NO write).
 /// 4. clear any prior logo, then ATOMIC-WRITE to the SERVER-DEFINED canonical
 ///    path `{console_data_dir}/branding/logo.<validated-ext>`.
@@ -267,8 +293,26 @@ pub async fn upload_logo(
         .await
         .ok_or_else(|| AppError::BadRequest("expected a multipart file field named 'logo'".into()))?;
 
-    // --- Step 2: SIZE CAP before reading the body (T-10-10 DoS guard) --------
+    // --- Step 2: SIZE CAP before reading the body into RAM (T-10-10 DoS) -----
+    // WR-04: Salvo has already SPOOLED the part to a temp file on disk before this
+    // handler runs, so the on-disk file is the authoritative size — not the
+    // declared `part.size()`, which a crafted multipart part can omit/understate.
+    // Check BOTH the declared size AND the spooled file's real on-disk length
+    // (fs::metadata, which does NOT read the contents) and reject an oversized
+    // upload BEFORE `fs::read` loads the whole file into memory. The authoritative
+    // bound is the Salvo request-body limit; these are the in-handler guards.
+    let path = part.path().clone();
     if part.size() > MAX_LOGO_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "file is too large; the maximum size is {} KB",
+            MAX_LOGO_BYTES / 1024
+        )));
+    }
+    let on_disk_len = tokio::fs::metadata(&path).await.map(|m| m.len()).map_err(|e| {
+        tracing::error!(error = %e, "branding: failed to stat uploaded temp file");
+        AppError::Internal("branding upload read failed".into())
+    })?;
+    if on_disk_len > MAX_LOGO_BYTES {
         return Err(AppError::BadRequest(format!(
             "file is too large; the maximum size is {} KB",
             MAX_LOGO_BYTES / 1024
@@ -276,15 +320,15 @@ pub async fn upload_logo(
     }
 
     // --- Step 3: read the temp-file bytes + MAGIC-BYTE sniff (T-10-upload) ---
-    // We trust ONLY the bytes, never `part.content_type()`.
-    let path = part.path().clone();
+    // The on-disk length is now known to be within the cap, so this read is
+    // bounded. We trust ONLY the bytes, never `part.content_type()`.
     let bytes = tokio::fs::read(&path).await.map_err(|e| {
         tracing::error!(error = %e, "branding: failed to read uploaded temp file");
         AppError::Internal("branding upload read failed".into())
     })?;
 
-    // Defense in depth: re-check the actual byte length against the cap (the
-    // declared part.size() and the real file could disagree).
+    // Defense in depth: re-check the actual byte length against the cap (a final
+    // belt-and-braces on top of the pre-read metadata check above).
     if bytes.len() as u64 > MAX_LOGO_BYTES {
         return Err(AppError::BadRequest(format!(
             "file is too large; the maximum size is {} KB",
@@ -442,6 +486,42 @@ mod tests {
         let mut deep = vec![b' '; 2000];
         deep.extend_from_slice(b"<svg></svg>");
         assert_eq!(sniff_image(&deep), None);
+    }
+
+    #[test]
+    fn logo_upload_validation_rejects_xxe_shaped_svg() {
+        // WR-02: an SVG carrying a DOCTYPE + external ENTITY is the XXE/SSRF lead-in
+        // (file:// or billion-laughs). The accept gate admits IMAGES, not arbitrary
+        // attacker-authored XML, so any doctype/entity document is rejected — even
+        // though it ends in a real <svg> element.
+        let xxe = br#"<?xml version="1.0"?>
+<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<svg xmlns="http://www.w3.org/2000/svg"><text>&xxe;</text></svg>"#;
+        assert_eq!(sniff_image(xxe), None);
+
+        // A bare DOCTYPE lead-in (no <?xml>) is rejected too.
+        let doctype_first =
+            b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://x/svg.dtd\">\n<svg></svg>";
+        assert_eq!(sniff_image(doctype_first), None);
+
+        // A standalone <!ENTITY ...> declaration (no DOCTYPE keyword) is rejected.
+        let entity_only = b"<!ENTITY foo \"bar\"><svg></svg>";
+        assert_eq!(sniff_image(entity_only), None);
+
+        // Case-insensitive: a lowercase doctype is rejected just the same.
+        let lower_doctype = b"<!doctype svg><svg></svg>";
+        assert_eq!(sniff_image(lower_doctype), None);
+
+        // CONTROL: a benign SVG (no DOCTYPE, no ENTITY) is still ACCEPTED so the
+        // tightened sniff did not over-reject legitimate logos.
+        assert_eq!(
+            sniff_image(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>"),
+            Some(ImageKind::Svg)
+        );
+        assert_eq!(
+            sniff_image(b"<?xml version=\"1.0\"?>\n<svg xmlns=\"...\"><rect/></svg>"),
+            Some(ImageKind::Svg)
+        );
     }
 
     #[test]
