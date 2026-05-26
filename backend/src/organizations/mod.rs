@@ -11,9 +11,49 @@
 //! Composed of:
 //! - [`domain`] — spoofing-resistant domain normalization (SSO-05), applied
 //!   IDENTICALLY on write and on the login-time lookup.
-//! - `queries` — sqlx `query!`/`query_as!` CRUD + the domain->SSO lookup (added
-//!   in Task 2; compile-checked against the committed `.sqlx`).
-//! - `routes` — audited CRUD handlers + the lookup handler (Task 2), all gated
-//!   by `FeatureFlagHoop::new("organizations")` (SSO-07).
+//! - [`queries`] — sqlx `query!`/`query_as!` CRUD + the domain->SSO lookup
+//!   (compile-checked against the committed `.sqlx`).
+//! - [`routes`] — audited CRUD handlers + the lookup handler, all gated by
+//!   `FeatureFlagHoop::new("organizations")` (SSO-07).
 
 pub mod domain;
+pub mod queries;
+pub mod routes;
+
+use serde::Serialize;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+/// An organization with its verified domains and linked SSO connection tenant.
+/// Carries no secret -> safe to `Serialize` directly to the operator UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrgView {
+    pub id: Uuid,
+    pub label: String,
+    /// The normalized registered-domain keys verified for this org (SSO-05).
+    pub domains: Vec<String>,
+    /// The linked Polis SSO connection `tenant` (the SSO-06 lookup result), or
+    /// `None` until a connection is linked. `product` is the fixed
+    /// `sso::POLIS_PRODUCT` ("ory-console") — not stored per-org.
+    pub sso_connection_tenant: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// The login-time domain->SSO lookup result (SSO-06). Returned by the
+/// `GET api/sso/lookup` endpoint consumed by the Account Experience UI in Phase
+/// 15. Carries only the org id + the linked SSO connection tenant (the
+/// identifier AX needs to start the SSO flow). An unknown domain yields a 404 (no
+/// org-existence leak), never a populated body with `null`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SsoLookupView {
+    /// The matched organization id.
+    pub org_id: Uuid,
+    /// The normalized domain that matched (the canonical key, echoed back).
+    pub domain: String,
+    /// The linked SSO connection tenant, or `None` if the org has no connection
+    /// linked yet (the domain is known but not SSO-enabled).
+    pub sso_connection_tenant: Option<String>,
+}

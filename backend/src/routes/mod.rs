@@ -554,6 +554,48 @@ pub fn build(
                 .get(crate::sso::routes::list_connections) // SSO list (secrets stripped)
                 .post(crate::sso::routes::create_connection), // SSO create (CA pre-flight + provider write)
         )
+        // Phase 14 (SSO-06): the login-time domain->SSO lookup. GATED by
+        // `FeatureFlagHoop::new("organizations")` (the lookup is part of the
+        // Organizations feature — it resolves an org's domain to its linked SSO
+        // connection) and mounted INSIDE the protected subtree AFTER auth/csrf, so
+        // a flag-OFF request 404s even with a valid session + matching CSRF token
+        // (FLAG-01 / SSO-07). The handler normalizes the email/domain through the
+        // SAME `domain::normalize_domain` used on write (SSO-05) so a spoofed/IDNA/
+        // case variant cannot bypass the match; an unknown domain -> 404 (no org-
+        // existence leak). GET (read-only) is csrf-exempt; inherits `auth_guard`
+        // (401). Consumed by the Account Experience UI in Phase 15. Registered
+        // under the `api/sso/` prefix (a literal `lookup` segment, distinct from
+        // the saml-gated `connections` paths above).
+        .push(
+            Router::with_path("api/sso/lookup")
+                .hoop(crate::features::FeatureFlagHoop::new("organizations"))
+                .get(crate::organizations::routes::sso_lookup), // SSO-06 domain->connection
+        )
+        // Phase 14 (SSO-05/07): the Organizations CRUD — console-OWNED state
+        // (console DB, migration 0008), NO Ory call (like webhooks/branding). All
+        // GATED by `FeatureFlagHoop::new("organizations")` (seeded OFF) and mounted
+        // INSIDE the protected subtree AFTER the audit/auth/csrf hoops, so a
+        // flag-OFF request 404s even with a valid session + matching CSRF token
+        // (FLAG-01 / SSO-07). The blanket response-phase audit_hoop auto-audits the
+        // state-changing create/delete (actor-from-session, T-14-09) — no second
+        // audit path. The most-specific `{id}` path is mounted FIRST so the literal
+        // `organizations` collection segment is not captured by `{id}` (mirrors the
+        // api-keys `{id}/revoke`-before-`api-keys` precedent). GET (list/detail) is
+        // csrf-exempt; POST/DELETE inherit `csrf_guard` (403) + `auth_guard` (401).
+        // Every domain is normalized server-side (SSO-05) and the UNIQUE index on
+        // the normalized domain is the last-line collision defense (409 on dup).
+        .push(
+            Router::with_path("api/organizations/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("organizations"))
+                .get(crate::organizations::routes::get_org) // SSO-05 detail
+                .delete(crate::organizations::routes::delete_org), // SSO-05 delete (CSRF-guarded, audited)
+        )
+        .push(
+            Router::with_path("api/organizations")
+                .hoop(crate::features::FeatureFlagHoop::new("organizations"))
+                .get(crate::organizations::routes::list_orgs) // SSO-05 list
+                .post(crate::organizations::routes::create_org), // SSO-05 create (CSRF-guarded, audited)
+        )
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
         // allowlisted values; PUT runs the full transactional flow. Both inherit
         // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`
