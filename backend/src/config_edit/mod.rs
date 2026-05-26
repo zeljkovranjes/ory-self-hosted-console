@@ -27,6 +27,7 @@
 pub mod allowlist;
 pub mod jsonnet;
 pub mod locks;
+pub mod polis;
 pub mod restart;
 pub mod routes;
 pub mod schema;

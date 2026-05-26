@@ -20,7 +20,7 @@ use crate::error::AppError;
 
 /// The known config-editable services. A lock is created lazily per service on
 /// first acquire; an unknown service yields `AppError::NotFound`.
-const SERVICES: &[&str] = &["kratos", "hydra", "keto", "oathkeeper"];
+const SERVICES: &[&str] = &["kratos", "hydra", "keto", "oathkeeper", "polis"];
 
 /// One write lock per service, keyed by the canonical `'static` service name.
 type LockRegistry = Mutex<HashMap<&'static str, Arc<Mutex<()>>>>;
