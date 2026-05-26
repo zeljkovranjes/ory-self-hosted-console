@@ -13,6 +13,7 @@ pub mod config;
 pub mod config_edit;
 pub mod db;
 pub mod error;
+pub mod features;
 pub mod members;
 pub mod overview;
 pub mod ory;
