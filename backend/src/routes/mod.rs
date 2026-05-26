@@ -243,6 +243,26 @@ pub fn build(
                 .hoop(pre_auth_limiter())
                 .hoop(origin_guard)
                 .post(login::login),
+        )
+        // Phase 15 (AX-01 / SSO-06 surfacing): the NARROW, UNAUTHENTICATED
+        // login-time domain->SSO HINT consumed by the Account Experience login
+        // screen (browser -> AX server route -> backend). It is mounted on the
+        // PUBLIC subtree (NO auth_guard) because the AX is an unauthenticated
+        // end-user surface — the existing PROTECTED `api/sso/lookup` (console
+        // session required) is left UNCHANGED (T-15-17: we do not loosen it).
+        //
+        // It is STILL gated by `FeatureFlagHoop::new("organizations")` so the
+        // hint 404s when the Organizations feature is OFF (matching the protected
+        // lookup's gate), and it returns ONLY the linked SSO provider tenant —
+        // a domain with no org OR no linked connection BOTH 404 (no org-existence
+        // enumeration, T-15-16). It is GET (read-only, csrf-exempt) and carries
+        // the pre-auth rate limiter (attacker-reachable, Pitfall 7) to bound
+        // domain-probing volume.
+        .push(
+            Router::with_path("api/sso/hint")
+                .hoop(pre_auth_limiter())
+                .hoop(crate::features::FeatureFlagHoop::new("organizations"))
+                .get(crate::organizations::routes::sso_hint),
         );
     // GitHub routes (Plan 02-04 fills this in when env-configured).
     public = attach_github(public, &cfg);

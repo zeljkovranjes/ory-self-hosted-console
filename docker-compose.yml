@@ -567,6 +567,16 @@ services:
       # on the next AX RESTART (the server re-reads the files at process start —
       # no rebuild, 15-RESEARCH A3). Server-side fs read only; never bundled.
       AX_OVERRIDES_DIR: /etc/account-experience-config
+      # AX-01 (SSO-06 surfacing): the SERVER-ONLY backend base URL the AX login's
+      # domain->SSO HINT server route (app/api/sso-lookup) calls. The AX reaches
+      # the backend over the SHARED `edge` network (the backend is dual-homed
+      # [internal, edge]); the browser never sees this host — it only hits the
+      # same-origin AX route, which proxies to `GET /api/sso/hint` here. It is NOT
+      # a NEXT_PUBLIC_ var, so the internal backend hostname never reaches the
+      # client bundle (threat T-15-18). The org lookup goes through the BACKEND,
+      # never Kratos (BACK-01 / T-15-19) — distinct from the Kratos-public proxy
+      # (ORY_SDK_URL), which serves ONLY the self-service flows.
+      BACKEND_INTERNAL_URL: http://backend:8080
     healthcheck:
       # Next standalone server has global fetch; probe over loopback with
       # redirect:'manual' (same node-fetch shape as the frontend/Polis services).

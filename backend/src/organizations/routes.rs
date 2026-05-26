@@ -174,3 +174,52 @@ pub async fn sso_lookup(req: &mut Request, depot: &mut Depot) -> Result<Json<sup
         .ok_or(AppError::NotFound)?;
     Ok(Json(found))
 }
+
+/// `GET api/sso/hint?email=a@corp.com` (or `?domain=corp.com`) — the NARROW,
+/// UNAUTHENTICATED login-time domain->SSO HINT consumed by the Account Experience
+/// login screen (AX-01 / SSO-06 surfacing, Phase 15).
+///
+/// WHY a SECOND endpoint instead of reusing [`sso_lookup`]: that handler sits on
+/// the PROTECTED subtree (it requires a CONSOLE session via `auth_guard`). The AX
+/// is an UNAUTHENTICATED end-user surface, so it CANNOT call the protected lookup
+/// — and we must NOT loosen that lookup's auth (T-15-17 / EoP). This hint is the
+/// minimal, end-user-safe alternative: it is mounted on the PUBLIC subtree but is
+/// STILL gated by `FeatureFlagHoop::new("organizations")` (404 when the feature is
+/// OFF), and it returns ONLY the linked SSO provider tenant ([`SsoHintView`]).
+///
+/// Information-disclosure discipline (T-15-16): the domain is normalized through
+/// the SAME `domain::normalize_domain` used on write (SSO-05) so a spoofed/IDNA/
+/// case variant cannot bypass the match. A domain that does NOT match an org, OR
+/// matches an org with NO linked SSO connection, BOTH yield a value-free 404 — so
+/// the response can never be used to enumerate which orgs/domains merely exist
+/// (an unknown domain and a known-but-not-SSO domain are indistinguishable). The
+/// caller (the AX) treats 404 as "no SSO route — proceed with normal password
+/// login". csrf-exempt (GET, read-only); takes no console session.
+#[handler]
+pub async fn sso_hint(req: &mut Request, depot: &mut Depot) -> Result<Json<super::SsoHintView>, AppError> {
+    let pool = pool(depot)?;
+
+    // Accept either ?email= (extract the host part) or ?domain= directly.
+    let raw = if let Some(email) = req.query::<String>("email").filter(|s| !s.trim().is_empty()) {
+        email
+            .rsplit_once('@')
+            .map(|(_, host)| host.to_string())
+            .ok_or_else(|| AppError::BadRequest("email must contain a domain".into()))?
+    } else if let Some(d) = req.query::<String>("domain").filter(|s| !s.trim().is_empty()) {
+        d
+    } else {
+        return Err(AppError::BadRequest("email or domain query parameter is required".into()));
+    };
+
+    // SSO-05/06: normalize through the SAME function used on write.
+    let normalized = domain::normalize_domain(&raw)?;
+    let found = queries::lookup_by_domain(&pool, &normalized)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    // A known domain with NO linked SSO connection is indistinguishable from an
+    // unknown domain (both 404) — no "this org exists but is not SSO-enabled"
+    // signal leaks (T-15-16). Only a real provider tenant produces a 200 hint.
+    let provider = found.sso_connection_tenant.ok_or(AppError::NotFound)?;
+    Ok(Json(super::SsoHintView { provider }))
+}

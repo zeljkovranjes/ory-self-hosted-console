@@ -57,3 +57,20 @@ pub struct SsoLookupView {
     /// linked yet (the domain is known but not SSO-enabled).
     pub sso_connection_tenant: Option<String>,
 }
+
+/// The NARROW, UNAUTHENTICATED login-time domain->SSO HINT (SSO-06 surfacing,
+/// Phase 15 / AX-01). Returned by the PUBLIC `GET /api/sso/hint` endpoint the
+/// Account Experience login screen calls (browser -> AX server route -> backend).
+///
+/// Information-disclosure discipline (T-15-16): this carries ONLY the linked SSO
+/// connection tenant (the `provider` the AX needs to route to). It deliberately
+/// does NOT echo the org id or the matched domain — and the route 404s for a
+/// domain that has NO linked connection — so the response can never be used to
+/// enumerate which orgs/domains merely EXIST. The protected `SsoLookupView`
+/// (console-authenticated) is the richer view; this hint is the unauthenticated
+/// minimum.
+#[derive(Debug, Clone, Serialize)]
+pub struct SsoHintView {
+    /// The SSO connection tenant to route the end-user to (the only field).
+    pub provider: String,
+}
