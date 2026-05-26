@@ -172,6 +172,61 @@ else
 fi
 
 # =============================================================================
+# WR-03 — BUILD-TIME assertion: the emitted EDGE MIDDLEWARE chunk carries NO Node
+# built-in (`node:fs`/`node:path`/`require("node:`). This is the robust guard the
+# review asked for: the NEXT_RUNTIME runtime guard in lib/overrides.ts is correct
+# but enforced only by convention; a future static `import` of a node built-in
+# into a module reachable from ory.config.ts -> middleware.ts would silently
+# re-bundle it into the edge chunk and 500 every Kratos self-service call (the bug
+# that bit 15-02 + 15-04). We read the AUTHORITATIVE edge-chunk list from
+# .next/server/middleware-manifest.json and grep ONLY those chunks — so this fails
+# fast at build time (not at runtime) if a node built-in ever lands in the edge
+# middleware bundle.
+# =============================================================================
+echo
+echo "--- [WR-03] the emitted EDGE MIDDLEWARE chunk carries no node:fs/node:path/require(\"node: ---"
+AX_DIR="${REPO_ROOT}/account-experience"
+MW_MANIFEST="${AX_DIR}/.next/server/middleware-manifest.json"
+if [ ! -f "$MW_MANIFEST" ]; then
+  echo "    (no prior .next build — building the AX once for the edge-chunk scan)"
+  ( cd "$AX_DIR" && npm run build ) >/dev/null 2>&1 || true
+fi
+if [ -f "$MW_MANIFEST" ]; then
+  # The manifest lists the edge middleware's chunk files relative to `.next/`.
+  EDGE_CHUNKS="$(node -e '
+    const fs = require("fs");
+    const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const mw = (m && m.middleware) || {};
+    const files = new Set();
+    for (const k of Object.keys(mw)) {
+      for (const f of (mw[k].files || [])) files.add(f);
+    }
+    process.stdout.write([...files].join("\n"));
+  ' "$MW_MANIFEST" 2>/dev/null)"
+  if [ -z "$EDGE_CHUNKS" ]; then
+    _fail "[WR-03] middleware-manifest.json lists NO edge chunks — cannot assert the edge bundle (anti-false-green)"
+  else
+    # Resolve each chunk under .next/ and grep for any node built-in reference.
+    EDGE_NODE_HITS=""
+    while IFS= read -r chunk; do
+      [ -z "$chunk" ] && continue
+      cf="${AX_DIR}/.next/${chunk}"
+      [ -f "$cf" ] || continue
+      h="$(grep -lE 'node:fs|node:path|require\(["'"'"']node:' "$cf" 2>/dev/null || true)"
+      [ -n "$h" ] && EDGE_NODE_HITS="${EDGE_NODE_HITS}\n${h}"
+    done <<< "$EDGE_CHUNKS"
+    if [ -z "$EDGE_NODE_HITS" ]; then
+      _pass "[WR-03] the edge middleware chunk(s) carry no node:fs/node:path/require(\"node: — the NEXT_RUNTIME guard holds at build time"
+    else
+      _fail "[WR-03] a node built-in leaked into the EDGE MIDDLEWARE chunk (would 500 every Kratos self-service call):"
+      printf '%b\n' "$EDGE_NODE_HITS"
+    fi
+  fi
+else
+  _fail "[WR-03] no middleware-manifest.json after build — cannot assert the edge chunk is node-builtin-free (anti-false-green)"
+fi
+
+# =============================================================================
 # AX-01 (static) — Kratos ui_url keys point at the AX origin; NO logout.ui_url.
 # =============================================================================
 echo

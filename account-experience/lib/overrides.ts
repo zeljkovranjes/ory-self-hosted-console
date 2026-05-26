@@ -41,8 +41,21 @@ function overridesDir(): string {
  * `require` so `node:fs` is never statically bundled into the edge middleware.
  */
 function readFileSafe(name: string): string | null {
-  // `NEXT_RUNTIME === "edge"` in edge middleware; "nodejs" in server components.
-  if (process.env.NEXT_RUNTIME === "edge") return null
+  // EDGE-SAFETY guard (WR-03). TWO independent conditions, EITHER of which short-
+  // circuits before any `require("node:…")` runs:
+  //   1. `NEXT_RUNTIME === "edge"` — set in the edge middleware runtime.
+  //   2. `typeof require !== "function"` — a belt-and-braces backstop: the edge
+  //      runtime has no CommonJS `require`, so even if NEXT_RUNTIME were unset
+  //      (a future Next change), we still never attempt a node built-in there.
+  // This runtime guard is now ALSO backstopped by a BUILD-TIME assertion: the
+  // phase15 acceptance gate ([WR-03]) reads .next/server/middleware-manifest.json
+  // and greps the emitted EDGE chunk for `node:fs`/`node:path`/`require("node:`,
+  // failing the build fast if any node built-in is ever bundled into the edge
+  // middleware (the bug that bit 15-02 + 15-04). Convention is no longer the only
+  // enforcement.
+  if (process.env.NEXT_RUNTIME === "edge" || typeof require !== "function") {
+    return null
+  }
   try {
     // EDGE-SAFETY: BOTH `node:fs` AND `node:path` are loaded via a guarded
     // dynamic `require` (NOT a static top-level import). A static
