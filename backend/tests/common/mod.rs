@@ -46,6 +46,7 @@ pub fn default_test_cfg() -> ory_console_backend::config::Config {
         // these at the compose services via env if needed.
         kratos_admin_url: "http://kratos:4434".to_string(),
         hydra_admin_url: "http://hydra:4445".to_string(),
+        hydra_public_url: "http://hydra:4444".to_string(),
         keto_read_url: "http://keto:4466".to_string(),
         keto_write_url: "http://keto:4467".to_string(),
         oathkeeper_api_url: "http://oathkeeper:4456".to_string(),
@@ -99,6 +100,7 @@ pub fn ory_clients_from_env() -> OryClients {
     let cfg = ory_console_backend::config::Config {
         kratos_admin_url: url("KRATOS_ADMIN_URL", &cfg.kratos_admin_url),
         hydra_admin_url: url("HYDRA_ADMIN_URL", &cfg.hydra_admin_url),
+        hydra_public_url: url("HYDRA_PUBLIC_URL", &cfg.hydra_public_url),
         keto_read_url: url("KETO_READ_URL", &cfg.keto_read_url),
         keto_write_url: url("KETO_WRITE_URL", &cfg.keto_write_url),
         oathkeeper_api_url: url("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url),

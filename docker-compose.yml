@@ -372,6 +372,9 @@ services:
       # no credential; the backend is the sole client of these endpoints.
       KRATOS_ADMIN_URL: http://kratos:4434
       HYDRA_ADMIN_URL: http://hydra:4445
+      # Hydra PUBLIC port — token revoke (/oauth2/revoke) is a public-API
+      # endpoint, NOT admin. Internal-only DNS; never host-published (INFRA-05).
+      HYDRA_PUBLIC_URL: http://hydra:4444
       KETO_READ_URL: http://keto:4466
       KETO_WRITE_URL: http://keto:4467
       OATHKEEPER_API_URL: http://oathkeeper:4456

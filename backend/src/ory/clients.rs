@@ -46,6 +46,11 @@ pub struct OryClients {
     pub kratos: KratosCfg,
     /// Hydra OAuth2 Admin (`HYDRA_ADMIN_URL`, default `http://hydra:4445`).
     pub hydra: HydraCfg,
+    /// Hydra OAuth2 PUBLIC (`HYDRA_PUBLIC_URL`, default `http://hydra:4444`).
+    /// Used ONLY for public-port endpoints the crate routes off `base_path`:
+    /// token revocation (`/oauth2/revoke`). The token client_id/client_secret in
+    /// the request body authenticate the call — no admin credential is involved.
+    pub hydra_public: HydraCfg,
     /// Keto READ API (`KETO_READ_URL`, default `http://keto:4466`).
     pub keto_read: KetoCfg,
     /// Keto WRITE API (`KETO_WRITE_URL`, default `http://keto:4467`).
@@ -104,6 +109,7 @@ impl OryClients {
         // WR-03: fail fast on a malformed admin URL.
         validate_admin_url("KRATOS_ADMIN_URL", &cfg.kratos_admin_url)?;
         validate_admin_url("HYDRA_ADMIN_URL", &cfg.hydra_admin_url)?;
+        validate_admin_url("HYDRA_PUBLIC_URL", &cfg.hydra_public_url)?;
         validate_admin_url("KETO_READ_URL", &cfg.keto_read_url)?;
         validate_admin_url("KETO_WRITE_URL", &cfg.keto_write_url)?;
         validate_admin_url("OATHKEEPER_API_URL", &cfg.oathkeeper_api_url)?;
@@ -124,6 +130,11 @@ impl OryClients {
             },
             hydra: HydraCfg {
                 base_path: cfg.hydra_admin_url.clone(),
+                client: http.clone(),
+                ..HydraCfg::new()
+            },
+            hydra_public: HydraCfg {
+                base_path: cfg.hydra_public_url.clone(),
                 client: http.clone(),
                 ..HydraCfg::new()
             },

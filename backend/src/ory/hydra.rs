@@ -362,8 +362,12 @@ pub async fn revoke_token(
         .await
         .map_err(|e| AppError::BadRequest(format!("invalid revoke body: {e}")))?;
 
+    // Token revocation is a PUBLIC-port endpoint: the crate posts to
+    // `{base_path}/oauth2/revoke`, which exists on Hydra's public API (4444), NOT
+    // the admin port (4445). Route it through the public Configuration; the
+    // client_id/client_secret in the body authenticate the call.
     o_auth2_api::revoke_o_auth2_token(
-        &clients.hydra,
+        &clients.hydra_public,
         &body.token,
         body.client_id.as_deref(),
         body.client_secret.as_deref(),

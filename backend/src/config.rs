@@ -27,6 +27,11 @@ const DEFAULT_SESSION_ABSOLUTE_SECS: i64 = 2_592_000;
 /// generated crate path templates already prepend the route).
 const DEFAULT_KRATOS_ADMIN_URL: &str = "http://kratos:4434";
 const DEFAULT_HYDRA_ADMIN_URL: &str = "http://hydra:4445";
+/// Hydra PUBLIC base URL (env `HYDRA_PUBLIC_URL`, default `http://hydra:4444`).
+/// Distinct from the admin URL: token revocation (`/oauth2/revoke`) and the
+/// token endpoint live on Hydra's PUBLIC port, NOT the admin port. Internal
+/// network only; never host-published (INFRA-05).
+const DEFAULT_HYDRA_PUBLIC_URL: &str = "http://hydra:4444";
 const DEFAULT_KETO_READ_URL: &str = "http://keto:4466";
 const DEFAULT_KETO_WRITE_URL: &str = "http://keto:4467";
 const DEFAULT_OATHKEEPER_API_URL: &str = "http://oathkeeper:4456";
@@ -98,6 +103,11 @@ pub struct Config {
     pub kratos_admin_url: String,
     /// Hydra Admin base URL (env `HYDRA_ADMIN_URL`, default `http://hydra:4445`).
     pub hydra_admin_url: String,
+    /// Hydra PUBLIC base URL (env `HYDRA_PUBLIC_URL`, default `http://hydra:4444`).
+    /// Token revoke (`/oauth2/revoke`) is a PUBLIC-port endpoint — the crate's
+    /// `revoke_o_auth2_token` posts to `{base_path}/oauth2/revoke`, which only
+    /// exists on the public API, not the admin port.
+    pub hydra_public_url: String,
     /// Keto READ base URL (env `KETO_READ_URL`, default `http://keto:4466`).
     pub keto_read_url: String,
     /// Keto WRITE base URL (env `KETO_WRITE_URL`, default `http://keto:4467`).
@@ -131,6 +141,7 @@ impl fmt::Debug for Config {
             // Admin URLs are non-secret: print in cleartext (log-useful).
             .field("kratos_admin_url", &self.kratos_admin_url)
             .field("hydra_admin_url", &self.hydra_admin_url)
+            .field("hydra_public_url", &self.hydra_public_url)
             .field("keto_read_url", &self.keto_read_url)
             .field("keto_write_url", &self.keto_write_url)
             .field("oathkeeper_api_url", &self.oathkeeper_api_url)
@@ -216,6 +227,8 @@ impl Config {
             env::var("KRATOS_ADMIN_URL").unwrap_or_else(|_| DEFAULT_KRATOS_ADMIN_URL.to_string());
         let hydra_admin_url =
             env::var("HYDRA_ADMIN_URL").unwrap_or_else(|_| DEFAULT_HYDRA_ADMIN_URL.to_string());
+        let hydra_public_url =
+            env::var("HYDRA_PUBLIC_URL").unwrap_or_else(|_| DEFAULT_HYDRA_PUBLIC_URL.to_string());
         let keto_read_url =
             env::var("KETO_READ_URL").unwrap_or_else(|_| DEFAULT_KETO_READ_URL.to_string());
         let keto_write_url =
@@ -241,6 +254,7 @@ impl Config {
             github,
             kratos_admin_url,
             hydra_admin_url,
+            hydra_public_url,
             keto_read_url,
             keto_write_url,
             oathkeeper_api_url,

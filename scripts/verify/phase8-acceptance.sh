@@ -75,6 +75,11 @@ HYDRA_YAML="${REPO_ROOT}/config/hydra/hydra.yml"
 : "${KETO_CTR:=ory-keto}"
 : "${OATHKEEPER_CTR:=ory-oathkeeper}"
 
+# The compose SERVICE name (for `docker compose exec`), distinct from the
+# container_name (`ory-hydra`, used by `docker inspect`/`compose ps` matching).
+# `docker compose exec` resolves by SERVICE, so token-mint execs target `hydra`.
+: "${HYDRA_SVC:=hydra}"
+
 # Hydra's PUBLIC OAuth2 endpoint, reachable from INSIDE the container only (ports
 # are host-internal, INFRA-05). --dev => plain HTTP on 4444 (T-08-DEV). We mint
 # tokens here via `docker compose exec ory-hydra curl` for the #2869 proof.
@@ -292,7 +297,10 @@ _json_field() {
 # the raw token response body. Uses client_secret_post (creds in the form body).
 _mint_token() {
   local cid="$1" csecret="$2"
-  $DC exec -T "$HYDRA_CTR" curl -s --max-time 20 \
+  # NOTE: exec targets the compose SERVICE ($HYDRA_SVC=hydra), NOT the container
+  # name (ory-hydra) — `docker compose exec` resolves by service. The distroless
+  # Hydra image has /usr/local/bin/curl but no shell, so we invoke curl directly.
+  $DC exec -T "$HYDRA_SVC" curl -s --max-time 20 \
     -X POST "${HYDRA_PUBLIC_INTERNAL}/oauth2/token" \
     -H 'Content-Type: application/x-www-form-urlencoded' \
     --data-urlencode 'grant_type=client_credentials' \
