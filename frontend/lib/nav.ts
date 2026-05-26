@@ -2,12 +2,14 @@ import type { LucideIcon } from "lucide-react";
 import {
   Activity,
   Cookie,
+  FileCode2,
   Fingerprint,
   KeyRound,
   Link2,
   Mail,
   Palette,
   RefreshCw,
+  Route,
   RotateCcw,
   ScanSearch,
   Settings,
@@ -223,15 +225,39 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Access",
+    // Phase 9 — the "Permissions" section (09-UI-SPEC §E). Relationships is the
+    // Keto relation-tuple DataTable + create/delete; Check & Expand is the
+    // read-only check/expand panel; Permission Model is the OPL Monaco editor;
+    // Access Rules is the Oathkeeper rules Monaco editor. All `built: true`.
+    label: "Permissions",
     items: [
       {
         slug: "permissions",
-        label: "Permissions",
-        href: "/permissions",
+        label: "Relationships",
+        href: "/permissions/relationships",
         icon: ShieldCheck,
-        built: false,
-        comingIn: "Phase 9",
+        built: true,
+      },
+      {
+        slug: "permissions-check",
+        label: "Check & Expand",
+        href: "/permissions/check",
+        icon: ScanSearch,
+        built: true,
+      },
+      {
+        slug: "permissions-model",
+        label: "Permission Model",
+        href: "/permissions/model",
+        icon: FileCode2,
+        built: true,
+      },
+      {
+        slug: "permissions-access-rules",
+        label: "Access Rules",
+        href: "/permissions/access-rules",
+        icon: Route,
+        built: true,
       },
     ],
   },
