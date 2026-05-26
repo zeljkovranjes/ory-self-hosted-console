@@ -109,6 +109,54 @@ pub async fn fetch_version(
     resp.json::<FallbackVersion>().await.map_err(map_fallback_err)
 }
 
+/// Check OPL (Ory Permission Language) syntax against Keto's dedicated OPL server
+/// (`:4469`), returning the raw `CheckOplSyntaxResult` JSON (`{}` or
+/// `{"errors":[...]}`).
+///
+/// **Why this is a fallback (a typed-crate BUG workaround).** The typed
+/// `ory_keto_client::apis::relationship_api::check_opl_syntax` serialises the OPL
+/// source with `reqwest::RequestBuilder::json(&source)` — i.e. it sends the source
+/// as a **JSON-encoded string** (a quoted, `\n`-escaped scalar). But Keto's
+/// `POST /opl/syntax/check` expects the **RAW OPL text** as the request body
+/// (verified live against `oryd/keto:v26.2.0`): sending the JSON-quoted form makes
+/// the parser choke on the leading `"` / `@`-import at "column 38" and reports a
+/// spurious syntax error for EVERY valid model. So the crate path is unusable for
+/// this one endpoint, and we POST the raw text ourselves here.
+///
+/// `base_url` is the FIXED internal Keto OPL URL from `Config` (`KETO_OPL_URL`,
+/// default `http://keto:4469`) — never user input, no SSRF surface. The OPL
+/// `source` is the operator's editor text; it travels as the raw request body
+/// (`Content-Type: text/plain`), exactly as Keto's parser wants. The response is
+/// returned as a generic `serde_json::Value` to preserve this module's isolation
+/// invariant (no Ory crate types here) — the typed handler deserialises it into
+/// the crate `CheckOplSyntaxResult`. On any transport/non-2xx failure the shared
+/// [`AppError::Upstream`] (502) envelope is returned with NO body/URL leak.
+pub async fn check_opl_syntax_raw(
+    client: &reqwest::Client,
+    base_url: &str,
+    source: &str,
+) -> Result<serde_json::Value, AppError> {
+    let url = format!("{}/opl/syntax/check", base_url.trim_end_matches('/'));
+    let resp = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "text/plain")
+        .body(source.to_string())
+        .send()
+        .await
+        .map_err(map_fallback_err)?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(map_fallback_status(status));
+    }
+
+    // The body is the CheckOplSyntaxResult JSON (`{}` clean, or `{"errors":[...]}`).
+    // A decode failure is still an upstream problem -> 502, never a body leak.
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(map_fallback_err)
+}
+
 /// Parse the `page_token` query value of the `rel="next"` entry from a Kratos
 /// `Link` response header (RFC 8288 web-linking), returning `None` when there is
 /// no next page.

@@ -691,12 +691,26 @@ pub async fn put_permission_model(
     // T-9-opl / Pitfall 4: a populated CheckOplSyntaxResult.errors short-circuits
     // here with 422 — BEFORE any backup or atomic write, so a syntactically-bad
     // model NEVER reaches disk. A :4469 upstream failure maps to Upstream(502).
-    let result = ory_keto_client::apis::relationship_api::check_opl_syntax(
-        &clients.keto_opl,
-        Some(&source),
+    // NOTE: the typed `relationship_api::check_opl_syntax` is UNUSABLE here — it
+    // sends the OPL source `.json()`-encoded (a quoted, \n-escaped string) but
+    // Keto's `:4469` /opl/syntax/check expects the RAW text body, so every valid
+    // model gets a spurious "unexpected token @ (column 38)" error and would be
+    // wrongly rejected pre-save. POST the raw text via the isolated reqwest-0.13
+    // fallback, then deserialise the raw JSON into the typed CheckOplSyntaxResult.
+    let http_opl = crate::ory::fallback::fallback_client()?;
+    let raw = crate::ory::fallback::check_opl_syntax_raw(
+        &http_opl,
+        &clients.keto_opl.base_path,
+        &source,
     )
-    .await
-    .map_err(crate::ory::error::map_keto_err)?;
+    .await?;
+    let result: ory_keto_client::models::CheckOplSyntaxResult =
+        serde_json::from_value(raw).map_err(|e| {
+            // A decode failure of Keto's own response is an upstream problem (502),
+            // never a body leak.
+            tracing::warn!(error = %e, "decode CheckOplSyntaxResult from :4469 failed");
+            AppError::Upstream("ory upstream returned an undecodable OPL result".into())
+        })?;
     opl_errors_to_validation(&result)?;
     tracing::info!(service = svc.key(), "permission-model put: OPL syntax clean");
 

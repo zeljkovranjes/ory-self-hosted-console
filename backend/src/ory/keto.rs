@@ -475,11 +475,22 @@ pub async fn validate_opl(
         .map_err(|e| AppError::BadRequest(format!("invalid validate opl body: {e}")))?;
 
     let clients = ory_clients(depot)?;
-    let result = relationship_api::check_opl_syntax(&clients.keto_opl, Some(&body.source))
-        .await
-        .map_err(map_keto_err)?;
 
-    json_of(result)
+    // NOTE: the typed `relationship_api::check_opl_syntax` is UNUSABLE for this
+    // endpoint — it sends the OPL source `.json()`-encoded (a quoted, \n-escaped
+    // string) but Keto's `:4469` /opl/syntax/check expects the RAW text body, so
+    // every valid model gets a spurious "unexpected token @ (column 38)" error.
+    // We POST the raw text via the isolated reqwest-0.13 fallback instead and
+    // deserialise the raw JSON into the typed CheckOplSyntaxResult for the client.
+    let http = crate::ory::fallback::fallback_client()?;
+    let raw = crate::ory::fallback::check_opl_syntax_raw(
+        &http,
+        &clients.keto_opl.base_path,
+        &body.source,
+    )
+    .await?;
+
+    json_of(raw)
 }
 
 #[cfg(test)]
