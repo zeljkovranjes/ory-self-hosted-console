@@ -28,7 +28,6 @@
 // The read is server-side only; it is never bundled into client JS.
 // =============================================================================
 
-import { join } from "node:path"
 import type { OryClientConfiguration } from "@ory/elements-react"
 
 /** The directory the console-owned override files are mounted at (read-only). */
@@ -45,9 +44,18 @@ function readFileSafe(name: string): string | null {
   // `NEXT_RUNTIME === "edge"` in edge middleware; "nodejs" in server components.
   if (process.env.NEXT_RUNTIME === "edge") return null
   try {
+    // EDGE-SAFETY: BOTH `node:fs` AND `node:path` are loaded via a guarded
+    // dynamic `require` (NOT a static top-level import). A static
+    // `import { join } from "node:path"` (or `import "node:fs"`) gets bundled
+    // into the @ory/nextjs EDGE middleware (ory.config.ts -> overrides.ts ->
+    // middleware.ts) and crashes it at runtime ("Native module not found:
+    // node:path") — the edge runtime has no Node built-ins. Keeping both dynamic
+    // and behind the `NEXT_RUNTIME==="edge"` guard keeps them out of the edge
+    // bundle entirely; the read only ever runs on the Node render path.
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- guarded
-    // dynamic require keeps node:fs out of the edge middleware bundle.
     const fs = require("node:fs") as typeof import("node:fs")
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- guarded
+    const { join } = require("node:path") as typeof import("node:path")
     return fs.readFileSync(join(overridesDir(), name), "utf8")
   } catch {
     return null

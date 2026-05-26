@@ -32,10 +32,42 @@
 
 pub mod routes;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config_edit::yaml::write_atomic;
 use crate::error::AppError;
+
+/// Relax an AX override file to WORLD-READABLE (`0644`) after the atomic write.
+///
+/// CROSS-SERVICE READ CONTRACT (correctness fix): the backend runs as a distroless
+/// `nonroot` uid (65532) and `write_atomic` persists via `NamedTempFile`, whose
+/// secure default mode is `0600` (owner-only) — correct for SECRET service config
+/// (kratos.yml/SMTP/etc.). But these two AX files are NON-secret (theme CSS,
+/// translations JSON) and are CONSUMED at boot by the account-experience container,
+/// which runs as a DIFFERENT uid (`node`, 1000). A `0600` file owned by 65532 is
+/// unreadable by uid 1000 → the AX read fails `EACCES` and silently falls back to
+/// "no override" (the AX-02/AX-03 override would never apply). So for THESE files
+/// only we widen to `0644` (owner-write, world-read). They carry no secret, so
+/// world-read is safe and intended. The dir itself is created `0755` by
+/// `create_dir_all` under the standard umask, so it is already traversable.
+///
+/// Unix-only mode bits; a no-op elsewhere (the deployment target is Linux
+/// containers). Best-effort: a chmod failure is logged, not fatal (the write
+/// already succeeded; the operator can re-trigger).
+fn make_world_readable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)) {
+            tracing::warn!(error = %e, path = %path.display(),
+                "account-experience: could not relax override file to 0644 (AX may not read it)");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
 
 /// The server-defined directory that holds the AX override files:
 /// `{config_dir}/account-experience`. Lives on the mounted config volume the AX
@@ -132,7 +164,12 @@ pub fn write_theme(config_dir: &str, source: &str) -> Result<(), AppError> {
         tracing::error!(error = %e, "account-experience: failed to create config dir");
         AppError::Internal("account-experience write failed".into())
     })?;
-    write_atomic(&theme_path(config_dir), source)
+    let path = theme_path(config_dir);
+    write_atomic(&path, source)?;
+    // Cross-service read contract: the AX (uid 1000) must read this file the
+    // backend (uid 65532) just wrote 0600. Widen to 0644 (non-secret CSS).
+    make_world_readable(&path);
+    Ok(())
 }
 
 /// Parse `body` as JSON, REJECTING malformed input with 422 BEFORE any disk
@@ -170,7 +207,11 @@ pub fn write_translations(config_dir: &str, body: &str) -> Result<serde_json::Va
         tracing::error!(error = %e, "account-experience: failed to create config dir");
         AppError::Internal("account-experience write failed".into())
     })?;
-    write_atomic(&translations_path(config_dir), &pretty)?;
+    let path = translations_path(config_dir);
+    write_atomic(&path, &pretty)?;
+    // Cross-service read contract: the AX (uid 1000) must read this file the
+    // backend (uid 65532) just wrote 0600. Widen to 0644 (non-secret JSON).
+    make_world_readable(&path);
     Ok(value)
 }
 

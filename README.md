@@ -1396,6 +1396,157 @@ Every negative passes ONLY on the explicit refusal (anti-false-green).
 
 ---
 
+## Account Experience UI (Phase 15)
+
+The **Account Experience (AX)** is a SEPARATE edge service — a self-hosted
+Next.js 16 app (`account-experience/`) on `@ory/elements-react` + `@ory/nextjs`
+that serves the end-user self-service flows (login, registration, recovery,
+verification, settings, error) for your Kratos instance. It is **distinct from
+the admin console** (`frontend/`): different origin, different cookies, different
+CSP. It is host-published on its own port (`ACCOUNT_EXPERIENCE_PORT`, default
+`3001`).
+
+### How it talks to Kratos — the `@ory/nextjs` middleware proxy
+
+The AX does **not** hand-roll a Next `rewrites()` to Kratos. It uses
+`createOryMiddleware` (`account-experience/middleware.ts`), a SAME-ORIGIN proxy
+that intercepts the Kratos self-service paths (`/self-service`, `/sessions`,
+`/ui`, `/.well-known/ory`, `/.ory`) and server-side forwards them to Kratos
+**public** (`ORY_SDK_URL`), rewriting every `Set-Cookie` Domain and every Kratos
+base URL in redirects/bodies to the AX origin. That keeps Kratos's anti-CSRF
+double-submit cookie + the session cookie first-party to the AX host, so CSRF
+succeeds. A bare rewrite would not rewrite `Set-Cookie` domains and would break
+CSRF — do not replace the middleware with one.
+
+`ORY_SDK_URL` is **server-only** (NOT `NEXT_PUBLIC_`), so the internal Kratos
+hostname never reaches the client bundle.
+
+### Network & the accepted Kratos public/admin co-listen residual
+
+The AX is **dual-homed**: on a dedicated `ax-public` network (Kratos + AX only)
+so it can reach Kratos public `:4433` WITHOUT joining the broad `internal`
+network — so it has **no route to Hydra/Keto/Oathkeeper admin** (INFRA-05 /
+T-15-01, asserted live) — and on `edge` so the browser can reach it and so it can
+reach the backend (below).
+
+**Accepted residual:** Kratos co-listens its public (`:4433`) and admin (`:4434`)
+APIs on every interface, so a peer sharing `ax-public` to reach `:4433` can also
+reach `:4434`. The AX is **never given an admin URL and never calls it**; closing
+the gap fully requires an L7 public-only proxy in front of Kratos (a hardening
+follow-up). The host-level INFRA-05 invariant (no admin port host-published) is
+unaffected. This is documented in `docker-compose.yml` (the `ax-public` network
+comment) and surfaced — not failed — by the acceptance gate.
+
+### Cookie / CSP isolation (AX-05)
+
+The AX issues only Kratos cookies (`ory_kratos_session`) on the AX origin and
+**never** a `__Host-console_*` cookie; the console never sets an
+`ory_kratos_session`. The AX sets its **own** Content-Security-Policy (distinct
+from the console): `style-src 'unsafe-inline'` (Elements injects styles),
+`connect-src 'self'` (the middleware keeps every Kratos call same-origin),
+`font-src 'self'` (local vendored font, no CDN), `frame-ancestors 'none'`.
+
+### Zero CDN egress
+
+The AX vendors its font locally (`next/font/local`, OFL-licensed Geist) — there
+is **no** `next/font/google` import and no CDN/Google-Fonts URL in the built
+bundle. The acceptance gate greps the built client JS for any CDN host or any
+internal Kratos hostname and fails on a hit (threats T-15-04/05).
+
+### Theming, localization & custom-domains editors (console side)
+
+Three admin-console pages (under **Branding**), all behind the
+`account_experience` feature flag (FLAG-01 — flag-OFF → `404` past a valid
+session + CSRF), edit **console-owned override files** the AX reads at boot. They
+make **no** Ory call:
+
+- **Theming (AX-02)** — a Monaco CSS editor. The backend writes
+  `config/account-experience/theme.css` (a `:root{}` CSS-variable block); the AX
+  injects it as a `<style>` after the Elements theme styles, so the override
+  custom properties win.
+- **Localization (AX-03)** — a Monaco JSON editor. The backend writes
+  `config/account-experience/translations.json`; the AX loads it into
+  `intl.customTranslations`. A malformed body is a `422` **before** any disk
+  write; a corrupt file on the read side falls back to the built-in catalog
+  (never bricks the UI). Links to the BRAND-01 email-template editor for
+  courier-side i18n.
+- **Custom Domains (AX-04)** — edits the Kratos `serve.public.base_url` +
+  `allowed_return_urls` (a Kratos-only restart via the broker), a **SSRF-guarded
+  reachability check** (the HOOK-02 guard runs FIRST — an internal/loopback/
+  credentialed/metadata target is refused as a `4xx`, never a `reachable:false`),
+  and a reverse-proxy **guidance snippet** generator (nginx/Caddy/Traefik).
+
+**Apply-on-restart (A3):** a theme/localization edit applies on the next AX
+**restart** (the server re-reads the files at process start) — **not** a rebuild.
+The override files are bind-mounted **read-only** into the AX (`:ro`); the backend
+is the sole writer.
+
+**Custom-domain TLS/DNS are owned by the operator's reverse proxy.** The console
+provisions **no** certificates and **no** DNS — the snippet is pure guidance. The
+operator's reverse proxy must also keep the AX **same registrable TLD** as Kratos
+public (Pitfall 1/14), or the cookie-domain rewrite the middleware performs cannot
+keep the session first-party and login breaks.
+
+### Org-domain → SSO login routing (AX-01 / SSO-06 surfacing)
+
+On the AX login screen, an email at an **organization domain** is routed to that
+org's linked SSO connection. The flow:
+
+1. the browser calls the AX's **own** same-origin server route
+   (`/api/sso-lookup`) — never Kratos, never the backend directly;
+2. that server route proxies to the backend's **narrow public hint** endpoint
+   (`GET /api/sso/hint`) over the `edge` network, using a **server-only**
+   `BACKEND_INTERNAL_URL` (the internal backend host never reaches the client
+   bundle — T-15-18);
+3. the hint returns **only** `{ provider }` (the SSO connection tenant) for a
+   domain that maps to an org with a linked connection, or **`404`** otherwise;
+4. the AX surfaces a "Continue with `<provider>` SSO" affordance routing to the
+   matching Kratos OIDC provider's initiate URL. An **unknown** domain → no
+   affordance → the normal password login proceeds.
+
+**Why a second endpoint:** the existing `GET /api/sso/lookup` is part of the
+Organizations feature and requires an authenticated **console** session. The AX
+is an unauthenticated end-user surface, so it cannot call that protected lookup —
+and we do **not** loosen it (T-15-17). The public hint is the minimal, end-user-
+safe alternative: still `organizations`-flag-gated (`404` when OFF), rate-limited
+(it is attacker-reachable), and it leaks **no org-existence** — a domain with no
+org **and** a known domain with no linked connection **both** `404`, and the body
+carries only `{ provider }` (no org id / domain echo — T-15-16). The org lookup
+goes through the **backend**, never Kratos (BACK-01 / T-15-19).
+
+### Verifying Phase 15 — Account Experience (`AX-01..05` / `FLAG-01` / `INFRA-05`)
+
+```bash
+# Full lifecycle (build -> up -d --wait -> drive -> down -v). Git Bash on Windows:
+# prefix MSYS_NO_PATHCONV=1 so leading-slash URL paths are not mangled.
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase15-acceptance.sh
+# (the gate runs `docker compose down -v` itself on exit; pass KEEP_STACK=1 to keep it up)
+```
+
+It proves end to end: the **A1 gating** login smoke (a real Kratos v26.2.0 login
+completes through the `@ory/nextjs` proxy with a same-origin `ory_kratos_session`
+— the highest-risk unknown the research flagged), INFRA-05 (AX refuses Hydra/Keto/
+Oathkeeper admin; Kratos `:4434` residual surfaced), AX-05 cookie/CSP isolation,
+the AX bundle-egress (zero CDN, no internal host), AX-02 theming + AX-03
+localization apply-on-restart, AX-04 base_url Kratos-only restart + the SSRF
+reachability rejection (anti-false-green: `http://kratos:4434` REFUSED) + the
+snippet, **AX-01 org-domain → SSO routing** (a configured domain resolves to its
+provider through the AX server route; an unknown domain `404`s; the protected
+console lookup is still auth-required), FLAG-01 across all the editor routes + the
+public hint, the no-license grep, **and** the v1 + Phase-13/14 invariant
+regression (INFRA-05 admin internal-only, BACK-05 restart-broker-only + no socket
+on backend/AX, BACK-01 no direct frontend→Ory, the saml/organizations guards).
+
+> **A1 self-hosted-proxy finding.** The `@ory/nextjs` proxy is designed for Ory
+> Network; its `Ory-Base-URL-Rewrite*` response headers are **harmlessly ignored**
+> by self-hosted Kratos v26.2.0, and the same-origin cookie-domain rewrite still
+> works — the gating A1 smoke proves a real login completes through it against
+> self-hosted Kratos. The one harness nuance: the flow JSON's `ui.action` carries
+> the internal Kratos host; a browser navigation (and the gate, replicating it)
+> rewrites it to the AX origin so the proxied submit is same-origin.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:

@@ -114,23 +114,32 @@ if [ "${SKIP_EGRESS:-0}" != "1" ]; then
   echo "--- [bundle] AX bundle-egress: no CDN/Google-Fonts + no internal Kratos host in the AX bundle ---"
   AX_DIR="${REPO_ROOT}/account-experience"
   AX_STATIC="${AX_DIR}/.next/static"
-  AX_STANDALONE="${AX_DIR}/.next/standalone/.next"
+  # The CLIENT bundle the browser actually downloads is `.next/static` (mirrored
+  # under the standalone build at `.next/standalone/.next/static`). We scan ONLY
+  # those CLIENT roots for the internal-host leak. We deliberately do NOT scan
+  # the standalone's `server/` chunks: that is SERVER-SIDE code (the Node render
+  # path + the @ory/nextjs proxy) which LEGITIMATELY holds the internal Kratos
+  # host in `ORY_SDK_URL` and the backend host in `BACKEND_INTERNAL_URL` — those
+  # vars are server-only BY DESIGN (never NEXT_PUBLIC_), so the threat (T-15-04/05)
+  # is the CLIENT bundle leaking them, not server code knowing them. Scanning the
+  # server chunks would false-fail on the very server-only discipline we enforce.
+  AX_STANDALONE_STATIC="${AX_DIR}/.next/standalone/.next/static"
   if [ ! -d "$AX_STATIC" ]; then
     echo "    (no prior .next build — building the AX once for the egress scan)"
     ( cd "$AX_DIR" && npm run build ) >/dev/null 2>&1 || true
   fi
   if [ -d "$AX_STATIC" ]; then
-    # Forbidden in the AX client bundle: any CDN/Google-Fonts host, and the
-    # internal Kratos hostname/port in a real URL position (the env-var NAME
-    # ORY_SDK_URL is fine — only the VALUE host would be a leak).
-    AX_FORBIDDEN='cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|unpkg\.com|fonts\.googleapis\.com|fonts\.gstatic\.com|(//|@)(ory-kratos|kratos)([/:."'"'"']|$)|(ory-kratos|kratos):(4433|4434)([^0-9]|$)'
+    # Forbidden in the AX client bundle: any CDN/Google-Fonts host, the internal
+    # Kratos hostname/port, and the internal backend host:port (the env-var NAMES
+    # ORY_SDK_URL / BACKEND_INTERNAL_URL are fine — only the VALUE host is a leak).
+    AX_FORBIDDEN='cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|unpkg\.com|fonts\.googleapis\.com|fonts\.gstatic\.com|(//|@)(ory-kratos|kratos)([/:."'"'"']|$)|(ory-kratos|kratos):(4433|4434)([^0-9]|$)|(//|@)backend([/:."'"'"']|$)|backend:8080'
     declare -a AX_ROOTS=("$AX_STATIC")
-    [ -d "$AX_STANDALONE" ] && AX_ROOTS+=("$AX_STANDALONE")
+    [ -d "$AX_STANDALONE_STATIC" ] && AX_ROOTS+=("$AX_STANDALONE_STATIC")
     AX_HITS="$(grep -rIEli "$AX_FORBIDDEN" "${AX_ROOTS[@]}" 2>/dev/null || true)"
     if [ -z "$AX_HITS" ]; then
-      _pass "[bundle] AX bundle is CDN/Google-Fonts-free and carries no internal Kratos host (searched ${AX_ROOTS[*]})"
+      _pass "[bundle] AX CLIENT bundle is CDN/Google-Fonts-free and carries no internal Kratos/backend host (searched ${AX_ROOTS[*]})"
     else
-      _fail "[bundle] forbidden CDN/font/internal-host reference in the AX bundle:"
+      _fail "[bundle] forbidden CDN/font/internal-host reference in the AX CLIENT bundle:"
       printf '%s\n' "$AX_HITS"
     fi
   else
@@ -659,8 +668,17 @@ else
     _pass "[AX-02] PUT theme override accepted (200)"
     echo "    restarting account-experience (re-reads theme.css at boot)…"
     $DC restart account-experience >/dev/null 2>&1 || true
-    assert_healthy account-experience
-    ax_dom="$(curl -s --max-time 25 "${AX_BASE_URL}/auth/login" 2>/dev/null)"
+    # Poll until healthy: a bare assert_healthy races the post-restart `starting`
+    # window (the AX healthcheck has a start_period + retries before `healthy`).
+    wait_container_healthy account-experience 90
+    # Scan the AX-served DOM for the layout-injected theme override. We probe
+    # /auth/error (HTTP 200) NOT /auth/login: a login GET initiates a Kratos
+    # self-service flow and 307-REDIRECTS through internal hosts the HOST curl
+    # cannot resolve, so its rendered DOM is unreachable from outside the network.
+    # /auth/error renders the SAME root layout (which injects the theme <style>)
+    # as a plain 200 with no Kratos redirect — so the layout-level theme override
+    # (the AX-02 surface) is observable there reliably.
+    ax_dom="$(curl -s -L --max-time 25 "${AX_BASE_URL}/auth/error" 2>/dev/null)"
     if printf '%s' "$ax_dom" | grep -qiF "$THEME_SENTINEL"; then
       _pass "[AX-02] the console-set --ui-* sentinel (${THEME_SENTINEL}) is present in the AX-served DOM after restart"
     else
@@ -693,7 +711,8 @@ else
     fi
     echo "    restarting account-experience (re-reads translations.json at boot)…"
     $DC restart account-experience >/dev/null 2>&1 || true
-    assert_healthy account-experience
+    # Poll until healthy (avoid the post-restart `starting`-window race).
+    wait_container_healthy account-experience 90
     # The AX boots cleanly WITH the override loaded into config.intl.customTranslations
     # (a malformed catalog would fall back to {} but a valid one is read at module
     # init). A healthy AX after the restart proves the override was consumed without
@@ -762,7 +781,9 @@ else
   if [ "$base_put" = "200" ]; then
     _pass "[AX-04] serve.public.base_url + allowed_return_urls write accepted (200) — base_url is allowlisted"
     assert_only_container_restarted "$KRATOS_CONTAINER" ory-hydra ory-keto ory-oathkeeper
-    assert_healthy "$KRATOS_CONTAINER"
+    # Poll until Kratos is healthy again (the config-edit broker restart leaves it
+    # in a `starting` window briefly; a bare assert_healthy races it).
+    wait_container_healthy "$KRATOS_CONTAINER" 90
     # Confirm the value round-trips back through the config-edit GET.
     uiurls_body="$(_auth_get_body "$UIURLS_URL")"
     if printf '%s' "$uiurls_body" | grep -qF "$AX04_BASE"; then
@@ -834,10 +855,129 @@ else
     _fail "[AX-04] reverse-proxy snippet did not carry the expected host/service mapping"
   fi
 
-  # Reset the overrides + flag so a re-run starts clean (best-effort).
+  # ===========================================================================
+  # AX-01 (SSO-06 surfacing) — the login-time org-domain->SSO ROUTING path.
+  #
+  # The AX login screen routes an org-domain email to that org's SSO provider via
+  # a NARROW, UNAUTHENTICATED backend HINT (`GET /api/sso/hint`), called through
+  # the AX's OWN server route (`/api/sso-lookup`). We prove the path end to end:
+  #   (a) seed an org with a verified domain + a linked SSO connection tenant via
+  #       the authenticated console Organizations API (organizations flag ON),
+  #   (b) the AX server route returns {provider} for that domain (AX -> backend,
+  #       NOT Kratos — BACK-01), and the public backend hint returns it too,
+  #   (c) an UNKNOWN domain -> 404/no-route on BOTH (the login proceeds normally),
+  #   (d) information-disclosure discipline (T-15-16/17): the hint returns ONLY
+  #       {provider} (no org id / no domain echo), the existing PROTECTED console
+  #       lookup still requires auth, and flag-OFF -> 404.
+  # ===========================================================================
+  echo
+  echo "============================================================"
+  echo " AX-01 (SSO-06) — org-domain->SSO login routing (AX -> backend hint)"
+  echo "============================================================"
+
+  ORGS_URL="${BACKEND_BASE_URL}/api/organizations"
+  HINT_URL="${BACKEND_BASE_URL}/api/sso/hint"             # PUBLIC backend hint (unauth)
+  LOOKUP_URL="${BACKEND_BASE_URL}/api/sso/lookup"          # PROTECTED console lookup
+  AX_HINT_URL="${AX_BASE_URL}/api/sso-lookup"              # the AX's OWN server route
+
+  AX01_DOMAIN="ax01-org-$$.example.com"
+  AX01_EMAIL="alice@${AX01_DOMAIN}"
+  AX01_PROVIDER="org-ax01-$$"
+  AX01_UNKNOWN_EMAIL="nobody@unknown-ax01-$$.example.org"
+
+  # The organizations feature must be ON for the hint + CRUD (it is currently ON,
+  # turned on above for AX-02/03; ensure it explicitly).
+  _set_flag organizations true
+
+  echo
+  echo "--- [AX-01] seed an org with a verified domain + linked SSO connection (console API) ---"
+  AX01_ORG_BODY="{\"label\":\"AX01 Org\",\"domains\":[\"${AX01_DOMAIN}\"],\"sso_connection_tenant\":\"${AX01_PROVIDER}\"}"
+  org_create_code="$(_auth_mut_code POST "$ORGS_URL" "$AX01_ORG_BODY")"
+  if [ "$org_create_code" = "200" ] || [ "$org_create_code" = "201" ]; then
+    _pass "[AX-01] seeded an org with domain ${AX01_DOMAIN} -> provider ${AX01_PROVIDER} ($org_create_code)"
+  else
+    _fail "[AX-01] could not seed the org fixture via the console API (got '$org_create_code')"
+  fi
+
+  # (b) the PUBLIC backend hint resolves the domain to ONLY {provider} (unauth).
+  echo
+  echo "--- [AX-01] the PUBLIC backend hint resolves the org domain to {provider} (unauthenticated) ---"
+  hint_body="$(curl -s --max-time 15 "${HINT_URL}?email=$(printf '%s' "$AX01_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  hint_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${HINT_URL}?email=$(printf '%s' "$AX01_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  if [ "$hint_code" = "200" ] && printf '%s' "$hint_body" | grep -qF "$AX01_PROVIDER"; then
+    _pass "[AX-01] public hint returns the provider for the org domain (200 + ${AX01_PROVIDER}, unauthenticated)"
+  else
+    _fail "[AX-01] public hint did not resolve the org domain (code=$hint_code body=$(printf '%s' "$hint_body" | head -c 200))"
+  fi
+  # T-15-16: the hint body carries ONLY {provider} — no org id, no domain echo.
+  if printf '%s' "$hint_body" | grep -qiE 'org_id|"domain"'; then
+    _fail "[AX-01/T-15-16] the public hint LEAKED org id/domain (enumeration surface): $(printf '%s' "$hint_body" | head -c 200)"
+  else
+    _pass "[AX-01/T-15-16] the public hint body carries only {provider} (no org id / domain echo — no enumeration)"
+  fi
+
+  # (a)+(b) the AX's OWN server route returns the provider (AX -> backend, NOT Kratos).
+  echo
+  echo "--- [AX-01] the AX server route (/api/sso-lookup) returns the provider (AX -> backend, BACK-01) ---"
+  ax_hint_body="$(curl -s --max-time 15 "${AX_HINT_URL}?email=$(printf '%s' "$AX01_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  ax_hint_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${AX_HINT_URL}?email=$(printf '%s' "$AX01_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  if [ "$ax_hint_code" = "200" ] && printf '%s' "$ax_hint_body" | grep -qF "$AX01_PROVIDER"; then
+    _pass "[AX-01] the AX server route resolves the provider (200 + ${AX01_PROVIDER}) — AX -> backend hint path proven"
+  else
+    _fail "[AX-01] the AX server route did not resolve the provider (code=$ax_hint_code body=$(printf '%s' "$ax_hint_body" | head -c 200))"
+  fi
+
+  # (c) an UNKNOWN domain -> 404/no-route on BOTH (the normal login proceeds).
+  echo
+  echo "--- [AX-01] an UNKNOWN domain -> 404 on both the public hint and the AX route (login proceeds) ---"
+  unknown_hint_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${HINT_URL}?email=$(printf '%s' "$AX01_UNKNOWN_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  if [ "$unknown_hint_code" = "404" ]; then
+    _pass "[AX-01] public hint of an unknown domain -> 404 (no SSO route; value-free)"
+  else
+    _fail "[AX-01] public hint of an unknown domain -> ${unknown_hint_code} (want 404)"
+  fi
+  unknown_ax_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${AX_HINT_URL}?email=$(printf '%s' "$AX01_UNKNOWN_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  if [ "$unknown_ax_code" = "404" ]; then
+    _pass "[AX-01] the AX server route of an unknown domain -> 404 (no affordance; normal login proceeds)"
+  else
+    _fail "[AX-01] the AX server route of an unknown domain -> ${unknown_ax_code} (want 404)"
+  fi
+
+  # (d) T-15-17: the existing PROTECTED console lookup STILL requires auth — an
+  #     UNAUTHENTICATED call (no session cookie) must NOT succeed (401/404), proving
+  #     we did NOT loosen it to build the hint.
+  echo
+  echo "--- [AX-01/T-15-17] the PROTECTED console lookup still rejects an UNAUTHENTICATED call (not loosened) ---"
+  prot_unauth_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${LOOKUP_URL}?email=$(printf '%s' "$AX01_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  if [ "$prot_unauth_code" = "401" ] || [ "$prot_unauth_code" = "403" ] || [ "$prot_unauth_code" = "404" ]; then
+    _pass "[AX-01/T-15-17] unauthenticated console lookup -> ${prot_unauth_code} (protected lookup NOT loosened)"
+  else
+    _fail "[AX-01/T-15-17] unauthenticated console lookup -> ${prot_unauth_code} (the protected lookup is reachable unauth — REGRESSION)"
+  fi
+
+  # FLAG-01 for the hint: organizations OFF -> the public hint 404s even for a
+  # known domain (the gate beats the lookup). Restore ON afterward.
+  echo
+  echo "--- [AX-01/FLAG-01] organizations OFF -> the public hint 404s for a known domain ---"
+  _set_flag organizations false
+  hint_off_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${HINT_URL}?email=$(printf '%s' "$AX01_EMAIL" | sed 's/@/%40/')" 2>/dev/null)"
+  if [ "$hint_off_code" = "404" ]; then
+    _pass "[AX-01/FLAG-01] public hint with organizations OFF -> 404 (feature gate beats the lookup)"
+  else
+    _fail "[AX-01/FLAG-01] public hint with organizations OFF -> ${hint_off_code} (want 404)"
+  fi
+  _set_flag organizations true
+
+  # Reset the overrides + flag so a re-run starts clean (best-effort). CRITICAL:
+  # restore serve.public.base_url to its CANONICAL committed value
+  # (`http://kratos:4433/`), NOT blank. Blanking it makes Kratos emit a relative
+  # flow action and breaks the same-origin CSRF/session path the A1 gating smoke
+  # relies on — which would then fail on the NEXT run (and leave kratos.yml dirty
+  # in the working tree). The config-edit engine rewrites the file, so a re-run
+  # always starts from the canonical issuer URL.
   _auth_mut_code PUT "$THEME_URL" '{"source":""}' >/dev/null 2>&1 || true
   _auth_mut_code PUT "$TRANS_URL" '{}' >/dev/null 2>&1 || true
-  _auth_mut_code PUT "$UIURLS_URL" '{"/serve/public/base_url":""}' >/dev/null 2>&1 || true
+  _auth_mut_code PUT "$UIURLS_URL" '{"/serve/public/base_url":"http://kratos:4433/"}' >/dev/null 2>&1 || true
 fi
 
 # =============================================================================
@@ -871,22 +1011,107 @@ else
 fi
 
 # =============================================================================
-# v1-INVARIANT REGRESSION HAND-OFF — Plan 04 extends this script in place.
+# v1 + Phase-13/14 INVARIANT REGRESSION SWEEP (Plan 04 — finalization).
 #
-# AX-01..05 are now asserted end-to-end by THIS gate: A1 login smoke (15-01),
-# AX-05 cookie/CSP isolation (15-01), INFRA-05 (15-01), AX-02 theming + AX-03
-# localization (15-02), and AX-04 custom-domains (base_url config-edit Kratos-only
-# restart + SSRF-guarded reachability rejection + reverse-proxy snippet, 15-03)
-# plus FLAG-01 404 across all five console editor routes. Plan 04 layers the
-# remaining v1-invariant regression sweep (BACK-05 restart-broker scope, the live
-# BRAND-02 ui_url rebind) on top of this proven base.
+# The whole stack is up WITH the AX added; re-prove the load-bearing v1 +
+# Phase-13/14 security invariants still hold (they must not have regressed now
+# that the AX edge service + the public SSO-hint route exist). We assert the KEY
+# invariants INLINE against this already-running stack (rather than re-invoking
+# each phaseN-acceptance.sh, which would each tear down + rebuild their own fresh
+# volume and collide with this live stack):
+#   - INFRA-05  Admin ports REFUSED from the host; the Kratos admin API IS
+#               reachable from the TRUSTED backend (internal-only, not exposed).
+#   - BACK-05   the restart-broker is default-deny: an Ory restart is ALLOWED, a
+#               container LIST / a non-Ory (postgres) restart / a stop is DENIED;
+#               the backend holds NO docker socket.
+#   - BACK-01   the FRONTEND container has NO direct route to any Ory admin port
+#               (it talks only to the backend); the new AX public hint did not
+#               open a frontend->Ory path.
+#   - Phase-13/14 the saml + organizations flag-gated routes still 404 when OFF
+#               (FLAG-01/SSO-07), and Polis admin :5225 is NOT host-published.
 # =============================================================================
 echo
 echo "============================================================"
-echo " v1-INVARIANT REGRESSION HAND-OFF (Plan 04)"
+echo " v1 + Phase-13/14 INVARIANT REGRESSION (INFRA-05 / BACK-05 / BACK-01)"
 echo "============================================================"
-echo "  [AX-01 live rebind]  a BRAND-02 config-edit PUT rebinds ui_url + restarts ONLY Kratos via the broker (Plan 04)"
-echo "  [BACK-05 broker]     full restart-broker scope sweep over the Ory + AX containers (Plan 04)"
+
+# --- Detect the Docker engine API version (mirror phase1's detector) ---------
+_detect_api_version() {
+  local ver=""
+  ver="$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true)"
+  [ -z "$ver" ] && ver="$(docker version --format '{{.Client.APIVersion}}' 2>/dev/null || true)"
+  [ -z "$ver" ] && ver="1.43"
+  printf 'v%s' "$ver"
+}
+API_VER="$(_detect_api_version)"
+echo "Using Docker engine API version path: ${API_VER}"
+
+# --- INFRA-05: admin ports refused from host; Kratos admin internal-only ------
+echo
+echo "--- [INFRA-05 regression] Ory admin ports REFUSED from the host (4434/4445/4467/4469/4456) ---"
+for port in 4434 4445 4467 4469 4456; do
+  assert_port_refused "$port"
+done
+# Positive: the TRUSTED backend container reaches the Kratos admin API internally.
+assert_internal_reachable backend "http://kratos:4434/health/ready"
+# Polis admin/OIDC :5225 is NEVER host-published (Phase-13 INFRA-05).
+echo
+echo "--- [INFRA-05 regression] Polis admin/OIDC :5225 is NOT host-published ---"
+assert_port_refused 5225
+
+# --- BACK-05: restart-broker default-deny scope + no socket on the backend ----
+echo
+echo "--- [BACK-05 regression] restart-broker default-deny scope (Ory restart allowed; list/stop/non-Ory denied) ---"
+assert_broker_allowed POST "/${API_VER}/containers/${KRATOS_CONTAINER}/restart"
+assert_broker_allowed POST "/${API_VER}/containers/${KRATOS_CONTAINER}/restart?t=5"
+assert_broker_denied  GET  "/${API_VER}/containers/json"
+assert_broker_denied  POST "/${API_VER}/containers/${KRATOS_CONTAINER}/stop"
+assert_broker_denied  POST "/${API_VER}/containers/postgres/restart"
+# The backend (and the AX) must NOT hold the docker socket — only the broker may.
+assert_no_socket_mount backend
+assert_no_socket_mount account-experience
+
+# --- BACK-01: the frontend has NO direct route to any Ory admin port ----------
+# The console talks ONLY to the backend; the AX's new public hint added a backend
+# call, never a frontend->Ory path. Prove the frontend container cannot reach the
+# Ory admin ports (node fetch inside the container — REFUSED on connection error).
+echo
+echo "--- [BACK-01 regression] the FRONTEND container has NO direct route to Ory admin ports ---"
+_frontend_can_reach() {
+  local url="$1"
+  $DC exec -T frontend node -e "
+    fetch(process.argv[1], { signal: AbortSignal.timeout(4000) })
+      .then(() => { process.stdout.write('OK'); })
+      .catch(() => { process.stdout.write('REFUSED'); });
+  " "$url" 2>/dev/null
+}
+for target in "http://kratos:4434/admin/identities" "http://hydra:4445/admin/clients" \
+              "http://keto:4467/relation-tuples" "http://oathkeeper:4456/rules"; do
+  fv="$(_frontend_can_reach "$target")"
+  if [ "$fv" = "REFUSED" ]; then
+    _pass "[BACK-01] frontend CANNOT reach ${target} (no direct frontend->Ory route)"
+  else
+    _fail "[BACK-01] frontend REACHED ${target} (verdict='$fv') — a direct frontend->Ory path exists!"
+  fi
+done
+
+# --- Phase-13/14: the flag-gated routes still 404 when OFF (FLAG-01/SSO-07) ----
+# Re-assert against an UNAUTHENTICATED request: a saml/organizations-gated route
+# is unreachable without a session anyway, but the public SSO hint we added is the
+# one organizations-gated route reachable unauth — its flag-OFF 404 was proven in
+# the AX-01 block above. Here we re-confirm the saml-gated config route is absent
+# to an unauthenticated caller (auth_guard 401, never a 200/route-present leak).
+echo
+echo "--- [Phase-13/14 regression] saml/organizations protected routes are not anonymously reachable ---"
+for purl in "${BACKEND_BASE_URL}/api/config/polis" "${BACKEND_BASE_URL}/api/sso/connections" \
+            "${BACKEND_BASE_URL}/api/organizations"; do
+  pc="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$purl" 2>/dev/null)"
+  if [ "$pc" = "401" ] || [ "$pc" = "404" ]; then
+    _pass "[Phase-13/14] GET ${purl##*/api/} unauthenticated -> ${pc} (gated/guarded, not anonymously served)"
+  else
+    _fail "[Phase-13/14] GET ${purl##*/api/} unauthenticated -> ${pc} (want 401/404 — a guard regressed)"
+  fi
+done
 
 # =============================================================================
 # Verdict — surface the A1 gating result explicitly.
