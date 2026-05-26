@@ -9,8 +9,8 @@
 // scripts/copy-monaco.mjs at prebuild/predev). The AMD `loader.js` then fetches
 // `editor/editor.main.js` AND the language Web Workers (min/vs/assets/*.worker-*)
 // all relative to that same base — so the editor AND its language features
-// (JSON validation squiggles, formatting, etc.) work with ZERO requests to
-// cdn.jsdelivr.net and ZERO dependency on Turbopack's worker transform.
+// (JSON validation squiggles, formatting, etc.) work with ZERO requests to the
+// default jsDelivr CDN and ZERO dependency on Turbopack's worker transform.
 //
 // Why NOT Strategy A (`loader.config({ monaco })` + `?worker` ESM imports):
 // the `?worker` import suffix is a webpack/Vite convention; Next 16 defaults to
