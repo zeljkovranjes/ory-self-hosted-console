@@ -66,6 +66,13 @@ async fn main() -> Result<(), AppError> {
     // AFTER migrate, BEFORE serve (RESEARCH "Bootstrap order").
     ensure_bootstrap_token(&pool).await?;
 
+    // Phase 12 (FLAG-01, Pitfall 5): load the feature-flag cache AFTER migrate (so
+    // `0007` is applied and the table exists) and BEFORE serve (so no gated route
+    // is ever reachable with an empty cache — fail-closed boot). The cache is
+    // injected into every Depot via affix_state inside `routes::build`.
+    let flags = ory_console_backend::features::FeatureFlags::load(&pool).await?;
+    tracing::info!("feature-flag cache loaded");
+
     // WR-07: background session reaper. A detached tokio task periodically
     // deletes sessions past their absolute `expires_at` so the table cannot grow
     // without bound from abandoned (never-logged-out) sessions. Runs one sweep
@@ -147,7 +154,7 @@ async fn main() -> Result<(), AppError> {
     // WR-03: `build` validates the five Ory admin URLs and fails fast at boot
     // (before binding the listener) if any is malformed, rather than degrading
     // to opaque per-request 502s.
-    let router = routes::build(pool.clone(), cfg)?;
+    let router = routes::build(pool.clone(), cfg, flags)?;
 
     tracing::info!(%bind_addr, "starting ory-console-backend");
 

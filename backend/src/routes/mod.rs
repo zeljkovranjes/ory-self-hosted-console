@@ -56,6 +56,17 @@ async fn index() -> &'static str {
     "ory-console-backend: ok"
 }
 
+/// Phase 12 (FLAG-01) keystone probe handler. A trivial 200 JSON behind the
+/// `FeatureFlagHoop::new("saml")` gate. When `saml` is OFF (the seeded default)
+/// the hoop 404s before this ever runs; when ON it returns 200 — that pair is the
+/// full FLAG-01 proof. It carries NO logic of its own and touches no Ory service
+/// (preserving the v1 no-direct-Ory invariant).
+#[handler]
+async fn feature_probe(res: &mut Response) {
+    res.status_code(StatusCode::OK);
+    res.render(Json(serde_json::json!({ "probe": "ok" })));
+}
+
 /// Extract the request origin: the `Origin` header, falling back to the origin
 /// (scheme://host[:port]) parsed out of `Referer`. Returns `None` if neither is
 /// present.
@@ -185,7 +196,17 @@ pub fn attach_github(public: Router, cfg: &Config) -> Router {
 }
 
 /// Build the application router (RESEARCH Pattern 5).
-pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError> {
+///
+/// Phase 12 (FLAG-01): `flags` is the boot-loaded in-process feature-flag cache,
+/// injected into every `Depot` (alongside the pool/cfg/clients) so the
+/// `FeatureFlagHoop` on the protected subtree can read it. The cache is loaded in
+/// `main.rs` AFTER migrate and BEFORE serve (Pitfall 5) so no gated route is ever
+/// reachable with an empty cache.
+pub fn build(
+    pool: PgPool,
+    cfg: Config,
+    flags: crate::features::FeatureFlags,
+) -> Result<Router, crate::error::AppError> {
     // PUBLIC subtree — no auth hoop (CAUTH-06 public set).
     let mut public = Router::new()
         .push(Router::with_path("health").get(health))
@@ -267,6 +288,35 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
                 .post(crate::apikeys::routes::issue_api_key), // PROJ-02 issue (one-time reveal)
         )
         .push(Router::with_path("api/console/members").get(crate::members::list_members))
+        // Phase 12 (FLAG-02 / FLAG-04): feature-flag MANAGEMENT routes. These
+        // read/toggle flags and are therefore NEVER themselves FeatureFlagHoop-
+        // gated. Both inherit auth_guard (401); the PUT inherits csrf_guard (403)
+        // and is auto-audited by the response-phase audit_hoop. The most-specific
+        // `{key}` path is mounted FIRST (mirrors the api-keys `{id}/revoke`-before-
+        // `api-keys` ordering) so it is not captured by the broader match.
+        .push(
+            Router::with_path("api/console/features/{key}")
+                .put(crate::features::routes::set_feature), // FLAG-04 toggle (CSRF-guarded, audited)
+        )
+        .push(
+            Router::with_path("api/console/features")
+                .get(crate::features::routes::list_features), // FLAG-02 read (seeded set + meta)
+        )
+        // Phase 12 (FLAG-01): the KEYSTONE gated probe. A minimal self-contained
+        // route mounted INSIDE the protected subtree (so it sits AFTER the
+        // audit/auth/csrf hoops) and gated by FeatureFlagHoop::new("saml") — which
+        // is seeded OFF. A request reaching it has ALREADY passed auth_guard (valid
+        // session) and csrf_guard (valid CSRF), yet a flag-OFF still 404s: that
+        // ordering IS the FLAG-01 security guarantee. This probe is the permanent
+        // keystone-test anchor; later phases mount real feature routes against the
+        // same hoop. GET + POST so the keystone test can prove the gate beats BOTH
+        // a csrf-exempt read and a csrf-guarded state change.
+        .push(
+            Router::with_path("api/features/_probe")
+                .hoop(crate::features::FeatureFlagHoop::new("saml"))
+                .get(feature_probe)
+                .post(feature_probe),
+        )
         // Phase 3 (BACK-02) Ory Admin proof wrappers. GET-only, so `csrf_guard`
         // auto-exempts them; they inherit `auth_guard` (401 when unauthenticated)
         // by sitting on this protected subtree. Thin pass-throughs to the typed
@@ -552,8 +602,10 @@ pub fn build(pool: PgPool, cfg: Config) -> Result<Router, crate::error::AppError
     let ory_clients = crate::ory::clients::OryClients::from_config(&cfg)?;
 
     // Root: inject shared state, then the public index + both subtrees.
+    // Phase 12 (FLAG-01): the FeatureFlags cache rides the same affix_state chain
+    // as the pool/cfg/clients; the FeatureFlagHoop reads it via depot.obtain.
     Ok(Router::new()
-        .hoop(affix_state::inject(pool).inject(cfg).inject(ory_clients))
+        .hoop(affix_state::inject(pool).inject(cfg).inject(ory_clients).inject(flags))
         .get(index)
         .push(public)
         .push(protected))

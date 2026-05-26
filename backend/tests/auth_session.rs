@@ -13,25 +13,12 @@ use ory_console_backend::auth::session;
 use ory_console_backend::config::Config;
 use sqlx::PgPool;
 
+/// Hardened-default test config. Delegates to the shared `common::default_test_cfg`
+/// (the single source of truth) so this file never drifts from the `Config` struct
+/// as new fields are added — the previous hand-rolled literal went stale when
+/// `webhook_allow_private_targets` (Phase 11) was introduced and stopped compiling.
 fn test_cfg() -> Config {
-    Config {
-        console_database_url: String::new(),
-        bind_addr: "0.0.0.0:8080".into(),
-        session_idle_secs: 604_800,
-        session_absolute_secs: 2_592_000,
-        insecure_cookies: true,
-        allowed_origins: Vec::new(),
-        github: None,
-        kratos_admin_url: "http://kratos:4434".into(),
-        hydra_admin_url: "http://hydra:4445".into(),
-        hydra_public_url: "http://hydra:4444".into(),
-        keto_read_url: "http://keto:4466".into(),
-        keto_write_url: "http://keto:4467".into(),
-        keto_opl_url: "http://keto:4469".into(),
-        oathkeeper_api_url: "http://oathkeeper:4456".into(),
-        restart_broker_url: "http://restart-broker:2375".into(),
-        config_dir: "/etc/config".into(),
-    }
+    common::default_test_cfg()
 }
 
 #[sqlx::test(migrations = "./migrations")]

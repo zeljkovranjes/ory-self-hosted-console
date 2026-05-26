@@ -26,6 +26,27 @@ pub fn build_test_router(pool: PgPool) -> Router {
     build_test_router_cfg(pool, default_test_cfg())
 }
 
+/// Build a [`FeatureFlags`](ory_console_backend::features::FeatureFlags) cache
+/// matching the `0007` migration seed (Phase 12 FLAG-01/04). The `#[sqlx::test]`
+/// harness applies `0007` to the temp DB, so the seeded enabled state is known
+/// statically: external-setup features OFF, `opl_live_validation` ON. Building the
+/// cache from this canonical seed (instead of an async DB read) keeps
+/// `build_test_router` synchronous — and stays consistent with the binary because
+/// toggles in the tests go through the PUT route, which refreshes THIS same cache
+/// instance held by the router. The keystone probe is gated by `saml` (OFF here),
+/// so a flag-OFF request 404s and a PUT-toggle ON makes it 200.
+pub fn seeded_test_flags() -> ory_console_backend::features::FeatureFlags {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    map.insert("saml".to_string(), false);
+    map.insert("organizations".to_string(), false);
+    map.insert("account_experience".to_string(), false);
+    map.insert("observability".to_string(), false);
+    map.insert("event_streams".to_string(), false);
+    map.insert("opl_live_validation".to_string(), true);
+    ory_console_backend::features::FeatureFlags::from_map(map)
+}
+
 /// Hardened-default test config. `insecure_cookies = true` because the
 /// in-process `TestClient` speaks plain HTTP (the `__Host-`/Secure cookie would
 /// otherwise be a production-only flag the test transport cannot model).
@@ -74,7 +95,10 @@ pub fn build_test_router_cfg(pool: PgPool, cfg: ory_console_backend::config::Con
     // WR-03: `routes::build` is now fallible (it validates the Ory admin URLs).
     // The test `Config` always uses the valid internal-network defaults, so this
     // never fails in practice; `expect` surfaces a misconfigured fixture loudly.
-    ory_console_backend::routes::build(pool, cfg).expect("test router build (valid admin URLs)")
+    // Phase 12: pass the seeded feature-flag cache so the test router matches the
+    // binary (FeatureFlagHoop on the protected subtree reads it via the Depot).
+    ory_console_backend::routes::build(pool, cfg, seeded_test_flags())
+        .expect("test router build (valid admin URLs)")
 }
 
 /// Run the embedded console migrations against a test pool.
