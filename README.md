@@ -493,6 +493,79 @@ round-trip note above.
 
 ---
 
+## Authentication Config (Phase 7)
+
+Phase 7 adds ten Kratos **authentication-config** pages (methods, passwordless,
+MFA/AAL, social OIDC, sessions, recovery, verification, SMTP, SMS, web_hooks),
+each one a Kratos config **section** edited through the same Phase-4 transactional
+engine (lock → allowlist-filter → merge into the full doc → validate against the
+pinned v26.2.0 schema with the `dsn` overlay → atomic write + backup → restart
+**only Kratos** → health-poll → rollback). Editable secrets are **write-only** in
+the UI: the backend masks them on `GET` and merges-by-`id` on `PUT` so an untouched
+secret is preserved (never clobbered with the mask sentinel).
+
+### Caveats (read before configuring auth in production)
+
+- **File-secret residual risk.** The editable secrets — the SMTP
+  `connection_uri` (set only via the dedicated write-only `/api/kratos/smtp-connection`
+  path), per-provider OIDC `client_secret` (and `apple_private_key`), and the SMS
+  channel / web_hook `auth` credentials — are written into the mounted
+  `config/kratos/kratos.yml` as **operator-managed file secrets**, consistent with
+  the self-hosted "YAML + restart" model (self-hosted Ory has no live config API).
+  They are masked on `GET` and never echoed/logged, but they live at rest in the
+  config file on the host. Treat `config/kratos/kratos.yml` as a secret-bearing file
+  (restrict filesystem permissions; keep it out of any image layer or VCS commit).
+- **Inline Jsonnet only (`base64://`) — remote-fetch SSRF deferred.** The OIDC
+  mapper, the SMS `request_config.body`, and the web_hook `config.body` are Jsonnet
+  templates. In Phase 7 the console stores them **inline** as `base64://<b64(source)>`
+  (the Monaco editor edits source; the backend encodes/decodes — no fetch). A remote
+  `http(s)://` Jsonnet/web_hook URL would cause Kratos to **fetch it at runtime**, an
+  SSRF/exfiltration surface; that remote-URL-fetch hardening (allowlist/guard) is an
+  accepted-and-**deferred** posture, owned by the Phase-11 webhook dispatcher
+  (HOOK-02). Phase 7 deliberately keeps the surface to inline `base64://`.
+- **The hard denylist stays non-editable.** `dsn`, `secrets.*`, and `serve.admin`
+  remain on the Phase-4 `SENSITIVE_PREFIXES` denylist — a `PUT` of any of them is
+  refused `403` on **every** section path with no disk write (the denylist wins over
+  any allowlist, and editing `secrets.cipher`/`secrets.cookie` would corrupt stored
+  data). The SMTP `connection_uri` is likewise on the denylist for the generic
+  section path (`403`) and is writable **only** through its dedicated, masked,
+  write-only endpoint.
+
+### Verifying Phase 7
+
+Offline (no stack) — backend allowlist / secret-merge / SMTP-write-only tests:
+
+```bash
+cd backend && SQLX_OFFLINE=true cargo build --locked && cargo test --lib config_edit && cargo test --test auth_config -- --skip live
+cd frontend && npm run typecheck && npm run test
+```
+
+Live — a single fail-closed gate proves a representative key per section group
+end-to-end against the real stack and tears it down cleanly afterward (a `trap`
+restores `config/kratos/kratos.yml` and runs `docker compose down -v`):
+
+```bash
+docker compose down -v
+MSYS_NO_PATHCONV=1 docker compose build backend frontend
+MSYS_NO_PATHCONV=1 docker compose up -d --wait
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase7-acceptance.sh   # Git Bash on Windows
+# (the gate runs `docker compose down -v` itself on exit; pass KEEP_STACK=1 to keep it up)
+```
+
+The gate exits `0` only when, for each section group, a write **validates →
+persists → restarts only Kratos** (Hydra/Keto/Oathkeeper `StartedAt` unchanged) →
+recovers healthy → `GET` reflects the change with **secrets masked**; the OIDC and
+SMTP secrets survive an **untouched-secret preserve** round-trip (a mask-echo `PUT`
+does not clobber the stored value) while a retyped secret overwrites; an **invalid**
+value (bad AAL enum / bad duration) is rejected `422` with **no disk write**; a
+**sensitive** key (`/dsn`, `/secrets/*`, `/serve/admin`, or `connection_uri` via the
+section path) and an out-of-scope **per-index** OIDC pointer are refused `403`;
+unauthenticated / no-CSRF writes are refused `401` / `403`; and the
+**bundle-egress** gate stays clean. Every negative assertion passes ONLY on the
+explicit refusal (a `2xx` where a `4xx` is due is a hard fail).
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
