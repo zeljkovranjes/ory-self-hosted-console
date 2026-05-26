@@ -94,11 +94,26 @@ async fn main() -> Result<(), AppError> {
     // retried next tick — it never panics the loop or blocks request serving.
     {
         let worker_pool = pool.clone();
+        // EFFECTIVE SSRF posture (fail-closed double-gate, T-11-01/02). In the
+        // production posture this is ALWAYS false (the worker fully enforces the
+        // SSRF classifier); it can only be true under the dev insecure-cookie
+        // escape hatch AND an explicit WEBHOOK_ALLOW_PRIVATE_TARGETS — the live
+        // acceptance gate's posture, where the echo receiver lives on the internal
+        // docker network. The resolve + pin + redirects-off hardening applies
+        // regardless, so even when relaxed the connection cannot be rebound.
+        let allow_private = cfg.webhook_allow_private_targets();
+        if allow_private {
+            tracing::warn!(
+                "WEBHOOK_ALLOW_PRIVATE_TARGETS is active (dev/acceptance posture): the \
+                 webhook worker may deliver to private/loopback targets — NEVER use this in \
+                 production"
+            );
+        }
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(WEBHOOK_TICK_INTERVAL);
             loop {
                 ticker.tick().await;
-                if let Err(e) = webhooks::worker::tick(&worker_pool).await {
+                if let Err(e) = webhooks::worker::tick_with(&worker_pool, allow_private).await {
                     tracing::warn!(error = %e, "webhook worker tick failed");
                 }
             }

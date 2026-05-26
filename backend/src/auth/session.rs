@@ -186,6 +186,7 @@ mod tests {
             oathkeeper_api_url: "http://oathkeeper:4456".into(),
             restart_broker_url: "http://restart-broker:2375".into(),
             config_dir: "/etc/config".into(),
+            webhook_allow_private_targets: false,
         }
     }
 

@@ -399,6 +399,17 @@ services:
       #     Origin; set this to your console origin(s) for defense-in-depth.
       CONSOLE_INSECURE_COOKIES: ${CONSOLE_INSECURE_COOKIES:-}
       CONSOLE_ALLOWED_ORIGINS: ${CONSOLE_ALLOWED_ORIGINS:-}
+      # Phase 11 (HOOK-01/02) — TEST/CI-ONLY webhook-worker SSRF relaxation.
+      # DEFAULT EMPTY (false): in production the webhook worker fully enforces the
+      # SSRF classifier (private/loopback/metadata targets are blocked). The live
+      # acceptance gate (scripts/verify/phase11-acceptance.sh) sets this to `true`
+      # for its ephemeral run so the worker can deliver to the internal `echo-
+      # receiver` sidecar (an RFC1918 docker address the guard would otherwise
+      # block). It is DOUBLE-GATED in the backend: honored ONLY when
+      # CONSOLE_INSECURE_COOKIES is ALSO set (the dev/acceptance posture) — so even
+      # if accidentally set in production it is ignored. The DNS resolve + pin
+      # (TOCTOU) + redirects-off hardening apply regardless. NEVER set this in prod.
+      WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-}
       # Backend reaches the Docker engine ONLY through the scoped broker.
       RESTART_BROKER_URL: http://restart-broker:2375
       # Backend's own state DB (Phase 2 owns the schema).
@@ -471,3 +482,54 @@ services:
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     networks: [edge]
+
+  # ===========================================================================
+  # Echo receiver (Phase 11 — TEST/CI ONLY, gated behind the `acceptance`
+  # profile). The webhook-delivery SUCCESS target for scripts/verify/
+  # phase11-acceptance.sh: a tiny HTTP server that 200s every POST and prints the
+  # request method, path, every header (incl. X-Console-Signature), and the raw
+  # body to stdout, so the gate can read `docker compose logs echo-receiver`,
+  # extract the signature the worker sent, and verify the HMAC against the
+  # webhook's secret. It lives ONLY on the `internal` network (never host-
+  # published) and ONLY runs when the `acceptance` profile is selected, so a
+  # normal `docker compose up` does NOT start it (threat T-11-28). The SSRF
+  # NEGATIVE targets (169.254.169.254 / 127.0.0.1 / an internal Ory admin
+  # host:port) need NO sidecar — they must be rejected before any connection.
+  echo-receiver:
+    image: python:3.12-alpine
+    container_name: echo-receiver
+    profiles: ["acceptance"]
+    # Unbuffered stdout (-u) so each request line is flushed to the container log
+    # immediately and the gate can poll for it. The handler reflects nothing
+    # sensitive — it only echoes what the worker chose to send.
+    command:
+      - "python"
+      - "-u"
+      - "-c"
+      - |
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import sys
+        class H(BaseHTTPRequestHandler):
+            def _handle(self):
+                length = int(self.headers.get('Content-Length', 0) or 0)
+                body = self.rfile.read(length) if length else b''
+                # One machine-greppable line per header + a body line. The gate
+                # parses ECHO-HEADER X-Console-Signature: <sig> and ECHO-BODY <...>.
+                for k, v in self.headers.items():
+                    print(f"ECHO-HEADER {k}: {v}", flush=True)
+                print(f"ECHO-METHOD {self.command} {self.path}", flush=True)
+                print(f"ECHO-BODY {body.decode('utf-8', 'replace')}", flush=True)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            def do_POST(self):
+                self._handle()
+            def do_GET(self):
+                self._handle()
+            def log_message(self, *a):
+                pass
+        print("echo-receiver listening on 0.0.0.0:9000", flush=True)
+        HTTPServer(('0.0.0.0', 9000), H).serve_forever()
+    networks: [internal]
+    # NO host ports — reachable only from the backend over the internal network.

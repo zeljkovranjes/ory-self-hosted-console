@@ -135,6 +135,22 @@ pub struct Config {
     /// default `/etc/config`). The per-service YAML resolves to
     /// `<config_dir>/<service>/<file>`. NON-SECRET fixed path; never client input.
     pub config_dir: String,
+
+    // --- Phase 11 (HOOK-01/02): webhook worker SSRF posture -----------------
+    /// Whether the webhook delivery worker is permitted to deliver to PRIVATE /
+    /// loopback / docker-internal targets (env `WEBHOOK_ALLOW_PRIVATE_TARGETS`,
+    /// default `false`).
+    ///
+    /// SECURITY (fail-closed, T-11-01/02): this is a TEST/CI-ONLY relaxation for
+    /// the live acceptance gate, whose echo receiver runs on the internal docker
+    /// network (an RFC1918 address the production guard correctly blocks). It is
+    /// DOUBLE-GATED: it is honored by [`webhook_allow_private_targets`] ONLY when
+    /// the dev `insecure_cookies` posture is ALSO on. In the production posture
+    /// (`CONSOLE_INSECURE_COOKIES` unset) it is IGNORED — the worker fully enforces
+    /// the SSRF classifier regardless of this flag. Even when relaxed, the DNS
+    /// resolve + `resolve_to_addrs` pin (TOCTOU defense) and redirects-off Policy
+    /// STILL apply, so the connection cannot be DNS-rebound or redirect-bounced.
+    pub webhook_allow_private_targets: bool,
 }
 
 impl fmt::Debug for Config {
@@ -159,6 +175,10 @@ impl fmt::Debug for Config {
             // Config-edit subsystem URLs/paths are non-secret: print in cleartext.
             .field("restart_broker_url", &self.restart_broker_url)
             .field("config_dir", &self.config_dir)
+            .field(
+                "webhook_allow_private_targets",
+                &self.webhook_allow_private_targets,
+            )
             .finish()
     }
 }
@@ -257,6 +277,13 @@ impl Config {
         let config_dir =
             env::var("CONFIG_DIR").unwrap_or_else(|_| DEFAULT_CONFIG_DIR.to_string());
 
+        // Phase 11 (HOOK-01/02): the webhook-worker SSRF relaxation flag. Parsed
+        // permissively, default false. It is ONLY consulted via
+        // `webhook_allow_private_targets()`, which additionally requires the dev
+        // insecure-cookie posture — so this raw value can never relax production.
+        let webhook_allow_private_targets =
+            parse_bool("WEBHOOK_ALLOW_PRIVATE_TARGETS", false);
+
         Ok(Config {
             console_database_url,
             bind_addr,
@@ -274,7 +301,21 @@ impl Config {
             oathkeeper_api_url,
             restart_broker_url,
             config_dir,
+            webhook_allow_private_targets,
         })
+    }
+
+    /// EFFECTIVE webhook-worker SSRF posture (fail-closed double-gate, T-11-01/02).
+    ///
+    /// Returns `true` (relax the private/loopback classifier for delivery) ONLY
+    /// when BOTH the raw `WEBHOOK_ALLOW_PRIVATE_TARGETS` flag is set AND the dev
+    /// `insecure_cookies` escape hatch is on. In the production posture
+    /// (`CONSOLE_INSECURE_COOKIES` unset → `insecure_cookies == false`) this always
+    /// returns `false`, so setting the raw flag alone can NEVER weaken production:
+    /// the worker keeps fully enforcing the SSRF guard. The pin + redirects-off
+    /// hardening applies regardless of the return value.
+    pub fn webhook_allow_private_targets(&self) -> bool {
+        self.webhook_allow_private_targets && self.insecure_cookies
     }
 
     /// Whether `origin` (already normalized: lowercase, no trailing slash) is in
@@ -419,6 +460,60 @@ mod tests {
     /// PERM-01: with `KETO_OPL_URL` unset, `from_env` falls back to the internal
     /// default `http://keto:4469`; with it set, the value is honored. Mirrors the
     /// read/write env-default contract for the new third Keto port.
+    /// T-11-01/02 fail-closed double-gate: the effective webhook SSRF relaxation
+    /// is true ONLY when BOTH the raw flag AND the dev insecure-cookie posture are
+    /// on. The raw flag alone (production posture) NEVER relaxes the worker.
+    #[test]
+    fn webhook_allow_private_targets_is_double_gated() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_dsn = env::var("DATABASE_URL").ok();
+        let prev_flag = env::var("WEBHOOK_ALLOW_PRIVATE_TARGETS").ok();
+        let prev_cookies = env::var("CONSOLE_INSECURE_COOKIES").ok();
+
+        env::set_var("DATABASE_URL", "postgres://u:p@localhost/console");
+
+        // Raw flag set, but production cookie posture (insecure_cookies=false)
+        // → effective posture stays FALSE (production can never be relaxed).
+        env::set_var("WEBHOOK_ALLOW_PRIVATE_TARGETS", "true");
+        env::remove_var("CONSOLE_INSECURE_COOKIES");
+        let cfg = Config::from_env().expect("valid");
+        assert!(cfg.webhook_allow_private_targets, "raw flag parsed");
+        assert!(
+            !cfg.webhook_allow_private_targets(),
+            "effective posture must be false without the dev insecure-cookie hatch"
+        );
+
+        // Both on → effective posture TRUE (the acceptance-gate posture).
+        env::set_var("CONSOLE_INSECURE_COOKIES", "true");
+        let cfg = Config::from_env().expect("valid");
+        assert!(
+            cfg.webhook_allow_private_targets(),
+            "effective posture true only when both flags are on"
+        );
+
+        // Insecure cookies on but raw flag off → still false.
+        env::remove_var("WEBHOOK_ALLOW_PRIVATE_TARGETS");
+        let cfg = Config::from_env().expect("valid");
+        assert!(
+            !cfg.webhook_allow_private_targets(),
+            "no relaxation without the explicit raw flag"
+        );
+
+        // Restore.
+        match prev_dsn {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match prev_flag {
+            Some(v) => env::set_var("WEBHOOK_ALLOW_PRIVATE_TARGETS", v),
+            None => env::remove_var("WEBHOOK_ALLOW_PRIVATE_TARGETS"),
+        }
+        match prev_cookies {
+            Some(v) => env::set_var("CONSOLE_INSECURE_COOKIES", v),
+            None => env::remove_var("CONSOLE_INSECURE_COOKIES"),
+        }
+    }
+
     #[test]
     fn keto_opl_url_defaults_then_honors_env() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
