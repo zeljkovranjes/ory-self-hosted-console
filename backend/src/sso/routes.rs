@@ -59,6 +59,11 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 /// The scopes the generic provider requests from Polis (RESEARCH Pattern 4).
 const PROVIDER_SCOPES: &[&str] = &["openid", "email", "profile"];
 
+/// Hard cap on a fetched IdP-metadata document (CR-01). A SAML EntityDescriptor
+/// is a few KB; 1 MiB is generous while bounding a hostile/oversized response on
+/// the channel the BACKEND now performs itself.
+const MAX_METADATA_BYTES: usize = 1024 * 1024;
+
 /// The Kratos config file path (`<config_dir>/kratos/kratos.yml`). Fixed segments
 /// only — never client input (mirrors `config_edit::routes::config_file_path`).
 fn kratos_config_path(config_dir: &str) -> PathBuf {
@@ -85,6 +90,88 @@ fn polis_creds(cfg: &Config) -> Result<(String, String, String), AppError> {
         AppError::Upstream("polis issuer not configured".into())
     })?;
     Ok((cfg.polis_admin_url.clone(), api_key, issuer))
+}
+
+/// Map an SSRF/fetch failure on the `metadata_url` path to a 422 `Validation`
+/// keyed on `metadata_url` (WR-02) so the SAML form surfaces the operator-safe
+/// reason VERBATIM through the SAME 422 path the signing-cert reject uses — the
+/// most security-relevant reject must be the clearest, never a generic 400/502.
+/// The `message` is value-free (the SSRF category, or a generic fetch-failed
+/// string); it NEVER echoes the URL, the resolved IP, or the response body.
+fn metadata_url_field_error(message: impl Into<String>) -> AppError {
+    AppError::Validation(vec![FieldError {
+        path: "metadata_url".into(),
+        message: message.into(),
+    }])
+}
+
+/// CR-01: the BACKEND fetches the IdP metadata ITSELF through the authoritative
+/// SSRF-guarded client (`ssrf::build_pinned_client` — re-resolve + PIN the
+/// just-validated addresses + redirects OFF), reads the body under a hard byte
+/// cap, and returns the raw XML. This collapses the URL path onto the safe
+/// fetch-free `encodedRawMetadata` branch: Polis NEVER fetches a URL, so the
+/// DNS-rebind/redirect TOCTOU window that existed when we handed Polis a
+/// `metadataUrl` is gone, and the WR-01 signing-cert pre-flight now runs on
+/// URL-sourced metadata too (WR-03). Any block/transport/oversize failure becomes
+/// a value-free 422 on `metadata_url` (WR-02) — never a Polis call.
+async fn fetch_metadata_xml(url: &str) -> Result<String, AppError> {
+    // `build_pinned_client(url, false)` re-resolves the host, rejects ANY resolved
+    // IP in a blocked range, then pins the connection to exactly those addresses
+    // with `Policy::none()` (redirects off). A blocked host is `AppError::BadRequest`
+    // carrying the operator-safe SSRF category message — re-key it onto
+    // `metadata_url` so the form shows it verbatim via the 422 path (WR-02).
+    let (client, _addrs) = ssrf::build_pinned_client(url, false).await.map_err(|e| {
+        let msg = match e {
+            AppError::BadRequest(m) => m,
+            _ => "The metadata URL could not be validated.".to_string(),
+        };
+        metadata_url_field_error(msg)
+    })?;
+
+    let resp = client.get(url).send().await.map_err(|e| {
+        // Value-free: never echo the URL/host/IP into the client-facing message.
+        tracing::warn!(error = %e, "saml metadata fetch transport error");
+        metadata_url_field_error("The IdP metadata URL could not be fetched.")
+    })?;
+
+    if !resp.status().is_success() {
+        // A non-2xx (incl. a 3xx that, with redirects OFF, is surfaced as-is) is a
+        // fetch failure — never a Polis call. Value-free.
+        let status = resp.status();
+        tracing::warn!(status = %status, "saml metadata fetch non-2xx");
+        return Err(metadata_url_field_error(
+            "The IdP metadata URL did not return a fetchable document.",
+        ));
+    }
+
+    // Read the body under a HARD cap so a hostile/oversized receiver cannot make
+    // the backend buffer an unbounded document (the channel we now own).
+    let mut body: Vec<u8> = Vec::new();
+    let mut resp = resp;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > MAX_METADATA_BYTES {
+                    tracing::warn!("saml metadata fetch exceeded the size cap");
+                    return Err(metadata_url_field_error(
+                        "The IdP metadata document is too large.",
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "saml metadata fetch body read error");
+                return Err(metadata_url_field_error(
+                    "The IdP metadata URL could not be fetched.",
+                ));
+            }
+        }
+    }
+
+    String::from_utf8(body).map_err(|_| {
+        metadata_url_field_error("The IdP metadata document is not valid UTF-8 XML.")
+    })
 }
 
 /// The create-connection request body. Exactly ONE metadata source must be set:
@@ -283,10 +370,17 @@ pub async fn create_connection(
             polis_admin::MetadataSource::Encoded(metadata::encode_metadata(xml))
         }
         (_, Some(url)) if !url.trim().is_empty() => {
-            // SSO-04: SSRF-validate the metadataUrl FIRST (internal/credentialed
-            // host → 422, NO fetch). We never let the URL be used before this.
-            ssrf::validate_url(url).await?;
-            polis_admin::MetadataSource::Url(url.clone())
+            // SSO-04 / CR-01: the BACKEND fetches the metadata ITSELF through the
+            // authoritative SSRF-guarded, redirects-off, address-pinned client
+            // (DNS-rebind defense) and reads it under a byte cap — Polis NEVER
+            // fetches a URL. A blocked host / fetch failure is a value-free 422 on
+            // `metadata_url` (WR-02), surfaced verbatim in the form.
+            let xml = fetch_metadata_xml(url).await?;
+            // SSO-02 / WR-03: the signing-cert pre-flight now runs on URL-sourced
+            // metadata too (the backend has the actual XML). 422 if no signing cert.
+            metadata::require_signing_cert(&xml)?;
+            // Collapse onto the safe fetch-free path: send Polis base64 XML, never a URL.
+            polis_admin::MetadataSource::Encoded(metadata::encode_metadata(&xml))
         }
         _ => {
             return Err(AppError::Validation(vec![FieldError {

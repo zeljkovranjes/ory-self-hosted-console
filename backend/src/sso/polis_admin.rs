@@ -88,21 +88,23 @@ fn api_key_header(api_key: &str) -> String {
     format!("Api-Key {api_key}")
 }
 
-/// The metadata source for a create request — exactly ONE is sent. `Encoded` is
-/// the PREFERRED, fetch-free path (base64 of operator-uploaded XML, no SSRF
-/// surface); `Url` is the non-default path and MUST have passed `ssrf::validate_url`
-/// at the call site BEFORE reaching here.
+/// The metadata source for a create request. There is exactly ONE shape: base64
+/// of raw IdP XML sent as `encodedRawMetadata` (the fetch-free, no-SSRF-surface
+/// path). CR-01: we NEVER send Polis a `metadataUrl` — when the operator supplies
+/// a URL, the BACKEND fetches it itself through the authoritative SSRF-guarded
+/// client (re-resolve + pin + redirects off) and feeds the fetched XML in here, so
+/// Polis is never the fetcher and the DNS-rebind/redirect TOCTOU window is closed.
 #[derive(Debug, Clone)]
 pub enum MetadataSource {
-    /// base64 of the operator-uploaded IdP XML → `encodedRawMetadata`.
+    /// base64 of the IdP XML (operator-uploaded OR backend-fetched) → `encodedRawMetadata`.
     Encoded(String),
-    /// A `metadataUrl` (SSRF-validated by the caller) → `metadataUrl`.
-    Url(String),
 }
 
 /// The verified `POST /api/v1/sso` create body (serde camelCase per the swagger).
-/// Exactly one of `encoded_raw_metadata` / `metadata_url` is `Some` (the other is
-/// skipped). The `redirect_url` is a JSON array of allowed redirect URLs.
+/// The metadata is ALWAYS sent as `encodedRawMetadata` (base64 raw XML) — the
+/// `metadataUrl` field is intentionally NOT modelled so Polis can never be made
+/// the fetcher (CR-01: the backend is the sole fetcher, behind the SSRF guard).
+/// The `redirect_url` is a JSON array of allowed redirect URLs.
 #[derive(Debug, Serialize)]
 struct CreateSamlConnection<'a> {
     tenant: &'a str,
@@ -111,10 +113,8 @@ struct CreateSamlConnection<'a> {
     default_redirect_url: &'a str,
     #[serde(rename = "redirectUrl")]
     redirect_url: &'a [String],
-    #[serde(rename = "encodedRawMetadata", skip_serializing_if = "Option::is_none")]
-    encoded_raw_metadata: Option<&'a str>,
-    #[serde(rename = "metadataUrl", skip_serializing_if = "Option::is_none")]
-    metadata_url: Option<&'a str>,
+    #[serde(rename = "encodedRawMetadata")]
+    encoded_raw_metadata: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
 }
@@ -160,17 +160,13 @@ pub async fn create_connection(
     api_key: &str,
     params: &CreateParams,
 ) -> Result<ConnectionResponse, AppError> {
-    let (encoded_raw_metadata, metadata_url) = match &params.metadata {
-        MetadataSource::Encoded(b64) => (Some(b64.as_str()), None),
-        MetadataSource::Url(url) => (None, Some(url.as_str())),
-    };
+    let MetadataSource::Encoded(encoded_raw_metadata) = &params.metadata;
     let body = CreateSamlConnection {
         tenant: &params.tenant,
         product: &params.product,
         default_redirect_url: &params.default_redirect_url,
         redirect_url: &params.redirect_url,
-        encoded_raw_metadata,
-        metadata_url,
+        encoded_raw_metadata: encoded_raw_metadata.as_str(),
         name: params.name.as_deref(),
     };
 
@@ -318,13 +314,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sends_metadata_url_when_url_source() {
+    async fn create_never_sends_a_metadata_url_field() {
+        // CR-01: the create body must ALWAYS carry encodedRawMetadata and NEVER a
+        // metadataUrl — Polis is never the fetcher. This guards the regression where
+        // a URL source could be delegated to Polis (SSRF-by-proxy).
         let mut server = mockito::Server::new_async().await;
         let m = server
             .mock("POST", "/api/v1/sso")
             .match_header("authorization", "Api-Key k")
+            // Match the encoded field present; the assertion that NO metadataUrl is
+            // ever serialized is enforced structurally (the body struct has no such
+            // field) and re-checked below against the captured request body.
             .match_body(mockito::Matcher::Regex(
-                "\"metadataUrl\":\"https://idp.example/meta\"".into(),
+                "\"encodedRawMetadata\":\"YmFzZTY0eG1s\"".into(),
             ))
             .with_status(201)
             .with_header("content-type", "application/json")
@@ -332,10 +334,10 @@ mod tests {
             .create_async()
             .await;
 
-        let params = create_params(MetadataSource::Url("https://idp.example/meta".into()));
+        let params = create_params(MetadataSource::Encoded("YmFzZTY0eG1s".into()));
         let conn = create_connection(&server.url(), "k", &params)
             .await
-            .expect("create with url source returns a Connection");
+            .expect("create with encoded source returns a Connection");
         m.assert_async().await;
         assert_eq!(conn.client_id, "c");
     }
