@@ -106,6 +106,122 @@ fn config_from(depot: &Depot) -> Result<Config, AppError> {
         .map_err(|_| AppError::Internal("config missing from depot".into()))
 }
 
+/// Per-array-section descriptor: the secret-merge/mask spec + the Jsonnet source
+/// field dot-paths within an item. The array-ROOT pointers themselves come from
+/// the section allowlist (`KRATOS_OIDC`/`KRATOS_SMS`/`KRATOS_WEBHOOKS`) — every
+/// allowlisted pointer in those three sections that holds an ARRAY of objects gets
+/// the mask/merge + base64 treatment; non-array allowlisted pointers in the same
+/// section (e.g. `oidc.enabled`) flow through unchanged.
+struct ArraySectionDescriptor {
+    spec: secret_merge::ArraySecretSpec,
+    /// Dot-notation paths to the per-item Jsonnet SOURCE fields (stored as
+    /// `base64://…`, decoded to source on GET / re-encoded on PUT).
+    jsonnet_fields: &'static [&'static str],
+}
+
+/// Resolve the array-section descriptor for a section name, or `None` for a
+/// non-array (scalar) section. Selection is by SECTION NAME (`oidc`/`sms`/
+/// `webhooks`) — never guessed from the pointer.
+fn array_section_descriptor(section: &str) -> Option<ArraySectionDescriptor> {
+    match section {
+        "oidc" => Some(ArraySectionDescriptor {
+            spec: secret_merge::OIDC_SPEC,
+            jsonnet_fields: &["mapper_url"],
+        }),
+        "sms" => Some(ArraySectionDescriptor {
+            spec: secret_merge::SMS_SPEC,
+            jsonnet_fields: &["request_config.body"],
+        }),
+        "webhooks" => Some(ArraySectionDescriptor {
+            spec: secret_merge::WEBHOOK_SPEC,
+            jsonnet_fields: &["config.body"],
+        }),
+        _ => None,
+    }
+}
+
+/// Read a dot-notation path on a JSON object (immutable). `None` if any
+/// intermediate is missing or not an object.
+fn get_dot<'a>(item: &'a Value, dot_path: &str) -> Option<&'a Value> {
+    let mut cur = item;
+    for seg in dot_path.split('.') {
+        cur = cur.as_object()?.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// Set a dot-notation path on a JSON object, creating intermediate objects;
+/// graceful no-op if an intermediate exists but is not an object.
+fn set_dot(item: &mut Value, dot_path: &str, value: Value) {
+    let segs: Vec<&str> = dot_path.split('.').collect();
+    let mut cur = item;
+    for (i, seg) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        let Value::Object(map) = cur else { return };
+        if last {
+            map.insert((*seg).to_string(), value);
+            return;
+        }
+        cur = map
+            .entry((*seg).to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+}
+
+/// GET transform for an array value: mask per-item secrets, then DECODE each item's
+/// Jsonnet `base64://` field back to source for the editor. A non-array value is
+/// returned unchanged (defensive). Never returns a real secret; never fetches a
+/// non-base64 URI (it passes through).
+fn array_get_transform(value: &Value, desc: &ArraySectionDescriptor) -> Result<Value, AppError> {
+    let Some(items) = value.as_array() else {
+        return Ok(value.clone());
+    };
+    // 1) mask per-item secrets (never emit a real secret on GET).
+    let mut masked = secret_merge::mask_array_secrets(items, &desc.spec);
+    // 2) decode each item's Jsonnet source field for the editor.
+    for item in &mut masked {
+        for field in desc.jsonnet_fields {
+            if let Some(Value::String(uri)) = get_dot(item, field) {
+                let decoded = crate::config_edit::jsonnet::decode_base64_uri(uri)?;
+                set_dot(item, field, Value::String(decoded));
+            }
+        }
+    }
+    Ok(Value::Array(masked))
+}
+
+/// PUT transform for an incoming array value: merge-by-id against the stored array
+/// (preserving masked secrets, Pitfall 3), then ENCODE each item's edited Jsonnet
+/// source field to `base64://` before it lands in the doc. A non-array incoming
+/// value is returned unchanged (defensive — the schema validate will reject it).
+fn array_put_transform(
+    stored: &Value,
+    incoming: &Value,
+    desc: &ArraySectionDescriptor,
+) -> Value {
+    let Some(incoming_items) = incoming.as_array() else {
+        return incoming.clone();
+    };
+    let empty: Vec<Value> = Vec::new();
+    let stored_items = stored.as_array().unwrap_or(&empty);
+    // 1) merge-by-id: a masked/absent incoming secret inherits the stored value.
+    let mut merged = secret_merge::merge_array_by_id(stored_items, incoming_items, &desc.spec);
+    // 2) re-encode each edited Jsonnet source field to base64://. The editor sent
+    //    PLAINTEXT source (the GET decoded it); store it back as base64://. If the
+    //    field already carries a base64:// URI (untouched), re-encoding the decoded
+    //    form is idempotent — but the editor always round-trips source, so we encode
+    //    the string we received as source.
+    for item in &mut merged {
+        for field in desc.jsonnet_fields {
+            if let Some(Value::String(src)) = get_dot(item, field) {
+                let encoded = crate::config_edit::jsonnet::encode_base64_uri(src);
+                set_dot(item, field, Value::String(encoded));
+            }
+        }
+    }
+    Value::Array(merged)
+}
+
 /// `GET /api/config/<service>/<section>` — current allowlisted values, absent
 /// pointers omitted, never a secret/denylisted value (T-04-15).
 #[handler]
@@ -134,6 +250,11 @@ pub async fn get_config(
     // future mistake (adding a sensitive pointer to a section allowlist) must NOT
     // leak that secret via GET while PUT would still refuse it — the denylist's
     // authority holds on read too.
+    // Array sections (oidc/sms/webhooks) get per-item secret MASKING + Jsonnet
+    // base64:// DECODE applied to each present array-root value; scalar sections
+    // pass through unchanged. Selection is by SECTION NAME, not pointer-guessing.
+    let array_desc = array_section_descriptor(&section);
+
     let mut out = Map::new();
     for ptr in allow.allowed_paths {
         if allowlist::is_sensitive(ptr) {
@@ -143,7 +264,14 @@ pub async fn get_config(
             continue;
         }
         if let Some(value) = doc.pointer(ptr) {
-            out.insert((*ptr).to_string(), value.clone());
+            let emitted = match &array_desc {
+                // An array-root pointer in an array section: mask secrets + decode
+                // Jsonnet. A non-array allowlisted value (e.g. oidc.enabled) is
+                // returned unchanged by array_get_transform's defensive guard.
+                Some(desc) => array_get_transform(value, desc)?,
+                None => value.clone(),
+            };
+            out.insert((*ptr).to_string(), emitted);
         }
     }
 
@@ -201,6 +329,27 @@ pub async fn put_config(
     // --- Step 3: LOAD the current live doc -----------------------------------
     let path = config_file_path(&cfg.config_dir, svc);
     let mut merged = yaml::load(&path)?;
+
+    // --- Step 3b: ARRAY-SECTION merge-by-id + base64 Jsonnet (pre-apply) ------
+    // For oidc/sms/webhooks, each whole-array PUT is (a) merged-by-id against the
+    // STORED array so a masked/untouched per-item secret is PRESERVED (never
+    // clobbered, Pitfall 3), and (b) each edited Jsonnet source field re-encoded to
+    // base64:// before it lands in the doc. The transformed array stays a single
+    // allowlisted ROOT-pointer value (Pattern 1), so it already passed `filter`.
+    // Scalar sections skip this entirely and flow through unchanged.
+    let filtered = if let Some(desc) = array_section_descriptor(&section) {
+        filtered
+            .into_iter()
+            .map(|(ptr, incoming)| {
+                // The stored value at this exact root pointer (absent -> empty).
+                let stored = merged.pointer(&ptr).cloned().unwrap_or(Value::Null);
+                let transformed = array_put_transform(&stored, &incoming, &desc);
+                (ptr, transformed)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        filtered
+    };
 
     // --- Step 4: APPLY the filtered pointers into the FULL doc ---------------
     // Creates allowlist-bounded intermediate objects for an absent parent (e.g.
@@ -750,5 +899,87 @@ mod tests {
             .ends_with("kratos/kratos.yml"));
         assert!(config_file_path("/etc/config", restart::Service::Oathkeeper)
             .ends_with("oathkeeper/config.yaml"));
+    }
+
+    // ─── Task 3: array-section selection + GET-mask/decode, PUT-merge/encode ───
+
+    #[test]
+    fn array_descriptor_selected_by_section_name_only() {
+        // The three array sections resolve a descriptor; scalar sections do NOT.
+        assert!(array_section_descriptor("oidc").is_some());
+        assert!(array_section_descriptor("sms").is_some());
+        assert!(array_section_descriptor("webhooks").is_some());
+        for scalar in ["methods", "mfa", "sessions", "recovery", "verification", "smtp", "session"] {
+            assert!(
+                array_section_descriptor(scalar).is_none(),
+                "scalar section `{scalar}` must not be treated as an array section"
+            );
+        }
+    }
+
+    #[test]
+    fn get_transform_masks_oidc_secret_and_decodes_mapper() {
+        // An OIDC providers array with a real client_secret and a base64:// mapper:
+        // GET must mask the secret and decode the mapper to plaintext source.
+        let mapper_uri = crate::config_edit::jsonnet::encode_base64_uri("local jsonnet = 1;");
+        let providers = json!([{
+            "id": "google",
+            "provider": "google",
+            "client_id": "public-id",
+            "client_secret": "REAL-SECRET",
+            "mapper_url": mapper_uri
+        }]);
+        let desc = array_section_descriptor("oidc").unwrap();
+        let out = array_get_transform(&providers, &desc).expect("transform ok");
+        let item = &out.as_array().unwrap()[0];
+        assert_eq!(item["client_secret"], json!(secret_merge::MASKED), "secret masked");
+        assert_eq!(item["client_id"], json!("public-id"), "non-secret untouched");
+        assert_eq!(item["mapper_url"], json!("local jsonnet = 1;"), "mapper decoded to source");
+        // No real secret survives in the serialized GET payload.
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("REAL-SECRET"), "client_secret leaked on GET: {s}");
+    }
+
+    #[test]
+    fn put_transform_preserves_masked_secret_and_encodes_mapper() {
+        // Stored has a real secret; incoming leaves it masked and edits the mapper
+        // (as plaintext source). After the PUT transform: the stored secret is
+        // preserved and the mapper is re-encoded to base64://.
+        let stored = json!([{
+            "id": "google",
+            "provider": "google",
+            "client_id": "public-id",
+            "client_secret": "REAL-SECRET",
+            "mapper_url": crate::config_edit::jsonnet::encode_base64_uri("old;")
+        }]);
+        let incoming = json!([{
+            "id": "google",
+            "provider": "google",
+            "client_id": "public-id",
+            "client_secret": secret_merge::MASKED,
+            "mapper_url": "new source;"
+        }]);
+        let desc = array_section_descriptor("oidc").unwrap();
+        let out = array_put_transform(&stored, &incoming, &desc);
+        let item = &out.as_array().unwrap()[0];
+        // Stored secret preserved (NOT clobbered with the mask).
+        assert_eq!(item["client_secret"], json!("REAL-SECRET"));
+        // Mapper re-encoded to base64:// of the new source; decode round-trips.
+        let stored_uri = item["mapper_url"].as_str().unwrap();
+        assert!(stored_uri.starts_with("base64://"), "mapper stored as base64://: {stored_uri}");
+        assert_eq!(
+            crate::config_edit::jsonnet::decode_base64_uri(stored_uri).unwrap(),
+            "new source;"
+        );
+    }
+
+    #[test]
+    fn array_transform_passes_through_non_array_value() {
+        // A scalar allowlisted pointer in an array section (e.g. oidc.enabled =
+        // true) must pass through both transforms unchanged.
+        let desc = array_section_descriptor("oidc").unwrap();
+        let scalar = json!(true);
+        assert_eq!(array_get_transform(&scalar, &desc).unwrap(), json!(true));
+        assert_eq!(array_put_transform(&json!(null), &scalar, &desc), json!(true));
     }
 }
