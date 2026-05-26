@@ -176,6 +176,9 @@ function TokenTab() {
             <div className="flex justify-end border-t pt-3">
               <RevokeTokenDialog
                 token={token.trim()}
+                // WR-05: prefill the client_id from introspection so a
+                // confidential-client revoke can authenticate (RFC 7009).
+                clientId={result.client_id}
                 onRevoked={() => setResult(null)}
                 trigger={
                   <Button type="button" variant="outline">
@@ -218,9 +221,12 @@ function FlowTab() {
       setRaw(JSON.stringify(res, null, 2));
       setStatus("idle");
     } catch (e) {
-      // A bogus/expired challenge maps to a backend upstream error — surface it
-      // as "not found" rather than a hard error (08-UI-SPEC Copywriting).
-      if (e instanceof ApiError && (e.status === 404 || e.status === 502)) {
+      // WR-04: ONLY a 404 means "no pending request for that challenge". A 502 is
+      // the backend's AppError::Upstream — Hydra was unreachable, timed out, or
+      // returned an unmapped error — which is an operational failure, NOT an
+      // unknown challenge. Collapsing 502 into "not found" would send the
+      // operator chasing a bad challenge when Hydra is actually down/slow.
+      if (e instanceof ApiError && e.status === 404) {
         setStatus("notfound");
       } else {
         setStatus("error");
