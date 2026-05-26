@@ -198,9 +198,17 @@ function ExpandTab() {
       const res = await api<Record<string, unknown>>(
         `/api/keto/expand?${qp.toString()}`,
       );
-      // An empty subject tree (no children, no subject) resolves to an empty set.
+      // The expand tree is authoritative: only a literal empty/absent body is
+      // an empty set. A populated root (any `type`/`subject_set`, or non-empty
+      // `children`) must NOT be mis-labeled "No subjects" — `subject_id` is not
+      // a documented root field of ExpandedPermissionTree, so we never key on it.
       const children = (res?.children as unknown[] | undefined) ?? [];
-      if (!res || (children.length === 0 && !res.subject_id && !res.subject_set)) {
+      const isEmpty =
+        !res ||
+        (children.length === 0 &&
+          res.subject_set == null &&
+          res.type == null);
+      if (isEmpty) {
         setEmpty(true);
         setRaw(null);
       } else {
