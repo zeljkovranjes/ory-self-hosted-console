@@ -280,17 +280,40 @@ pub async fn put_polis_settings(
     // Out-of-allowlist/secret -> 403; weakening value -> 422. NO disk touched yet,
     // and no rejected value is ever echoed.
     let filtered = filter_polis_patch(&raw_body)?;
-    // An empty (post-filter) patch is a no-op: nothing to write, nothing to restart.
+    // An empty (post-filter) patch is a no-op: nothing to write, nothing to
+    // restart, and — crucially — nothing was probed. WR-04: do NOT over-claim
+    // `"healthy"` here. The handler never wrote, restarted, or polled `/api/health`
+    // on this path, so asserting a health state it did not establish is an
+    // unverified claim (Polis could be down at that instant). Return a distinct,
+    // truthful `"unchanged"` body (mirroring the log line) so the API reports only
+    // what it actually did.
     if filtered.is_empty() {
-        tracing::info!(service = svc.key(), status = "unchanged", "polis put: empty patch — no write");
-        return Ok(Json(serde_json::json!({ "status": "healthy" })));
+        tracing::info!(
+            service = svc.key(),
+            status = "unchanged",
+            "polis put: empty patch — no write"
+        );
+        return Ok(Json(serde_json::json!({ "status": "unchanged" })));
     }
 
     // --- Step 3: LOAD + MERGE into the current env file ----------------------
+    // WR-01/WR-02: read the file EXACTLY ONCE and derive BOTH the merge base AND
+    // the rollback predicate (`had_existing`) from that single observation. A
+    // readable `Ok(_)` means a regular file was present at this instant -> backup
+    // it and, on rollback, restore the `.bak`. A `NotFound` means absent -> empty
+    // merge base and, on rollback, remove the file. This collapses the former
+    // read-then-re-stat (a `read_to_string` for the merge base PLUS a later
+    // `path.is_file()` driving the irreversible rollback decision) into a SINGLE
+    // syscall under the held lock, so the backup decision and the rollback
+    // decision can NEVER diverge: there is no TOCTOU window between the merge read
+    // and the existence check, and a non-regular path (dangling symlink / dir)
+    // that `read_to_string` cannot read as text now surfaces in the `Err` arm
+    // below as an internal fault instead of being silently misclassified as a
+    // brand-new file whose rollback would `remove_file` the symlink target.
     let path = polis_settings_path(&cfg.config_dir);
-    let existing_text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let (existing_text, had_existing) = match std::fs::read_to_string(&path) {
+        Ok(t) => (t, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         Err(e) => {
             tracing::error!(error = %e, "polis settings read failed");
             return Err(AppError::Internal("polis settings read failed".into()));
@@ -319,21 +342,27 @@ pub async fn put_polis_settings(
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::error!(error = %e, service = svc.key(), "polis put: could not create the polis config dir");
-            return Err(AppError::Internal("polis settings dir create failed".into()));
+            return Err(AppError::Internal(
+                "polis settings dir create failed".into(),
+            ));
         }
     }
 
     // --- Step 4: BACKUP + WR-02 assert ---------------------------------------
-    // If the file does not exist yet there is nothing to back up; in that case a
-    // rollback target is the "remove the file" state. We only `backup` (and assert
-    // the .bak) when a live file exists, so a brand-new write is reversible by
-    // truncation handled in the rollback path. Mirror routes.rs WR-02 when a live
-    // file is present.
-    let had_existing = path.is_file();
+    // If the file did not exist (`had_existing == false`, derived from the SINGLE
+    // step-3 read) there is nothing to back up; in that case a rollback target is
+    // the "remove the file" state. We only `backup` (and assert the .bak) when a
+    // live file was observed, so a brand-new write is reversible by removal in the
+    // rollback path. Mirror routes.rs WR-02 when a live file is present. NOTE: we
+    // deliberately do NOT re-stat here — `had_existing` is the same observation
+    // that drove the merge base (WR-01/WR-02), so backup and rollback never disagree.
     if had_existing {
         yaml::backup(&path)?;
         if !yaml::backup_exists(&path) {
-            tracing::error!(service = svc.key(), "polis put: backup missing after backup(); refusing reversible write");
+            tracing::error!(
+                service = svc.key(),
+                "polis put: backup missing after backup(); refusing reversible write"
+            );
             return Err(AppError::Internal("polis settings backup missing".into()));
         }
     }
@@ -343,30 +372,48 @@ pub async fn put_polis_settings(
     // reads. The atomic write (temp-in-same-dir + fsync + rename) is the reused
     // engine primitive.
     yaml::write_atomic(&path, &serialized)?;
-    tracing::info!(service = svc.key(), status = "applied", "polis put: written");
+    tracing::info!(
+        service = svc.key(),
+        status = "applied",
+        "polis put: written"
+    );
 
     // --- Step 6: RESTART only Polis via the scoped broker --------------------
     let http = restart::restart_client()?;
-    tracing::info!(service = svc.key(), status = "restarting", "polis put: restarting");
+    tracing::info!(
+        service = svc.key(),
+        status = "restarting",
+        "polis put: restarting"
+    );
     if let Err(e) = restart::restart(&http, &cfg.restart_broker_url, svc).await {
         // BROKER-FAILURE: Polis never restarted, so it still runs its OLD env;
         // restore disk only so disk matches the running service (no re-restart
         // through the just-failed broker). Mirrors routes.rs restore_only.
-        tracing::warn!(service = svc.key(), "polis put: broker restart failed; restoring disk (no re-restart)");
+        tracing::warn!(
+            service = svc.key(),
+            "polis put: broker restart failed; restoring disk (no re-restart)"
+        );
         polis_restore_only(&path, had_existing, svc);
         return Err(e);
     }
 
     // --- Step 7: HEALTH-POLL /api/health until ready or timeout --------------
     if restart::wait_healthy(&http, svc, HEALTH_TIMEOUT, None).await {
-        tracing::info!(service = svc.key(), status = "healthy", "polis put: healthy");
+        tracing::info!(
+            service = svc.key(),
+            status = "healthy",
+            "polis put: healthy"
+        );
         return Ok(Json(serde_json::json!({ "status": "healthy" })));
     }
 
     // --- Step 8: ROLLBACK on health failure ----------------------------------
     // HEALTH-FAILURE: Polis restarted into the new env and is unhealthy; restore the
     // last-known-good (or remove a brand-new file), restart again, re-poll.
-    tracing::warn!(service = svc.key(), "polis put: health failed; rolling back");
+    tracing::warn!(
+        service = svc.key(),
+        "polis put: health failed; rolling back"
+    );
     polis_rollback_and_restart(&http, &path, had_existing, &cfg, svc).await;
     Err(AppError::HealthFailed)
 }
@@ -381,7 +428,11 @@ fn polis_restore_only(path: &std::path::Path, had_existing: bool, svc: restart::
         if let Err(e) = std::fs::remove_file(path) {
             tracing::error!(error = %e, service = svc.key(), status = "rollback_remove_failed", "polis put: broker failed AND removing the new file failed — DISK LEFT IN WRITTEN STATE");
         } else {
-            tracing::info!(service = svc.key(), status = "rolled_back_disk_only", "polis put: broker failed; new settings file removed (service never restarted)");
+            tracing::info!(
+                service = svc.key(),
+                status = "rolled_back_disk_only",
+                "polis put: broker failed; new settings file removed (service never restarted)"
+            );
         }
         return;
     }
@@ -436,9 +487,17 @@ async fn polis_rollback_and_restart(
     }
     let healthy = restart::wait_healthy(http, svc, HEALTH_TIMEOUT, None).await;
     if healthy {
-        tracing::info!(service = svc.key(), status = "rolled_back", "polis put: rolled back to last-known-good and healthy");
+        tracing::info!(
+            service = svc.key(),
+            status = "rolled_back",
+            "polis put: rolled back to last-known-good and healthy"
+        );
     } else {
-        tracing::error!(service = svc.key(), status = "rollback_unhealthy", "polis put: rolled back but service still UNHEALTHY");
+        tracing::error!(
+            service = svc.key(),
+            status = "rollback_unhealthy",
+            "polis put: rolled back but service still UNHEALTHY"
+        );
     }
 }
 
