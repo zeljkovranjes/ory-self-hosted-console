@@ -261,15 +261,22 @@ fn repick_config(prompter: &dyn Prompter, current: &ConsoleConfig) -> Result<Con
     let observability = repick_observability(prompter, current)?;
 
     // Features are NOT re-picked here — they are mutated via `edit features` (the
-    // dedicated ONLINE flow). Carry the current effective set forward unchanged so a
-    // services/config edit never silently flips a flag.
-    let features = current.effective_features();
+    // dedicated ONLINE flow).
+    //
+    // WR-02: carry forward ONLY what was EXPLICITLY present (`current.features`, the
+    // raw `Option<Features>`), NOT `effective_features()`. Materializing the merged
+    // locked-default + derived `observability` set into the file would silently add
+    // an explicit ~14-key `[features]` table to a file that had none (or pin the
+    // CURRENT defaults so a later default change diverges from `--defaults`). The
+    // `observability` feature is DERIVED from the observability mode on every read,
+    // so it never needs to be persisted. A minimal-`[features]` file stays minimal.
+    let features = current.features.clone();
 
     Ok(ConsoleConfig {
         services,
         postgres: Some(postgres),
         observability: Some(observability),
-        features: Some(features),
+        features,
     })
 }
 
@@ -610,6 +617,38 @@ mod tests {
                 "unexpected file written: {name} (only .env + the toml are allowed)"
             );
         }
+    }
+
+    /// WR-02: a re-pick over a config with NO explicit `[features]` table must NOT
+    /// materialize the merged/derived default flag set into the result. The raw
+    /// `Option<Features>` is carried forward verbatim, so a minimal file stays
+    /// minimal (no silent ~14-key `[features]` table appears).
+    #[test]
+    fn repick_preserves_absent_features_table() {
+        // A config that declares only service modes — no `[features]` table.
+        let current = config_model::parse_config(
+            "[services.kratos]\nmode = \"in-stack\"\n[services.hydra]\nmode = \"off\"\n",
+        )
+        .unwrap();
+        assert!(current.features.is_none(), "fixture has no [features] table");
+
+        // Re-pick: keep kratos in-stack (Enter), keep hydra off (Enter), then the
+        // remaining three services Enter, postgres Enter, observability Enter.
+        let script = "\n\n\n\n\n\n\n";
+        let prompter = scripted(script);
+        let new_cfg = repick_config(&prompter, &current).expect("re-pick");
+
+        // The raw features Option is carried forward unchanged — still None, so the
+        // emitted toml has NO [features] table.
+        assert!(
+            new_cfg.features.is_none(),
+            "an absent [features] table must stay absent after a services edit"
+        );
+        let toml = config_model::to_toml_string(&new_cfg).unwrap();
+        assert!(
+            !toml.contains("[features]"),
+            "no [features] table should be materialized: {toml}"
+        );
     }
 
     /// `edit services` on a non-TTY (Plain) errors clearly and writes NOTHING.
