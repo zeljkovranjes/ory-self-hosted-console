@@ -1,59 +1,25 @@
-# config/kratos/kratos.yml
-#
-# Minimal Kratos configuration to reach healthy on first boot.
-# Mounted read-only into the container at /etc/config/kratos/ (RESEARCH Pattern 3).
-# Verified minimal key set: ory/kratos contrib/quickstart kratos.yml (RESEARCH).
-#
-# DSN is NOT set here (WR-03): it is the SINGLE responsibility of the `DSN` env
-# var that docker-compose injects (built from KRATOS_DB_PASSWORD in .env). Keeping
-# a hardcoded `dsn:` here as well created a three-way drift hazard (init SQL +
-# this YAML + .env all had to agree) and shipped a password in committed config.
-# For all OTHER self-hosted Ory config there is NO live config API — it lives in
-# this file and is applied via restart.
-
 serve:
   public:
     base_url: http://kratos:4433/
   admin:
     base_url: http://kratos:4434/
-
 identity:
   default_schema_id: default
   schemas:
-    - id: default
-      url: file:///etc/config/kratos/identity.schema.json
-
+  - id: default
+    url: file:///etc/config/kratos/identity.schema.json
 selfservice:
   default_browser_return_url: http://localhost:3000/
-  # BRAND-02 ui_url rebind (Phase 15, AX-01): the six self-service flow ui_url
-  # keys point at the Account Experience (AX) origin (the host-published AX port,
-  # default 3001 — see ACCOUNT_EXPERIENCE_PORT) on the AX route paths, which match
-  # account-experience/ory.config.ts. This direct edit seeds the committed config;
-  # the LIVE rebind through the BRAND-02 config-edit PUT (+ Kratos-only restart via
-  # the broker) is exercised by scripts/verify/phase15-acceptance.sh.
-  #
-  # LOGOUT TRAP (allowlist.rs Pitfall 1 / 15-RESEARCH Open Q3): there is NO
-  # `logout.ui_url` — the v26.2.0 schema gives logout no `ui_url` and is
-  # additionalProperties:false, so adding it would brick every full-config save.
-  # A logout redirect, if ever wanted, uses logout.after.default_browser_return_url.
-  # Self-service METHODS. `password` is on by default; `code` is what drives
-  # account recovery + address verification (and could later power passwordless
-  # login). Enabling it is required for the recovery/verification flows below to
-  # be allowed — without it Kratos answers "recovery is not allowed because it was
-  # disabled" and the AX shows an error page.
   methods:
     password:
       enabled: true
     code:
-      enabled: true
-      # passwordless_enabled: lets an identity whose schema marks a trait as a
-      # `code` credential (the optional `phone` trait below, via: sms) sign in with
-      # a one-time SMS code — the canonical Kratos SMS path. Email keeps using
-      # password; recovery/verification keep using the same code method for their
-      # one-time email codes.
-      passwordless_enabled: true
+      enabled: false
+      passwordless_enabled: false
       config:
         lifespan: 15m
+    profile:
+      enabled: false
   flows:
     login:
       ui_url: http://localhost:3001/auth/login
@@ -63,52 +29,29 @@ selfservice:
       ui_url: http://localhost:3001/settings
     error:
       ui_url: http://localhost:3001/auth/error
-    # Account recovery (password reset): user submits email -> Kratos emails a
-    # one-time code -> user enters it -> sets a new password. `use: code` selects
-    # the code strategy (vs magic link). Requires courier SMTP (below) to deliver.
     recovery:
       enabled: true
       use: code
       ui_url: http://localhost:3001/auth/recovery
-    # Address verification: emails a code to confirm ownership of the address
-    # (triggered after registration and from the settings flow).
     verification:
       enabled: true
       use: code
       ui_url: http://localhost:3001/auth/verification
-
-# Courier: how Kratos delivers recovery/verification email. Points at the Mailpit
-# DEV catcher (docker-compose `mailpit` service) over plain SMTP on the internal
-# network — `disable_starttls=true` because the catcher does not offer STARTTLS.
-# Captured mail is viewable at http://localhost:8025. For PRODUCTION, replace this
-# with a real SMTP server via the console Email/SMTP page (it rewrites this block
-# and restarts Kratos). Kratos must run with `--watch-courier` (see docker-compose)
-# for queued messages to actually send.
 courier:
   smtp:
-    connection_uri: smtp://mailpit:1025/?disable_starttls=true
-    from_address: no-reply@ory-console.local
     from_name: Ory Self-Hosted Console
-  # SMS delivery: Kratos has no built-in SMS provider — it POSTs each SMS to an
-  # HTTP gateway. In dev that gateway is the `sms-sink` service (captures + shows
-  # the codes at http://localhost:8026); the body template maps Kratos's message
-  # to the gateway's JSON shape (config/kratos/sms.body.jsonnet). For PRODUCTION,
-  # point this at a real SMS provider (e.g. Twilio) via the console SMS page —
-  # rewrite the url/headers/body template and restart Kratos.
+    from_address: no-reply@ory-console.local
   channels:
-    - id: sms
-      type: http
-      request_config:
-        url: http://sms-sink:8080/send
-        method: POST
-        body: file:///etc/config/kratos/sms.body.jsonnet
-        headers:
-          Content-Type: application/json
-
+  - id: sms
+    type: http
+    request_config:
+      url: http://sms-sink:8080/send
+      method: POST
+      body: file:///etc/config/kratos/sms.body.jsonnet
+      headers:
+        Content-Type: application/json
 secrets:
-  # PLACEHOLDER 32-char values — Plan 04 overrides via env/.env. Do NOT use in production.
   cookie:
-    - PLACEHOLDERcookieSECRET0123456789AB
+  - PLACEHOLDERcookieSECRET0123456789AB
   cipher:
-    # cipher MUST be exactly 32 characters
-    - PLACEHOLDERcipherSECRET0123456AB
+  - PLACEHOLDERcipherSECRET0123456AB

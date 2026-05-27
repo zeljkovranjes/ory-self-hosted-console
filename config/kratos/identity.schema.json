@@ -10,7 +10,7 @@
         "email": {
           "type": "string",
           "format": "email",
-          "title": "E-Mail",
+          "title": "Email",
           "minLength": 3,
           "ory.sh/kratos": {
             "credentials": {
@@ -23,20 +23,6 @@
             },
             "recovery": {
               "via": "email"
-            }
-          }
-        },
-        "phone": {
-          "type": "string",
-          "format": "tel",
-          "title": "Phone number",
-          "description": "Optional. E.164 format (e.g. +12125550123). Enables one-time SMS code sign-in.",
-          "ory.sh/kratos": {
-            "credentials": {
-              "code": {
-                "identifier": true,
-                "via": "sms"
-              }
             }
           }
         }
