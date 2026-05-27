@@ -392,6 +392,14 @@ pub async fn get_delivery(
 
 /// POST /api/event-sinks/deliveries/{id}/redeliver — re-enqueue a fresh pending
 /// delivery from an existing one (a state change → CSRF-guarded).
+///
+/// WR-05: the redelivered payload is RE-REDACTED under the CURRENT policy before
+/// re-enqueue, so a payload originally redacted under a WEAKER past policy (see
+/// CR-01) is never re-leaked. We prefer to re-resolve the SOURCE audit row (the
+/// OutboundEvent `id` IS the audit row id) and run the full current `redact()`;
+/// if that row was pruned, we fall back to re-running the current redaction pass
+/// over the stored payload. We also short-circuit if the owning sink no longer
+/// exists or is disabled (no point enqueuing an undeliverable row).
 #[handler]
 pub async fn redeliver(
     req: &mut Request,
@@ -402,9 +410,39 @@ pub async fn redeliver(
     let existing = queries::get_delivery(&pool, id)
         .await?
         .ok_or(AppError::NotFound)?;
+
+    // Short-circuit if the owning sink is gone/disabled.
+    let sink = queries::get_sink(&pool, existing.sink_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("The owning sink no longer exists.".into()))?;
+    if !sink.enabled {
+        return Err(AppError::BadRequest(
+            "The owning sink is disabled; enable it before redelivering.".into(),
+        ));
+    }
+
+    // Re-redact under the CURRENT policy. Prefer the source audit row (full
+    // re-redaction via redact()); fall back to re-running the pass over the stored
+    // payload when the source was pruned.
+    let event_id = existing
+        .payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let fresh_payload = match event_id {
+        Some(eid) => match queries::get_audit_row(&pool, eid).await? {
+            Some(audit) => {
+                let outbound = super::redact::redact(&audit);
+                serde_json::to_value(&outbound)
+                    .map_err(|e| AppError::Internal(format!("serialize re-redacted event: {e}")))?
+            }
+            None => super::redact::re_redact_payload(&existing.payload),
+        },
+        None => super::redact::re_redact_payload(&existing.payload),
+    };
+
     let new_id =
-        queries::insert_delivery(&pool, existing.sink_id, &existing.event, &existing.payload)
-            .await?;
+        queries::insert_delivery(&pool, existing.sink_id, &existing.event, &fresh_payload).await?;
     Ok(Json(serde_json::json!({ "id": new_id })))
 }
 

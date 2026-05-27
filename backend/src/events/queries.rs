@@ -248,6 +248,26 @@ pub async fn read_new_audit_since(
     Ok(rows)
 }
 
+/// Fetch a single `console_audit_log` row by id (the OutboundEvent idempotency
+/// key IS this id). Used by `redeliver` (WR-05) to re-resolve the SOURCE event so
+/// it can be RE-REDACTED under the CURRENT policy — never re-shipping a payload
+/// redacted under a weaker past policy. Returns `None` if the source row was
+/// pruned (the caller then re-runs the current redaction over the stored payload).
+pub async fn get_audit_row(pool: &PgPool, id: Uuid) -> Result<Option<AuditView>, AppError> {
+    let row = sqlx::query_as!(
+        AuditView,
+        r#"
+        SELECT id, actor_id, actor_email, action, method, path,
+               target_type, target_id, outcome, metadata, created_at
+        FROM console_audit_log WHERE id = $1
+        "#,
+        id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Advance the per-sink cursor after fanning out a batch.
 pub async fn advance_sink_cursor(
     pool: &PgPool,
