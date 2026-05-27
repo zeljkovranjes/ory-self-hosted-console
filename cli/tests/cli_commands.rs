@@ -242,6 +242,92 @@ async fn admin_list_issues_get_members() {
     m.assert_async().await;
 }
 
+/// CR-01 (the false-green that hid the blocker): `admin create --via-setup` MUST
+/// POST `/setup` with the REQUIRED `name` field (the backend `SetupRequest.name`
+/// is non-optional — a body without it 400s before the token is even checked),
+/// alongside `token`, `email`, and `password`. The token + password arrive via
+/// `--*-file` paths (never argv); the api-key is irrelevant to this token-gated
+/// route. This is the coverage the command previously lacked entirely.
+#[tokio::test]
+async fn admin_create_via_setup_posts_name_token_email_password() {
+    use console_cli::{bootstrap, AdminAction};
+
+    let mut server = mockito::Server::new_async().await;
+    let m = server
+        .mock("POST", "/setup")
+        .match_body(mockito::Matcher::Json(serde_json::json!({
+            "name": "Op Admin",
+            "token": "boot-token-xyz",
+            "email": "admin@example.com",
+            "password": "a-strong-passphrase-123"
+        })))
+        .with_status(201)
+        .with_body(r#"{"id":"a1","email":"admin@example.com","name":"Op Admin"}"#)
+        .create_async()
+        .await;
+
+    // Secrets via FILES (never argv) — token + password.
+    let dir = tempfile::tempdir().unwrap();
+    let token_path = dir.path().join("boot_token");
+    std::fs::write(&token_path, "boot-token-xyz\n").unwrap();
+    let pw_path = dir.path().join("admin_pw");
+    std::fs::write(&pw_path, "a-strong-passphrase-123\n").unwrap();
+
+    bootstrap::admin(
+        &server.url(),
+        None, // api-key is irrelevant for the token-gated /setup route
+        AdminAction::Create {
+            email: "admin@example.com".into(),
+            name: "Op Admin".into(),
+            via_setup: true,
+            password_file: Some(pw_path.to_string_lossy().into_owned()),
+            token_file: Some(token_path.to_string_lossy().into_owned()),
+        },
+    )
+    .await
+    .expect("admin create --via-setup should POST /setup and succeed on 201");
+
+    // The matcher asserts the EXACT body shape (incl. `name`); this proves the
+    // request was actually made with the required field.
+    m.assert_async().await;
+}
+
+/// A `/setup` that returns 400 (the symptom CR-01 produced when `name` was
+/// missing) surfaces as a clear backend error, not a silent success.
+#[tokio::test]
+async fn admin_create_via_setup_surfaces_setup_400() {
+    use console_cli::{bootstrap, AdminAction};
+
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/setup")
+        .with_status(400)
+        .with_body(r#"{"error":"invalid JSON body"}"#)
+        .create_async()
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let token_path = dir.path().join("boot_token");
+    std::fs::write(&token_path, "boot-token-xyz").unwrap();
+    let pw_path = dir.path().join("admin_pw");
+    std::fs::write(&pw_path, "a-strong-passphrase-123").unwrap();
+
+    let err = bootstrap::admin(
+        &server.url(),
+        None,
+        AdminAction::Create {
+            email: "admin@example.com".into(),
+            name: "Op Admin".into(),
+            via_setup: true,
+            password_file: Some(pw_path.to_string_lossy().into_owned()),
+            token_file: Some(token_path.to_string_lossy().into_owned()),
+        },
+    )
+    .await
+    .expect_err("a 400 from /setup must be an error, not a silent success");
+    assert!(err.to_string().contains("400"), "got: {err}");
+}
+
 /// 401 maps to the "check CONSOLE_API_KEY" message (not a raw status dump).
 #[tokio::test]
 async fn unauthorized_maps_to_friendly_message() {

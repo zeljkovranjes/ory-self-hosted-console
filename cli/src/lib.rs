@@ -208,6 +208,11 @@ pub enum AdminAction {
         /// Admin email / username.
         #[arg(long)]
         email: String,
+        /// Admin display name. REQUIRED by the backend `/setup` contract
+        /// (`SetupRequest.name` is non-optional); a body without it 400s before
+        /// the token is even checked. Also used by the offline DB-direct path.
+        #[arg(long)]
+        name: String,
         /// Drive the first-run `POST /setup` route (keeps the backend the single
         /// writer). When absent, an offline DB-direct insert is attempted (needs
         /// the `offline-admin` feature).

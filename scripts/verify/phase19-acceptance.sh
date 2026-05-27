@@ -315,11 +315,73 @@ echo "--- [preflight] backend healthy + serving ---"
 assert_healthy backend
 assert_status GET "${BACKEND_BASE_URL}/health" 200
 
+# The single admin this stack's one-time /setup mints. Created HERE via the CLI
+# (CR-01 proof), then re-used by the phase12 keystone re-run + every live
+# criterion below (all of which authenticate as this admin).
+ADMIN_EMAIL_TEST="phase12-admin@example.com"
+ADMIN_PW_TEST="phase12-acceptance-pw"   # >= 12 chars (CAUTH-03 / WR-04 policy)
+: "${SESSION_COOKIE_NAME:=console_session}"
+
+# =============================================================================
+# CR-01 (anti-false-green): the FIRST-RUN admin is created by DRIVING THE CLI's
+# `admin create --via-setup` against the live backend — NOT a raw curl. This is
+# the one /setup this stack allows, so if the CLI's /setup body is malformed
+# (the CR-01 blocker: missing the required `name`), the admin is NEVER created,
+# the phase12 keystone re-run + every subsequent login FAILS, and the whole gate
+# goes RED. The bootstrap token comes from the backend's boot log; the admin
+# password arrives via CONSOLE_ADMIN_PASSWORD / the bootstrap token via
+# CONSOLE_BOOTSTRAP_TOKEN env (NEVER argv).
+# =============================================================================
+echo
+echo "============================================================"
+echo " CR-01 — first-run admin via the CLI (admin create --via-setup)"
+echo "============================================================"
+SETUP_TOKEN_CLI="$($DC logs backend 2>/dev/null \
+  | grep -oE 'FIRST-RUN SETUP TOKEN: [A-Za-z0-9_-]+' \
+  | tail -n1 | sed 's/^FIRST-RUN SETUP TOKEN: //')"
+state_pre="$(curl -s --max-time 10 "${BACKEND_BASE_URL}/api/console/state" 2>/dev/null)"
+pre_init=0
+printf '%s' "$state_pre" | grep -q '"initialized":true' && pre_init=1
+
+if [ "$pre_init" = "1" ]; then
+  _pass "[CR-01] console already initialized on this (re-used) stack — skipping the CLI create (idempotent)"
+elif [ -z "$SETUP_TOKEN_CLI" ]; then
+  _fail "[CR-01] could not read the FIRST-RUN SETUP TOKEN from the backend log (cannot drive the CLI create)"
+else
+  echo
+  echo "--- [CR-01] docker compose run --rm cli admin create --via-setup (token+password via env, never argv) ---"
+  cli_create_out="$($DC --profile cli run --rm \
+      -e CONSOLE_API_URL="http://backend:8080" \
+      -e CONSOLE_BOOTSTRAP_TOKEN="$SETUP_TOKEN_CLI" \
+      -e CONSOLE_ADMIN_PASSWORD="$ADMIN_PW_TEST" \
+      cli admin create --via-setup \
+        --name "Phase19 CLI Admin" \
+        --email "$ADMIN_EMAIL_TEST" 2>&1)"
+  cli_create_rc=$?
+  state_post="$(curl -s --max-time 10 "${BACKEND_BASE_URL}/api/console/state" 2>/dev/null)"
+  post_init=0
+  printf '%s' "$state_post" | grep -q '"initialized":true' && post_init=1
+  if [ "$cli_create_rc" = "0" ] && [ "$post_init" = "1" ]; then
+    _pass "[CR-01] the CLI 'admin create --via-setup' created the first-run admin (console now initialized — proven end-to-end through the CLI)"
+  else
+    _fail "[CR-01] CLI admin create --via-setup FAILED rc='$cli_create_rc' initialized='$post_init' (out: $(printf '%s' "$cli_create_out" | head -c 400))"
+  fi
+  # The CLI must NOT echo the password.
+  if printf '%s' "$cli_create_out" | grep -qF "$ADMIN_PW_TEST"; then
+    _fail "[BACK-07] the CLI admin-create output echoed the admin password (must never print the secret)"
+  else
+    _pass "[BACK-07] the CLI admin-create output did not echo the password"
+  fi
+fi
+
 # =============================================================================
 # OPTIONALITY (CLI-02): re-run the phase12 feature-toggle keystone gate against
 # the ALREADY-UP stack (REUSE_STACK=1) — it must pass with NO cli present. This
 # is the "full feature set works without the CLI" proof + a Phase-13..18-class
 # regression rider (the keystone exercises auth/csrf/audit/feature routes).
+# NOTE: /setup is already consumed by the CLI create above, so phase12's own
+# /setup call takes its 404-already-init branch and logs in as the CLI-created
+# admin — which only exists if the CLI's /setup body was correct (CR-01).
 # =============================================================================
 echo
 echo "============================================================"
@@ -335,42 +397,18 @@ else
 fi
 
 # =============================================================================
-# Authenticate a console session (complete /setup + login). Mirrors phase12.
+# Authenticate a console session as the CLI-created admin (login only — /setup
+# was already driven through the CLI above; ADMIN_EMAIL_TEST / ADMIN_PW_TEST /
+# SESSION_COOKIE_NAME were defined there). If the CLI create silently no-op'd,
+# this /login fails and the live criteria below cannot run — a hard red.
 # =============================================================================
 echo
-echo "--- [auth] complete /setup + login for an authenticated session ---"
-SETUP_TOKEN="$($DC logs backend 2>/dev/null \
-  | grep -oE 'FIRST-RUN SETUP TOKEN: [A-Za-z0-9_-]+' \
-  | tail -n1 | sed 's/^FIRST-RUN SETUP TOKEN: //')"
-
-# IMPORTANT: the OPTIONALITY re-run above runs phase12-acceptance.sh, which
-# completes the one-time /setup and creates ITS admin (phase12-admin@…). /setup
-# is then closed (404) for the rest of this stack's life, so a fresh phase19 admin
-# can NEVER be created. We therefore AUTHENTICATE AS THE phase12 admin (the single
-# admin minted by the one /setup this stack allows) — the api-key / cli / bootstrap
-# criteria are independent of which admin name issued the session.
-ADMIN_EMAIL_TEST="phase12-admin@example.com"
-ADMIN_PW_TEST="phase12-acceptance-pw"
-: "${SESSION_COOKIE_NAME:=console_session}"
-
+echo "--- [auth] login as the CLI-created admin for an authenticated session ---"
 state_now="$(curl -s --max-time 10 "${BACKEND_BASE_URL}/api/console/state" 2>/dev/null)"
-already_init=0
-printf '%s' "$state_now" | grep -q '"initialized":true' && already_init=1
-
-if [ -n "$SETUP_TOKEN" ]; then
-  setup_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-    -H 'Content-Type: application/json' \
-    --data "{\"name\":\"Phase19 Admin\",\"email\":\"${ADMIN_EMAIL_TEST}\",\"password\":\"${ADMIN_PW_TEST}\",\"token\":\"${SETUP_TOKEN}\"}" \
-    "${BACKEND_BASE_URL}/setup" 2>/dev/null)"
-  case "$setup_code" in
-    201) _pass "completed /setup (admin created)";;
-    404) _pass "/setup already completed on a prior run (404) — proceeding to login";;
-    *)   _fail "/setup returned '$setup_code' (want 201 or 404-already-init)";;
-  esac
-elif [ "$already_init" = "1" ]; then
-  _pass "console already initialized (re-run) — proceeding to login"
+if printf '%s' "$state_now" | grep -q '"initialized":true'; then
+  _pass "console is initialized (the CLI first-run admin exists) — proceeding to login"
 else
-  _fail "could not parse FIRST-RUN SETUP TOKEN AND console is not initialized"
+  _fail "console is NOT initialized after the CLI create (admin create --via-setup did not take effect)"
 fi
 
 _psql() { $DC exec -T postgres psql -U "$POSTGRES_USER" -d console -tAc "$1" 2>/dev/null | tr -d '\r'; }

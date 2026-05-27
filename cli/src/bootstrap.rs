@@ -300,6 +300,7 @@ pub async fn admin(
         AdminAction::List => unreachable!("admin list is dispatched to online::admin_list"),
         AdminAction::Create {
             email,
+            name,
             via_setup,
             password_file,
             token_file,
@@ -311,16 +312,25 @@ pub async fn admin(
             )?;
             if via_setup {
                 // SINGLE-WRITER path: the backend creates the admin via /setup.
-                return setup_via_http(api_url, api_key, &email, &password, token_file.as_deref())
-                    .await;
+                // CR-01: forward `name` — the backend's `SetupRequest.name` is
+                // non-optional, so a body without it 400s before the token check.
+                return setup_via_http(
+                    api_url,
+                    api_key,
+                    &name,
+                    &email,
+                    &password,
+                    token_file.as_deref(),
+                )
+                .await;
             }
             #[cfg(feature = "offline-admin")]
             {
-                offline::create_admin(&email, &password).await
+                offline::create_admin(&email, &name, &password).await
             }
             #[cfg(not(feature = "offline-admin"))]
             {
-                let _ = (&email, &password);
+                let _ = (&email, &name, &password);
                 Err(CliError::Unsupported(
                     "offline admin create requires the `offline-admin` build feature + a reachable \
                      DATABASE_URL. Prefer `admin create --via-setup` (drives the backend's first-run \
@@ -361,6 +371,7 @@ pub async fn admin(
 async fn setup_via_http(
     api_url: &str,
     _api_key: Option<&str>,
+    name: &str,
     email: &str,
     password: &str,
     token_file: Option<&str>,
@@ -372,7 +383,10 @@ async fn setup_via_http(
         .map_err(|e| CliError::Http(e.to_string()))?;
     let resp = client
         .post(url)
+        // CR-01: `name` is REQUIRED by the backend `SetupRequest` (non-optional);
+        // omitting it 400s ("invalid JSON body") before the token is verified.
         .json(&serde_json::json!({
+            "name": name,
             "token": token,
             "email": email,
             "password": password,
