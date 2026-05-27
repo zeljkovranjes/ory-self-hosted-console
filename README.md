@@ -75,6 +75,12 @@ ory-console init --defaults                     # recommended defaults, no promp
 ory-console init --config console.config.toml   # re-apply a saved build
 ```
 
+Don't have the binary installed? Run it straight from source in this repo (host mode, Docker required):
+
+```bash
+cargo run -p ory-console-cli -- init            # build + run the wizard from source
+```
+
 - **Selective services** — Kratos, Hydra, Keto, Oathkeeper, and Polis are each `in-stack | bring-your-own | off`. Turning one **off** also disables its console features server-side. Postgres, backend, and frontend are always required.
 - **Bring-your-own** — point at an Ory service you already host; the wizard health-checks the connection and **blocks on failure** (`--skip-checks` to override).
 - **Reproducible** — writes a `console.config.toml` you can commit and re-apply. Secrets stay in `.env`, never the config file.
