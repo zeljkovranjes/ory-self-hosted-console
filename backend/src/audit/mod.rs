@@ -107,7 +107,15 @@ pub async fn audit_hoop(
     // 3. Actor from the injected Session — NEVER a client-supplied value
     //    (T-11-14). A missing session (e.g. a 401 that never reached the handler)
     //    records a NULL actor rather than fabricating one.
-    let actor_id = depot.obtain::<Session>().ok().map(|s| s.admin_id);
+    let session_actor = depot.obtain::<Session>().ok().map(|s| s.admin_id);
+    // Phase 19 (CLI-02, RESEARCH Pattern 3 / T-19-06): if there was NO session
+    // but the request authenticated via an api-key, capture the api-key id so the
+    // mutation is attributed (never left unattributed). The Session branch comes
+    // FIRST — a session-authed mutation is recorded exactly as before.
+    let api_key_id = depot
+        .obtain::<crate::auth::middleware::ApiKeyPrincipal>()
+        .ok()
+        .map(|p| p.key_id);
 
     // 4. Resolve the actor email best-effort for a human-readable log. Failure to
     //    resolve is non-fatal — the id is the authoritative actor.
@@ -118,13 +126,37 @@ pub async fn audit_hoop(
             return;
         }
     };
-    let actor_email = match actor_id {
-        Some(id) => crate::db::queries::get_admin_by_id(&pool, id)
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.email),
-        None => None,
+    // The recorded actor id: the session admin when present, otherwise the
+    // api-key OWNER (`created_by`) resolved best-effort from the key row. A key
+    // with no human creator (created_by IS NULL) records a NULL actor_id — the
+    // action+path+outcome are STILL logged so the api-key mutation is never
+    // silently unaudited (T-19-06).
+    let (actor_id, actor_email) = match session_actor {
+        Some(id) => {
+            let email = crate::db::queries::get_admin_by_id(&pool, id)
+                .await
+                .ok()
+                .flatten()
+                .map(|a| a.email);
+            (Some(id), email)
+        }
+        None => match api_key_id {
+            Some(kid) => {
+                // Best-effort owner attribution: the key's `created_by` admin (if
+                // any). Never logs the key value (BACK-07).
+                let owner = queries::api_key_owner(&pool, kid).await.ok().flatten();
+                let email = match owner {
+                    Some(admin_id) => crate::db::queries::get_admin_by_id(&pool, admin_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|a| a.email),
+                    None => None,
+                };
+                (owner, email)
+            }
+            None => (None, None),
+        },
     };
 
     let outcome = outcome_for(res.status_code);

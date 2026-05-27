@@ -24,6 +24,21 @@ use crate::auth::session;
 use crate::config::Config;
 use crate::db::models::Session;
 
+/// The authenticated identity of an API-key request (Phase 19 / CLI-02).
+///
+/// Injected into the `Depot` by [`api_key_or_session`] ONLY after the presented
+/// `Authorization: Api-Key <raw>` verified against a known, non-revoked key
+/// (constant-time, via `apikeys::queries::verify_api_key`). Its presence in the
+/// Depot is the SOLE signal that a request authenticated by api-key rather than
+/// by session cookie — `csrf_guard` reads it to exempt the request from CSRF
+/// (the key IS the credential, T-19-05) and the `audit_hoop` reads it to record
+/// the api-key owner as actor (T-19-06). Carries ONLY the key id; the raw key is
+/// never stored here and NEVER logged (BACK-07).
+#[derive(Clone)]
+pub struct ApiKeyPrincipal {
+    pub key_id: uuid::Uuid,
+}
+
 /// Render a deny response (`status` + `{"error": code}` JSON) and stop the
 /// handler chain so the guarded handler never executes (fail-closed).
 fn deny(res: &mut Response, ctrl: &mut FlowCtrl, status: StatusCode, code: &'static str) {
@@ -73,6 +88,90 @@ pub async fn auth_guard(
     }
 }
 
+/// Combined API-key OR session authenticator (Phase 19 / CLI-02, RESEARCH
+/// Pattern 1). REPLACES `auth_guard` on the protected subtree.
+///
+/// It tries the `Authorization: Api-Key <raw>` machine-client credential FIRST,
+/// then falls back to the EXISTING session-cookie path — both branches share the
+/// fail-closed posture of `auth_guard`.
+///
+///   1. If an `Authorization` header carries the `Api-Key ` scheme with a
+///      non-empty raw value: verify it via `apikeys::queries::verify_api_key`
+///      (which already does prefix-bounded lookup, per-candidate constant-time
+///      `subtle` compare, a dummy-compare timing-oracle kill on no-match, revoked
+///      rejection, and a `last_used_at` stamp — REUSED verbatim, no re-rolled
+///      crypto). On `Ok(Some(id))` inject [`ApiKeyPrincipal`] and CONTINUE. On
+///      `Ok(None)` (unknown/revoked) or `Err(_)` (DB blip): 401 + `skip_rest()`.
+///      Once the `Api-Key` scheme is PRESENT we NEVER fall through to the cookie
+///      path (T-19-04) — a bad key can never silently retry as a session.
+///   2. If NO `Api-Key` scheme is present: run the EXACT live `auth_guard`
+///      session logic (cookie_name → req.cookie → validate_session → inject
+///      Session, else 401). This branch is byte-for-byte the session path, so the
+///      existing session behavior is provably unchanged (T-19-07).
+///
+/// A request with neither a valid Api-Key nor a valid session is 401 exactly as
+/// `auth_guard` is today. The raw key and the cookie value are NEVER logged
+/// (BACK-07 / Pitfall 4).
+#[handler]
+pub async fn api_key_or_session(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    // Pool + Config are injected by the root `affix_state` hoop. A missing
+    // dependency is an internal wiring fault — fail closed (treat as unauth),
+    // identical to `auth_guard`.
+    let pool = match depot.obtain::<sqlx::PgPool>() {
+        Ok(p) => p.clone(),
+        Err(_) => return deny(res, ctrl, StatusCode::UNAUTHORIZED, "unauthenticated"),
+    };
+    let cfg = match depot.obtain::<Config>() {
+        Ok(c) => c.clone(),
+        Err(_) => return deny(res, ctrl, StatusCode::UNAUTHORIZED, "unauthenticated"),
+    };
+
+    // 1) API-key path FIRST. The header name + scheme prefix come from
+    //    `console_core` (the single source of truth shared with the CLI). The raw
+    //    value is never logged.
+    let scheme_prefix = format!("{} ", console_core::API_KEY_SCHEME);
+    let presented = req
+        .header::<String>(console_core::API_KEY_HEADER)
+        .and_then(|h| h.strip_prefix(&scheme_prefix).map(|v| v.trim().to_owned()))
+        .filter(|v| !v.is_empty());
+    if let Some(raw) = presented {
+        // Once the Api-Key scheme is presented we commit to the api-key path:
+        // any non-match (unknown/revoked) or DB error is a 401, NEVER a silent
+        // fall-through to the cookie path (T-19-04 fail-closed).
+        match crate::apikeys::queries::verify_api_key(&pool, &raw).await {
+            Ok(Some(key_id)) => {
+                depot.inject(ApiKeyPrincipal { key_id });
+            }
+            Ok(None) | Err(_) => deny(res, ctrl, StatusCode::UNAUTHORIZED, "unauthenticated"),
+        }
+        return;
+    }
+
+    // 2) Session path — the EXACT live `auth_guard` logic, unchanged (T-19-07).
+    //    Read the in-force cookie (hardened `__Host-` name, or dev name). Never
+    //    log the value (Pitfall 4).
+    let name = session::cookie_name(&cfg);
+    let raw = match req.cookie(name).map(|c| c.value().to_owned()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return deny(res, ctrl, StatusCode::UNAUTHORIZED, "unauthenticated"),
+    };
+
+    // validate_session is itself fail-closed (DB errors -> None).
+    match session::validate_session(&pool, &raw, &cfg).await {
+        Some(sess) => {
+            // Make the session (and thus the admin id + csrf_token) available to
+            // the csrf_guard and the downstream handlers.
+            depot.inject(sess);
+        }
+        None => deny(res, ctrl, StatusCode::UNAUTHORIZED, "unauthenticated"),
+    }
+}
+
 /// Whether an HTTP method is "safe" (no state change) and therefore exempt from
 /// the CSRF check (RESEARCH Anti-Pattern: never CSRF-guard GET/HEAD).
 fn is_safe_method(method: &salvo::http::Method) -> bool {
@@ -94,6 +193,18 @@ pub async fn csrf_guard(
 ) {
     // Safe methods are exempt (reads must stay side-effect free).
     if is_safe_method(req.method()) {
+        return;
+    }
+
+    // Phase 19 (CLI-02, RESEARCH Pattern 2 / T-19-05): an api-key request is
+    // exempt from CSRF. CSRF defends a BROWSER that auto-attaches a cookie; an
+    // api-key client never auto-attaches anything — an attacker cannot make a
+    // victim's browser send the operator's `Authorization: Api-Key` header, so
+    // the check is meaningless for it (not a real defense being removed). The
+    // exemption fires ONLY when `api_key_or_session` injected an
+    // `ApiKeyPrincipal`; the session branch below keeps FULL X-CSRF-Token
+    // enforcement, so the session path is byte-for-byte unchanged.
+    if depot.obtain::<ApiKeyPrincipal>().is_ok() {
         return;
     }
 

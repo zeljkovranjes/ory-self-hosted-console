@@ -53,6 +53,21 @@ pub async fn insert_audit(
     Ok(row.id)
 }
 
+/// Best-effort resolve an API key's owner (`created_by`) for audit actor
+/// attribution (Phase 19 / T-19-06). Returns the creating admin id, or `None`
+/// when the key has no human creator (created_by IS NULL) or no such key exists.
+/// Reads ONLY the non-secret `created_by` column — never the hash or prefix
+/// (BACK-07). Parameterized; no interpolation (T-11-15).
+pub async fn api_key_owner(pool: &PgPool, key_id: Uuid) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query!(
+        "SELECT created_by FROM console_api_keys WHERE id = $1",
+        key_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.created_by))
+}
+
 /// Read-only, filtered, paginated listing of the audit log (newest first).
 ///
 /// Each filter is NULL-guarded so a single parameterized query serves every
