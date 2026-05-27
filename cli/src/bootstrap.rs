@@ -24,7 +24,7 @@ use crate::{AdminAction, BootstrapAction, CliError, GithubAction, OauthAction};
 /// Mirrors `.gitignore`: `.env` + `.env.*` (anywhere) and any path under a
 /// `secrets/` directory. The check is intentionally conservative — a path that
 /// does not look gitignored is REFUSED rather than written.
-fn is_gitignored_secret_path(path: &str) -> bool {
+pub(crate) fn is_gitignored_secret_path(path: &str) -> bool {
     let norm = path.replace('\\', "/");
     let file = norm.rsplit('/').next().unwrap_or(&norm);
     // `.env` or `.env.<anything>` (the `.env.example` template is the only
@@ -102,7 +102,7 @@ fn reject_control_chars(value: &str, label: &str) -> Result<(), CliError> {
 /// Upsert a set of `KEY=value` pairs into a `.env`-style file, preserving every
 /// other line. Writes atomically (temp file + rename) into a gitignored path
 /// ONLY. The secret values are never printed.
-fn upsert_env(env_file: &str, pairs: &[(&str, &str)]) -> Result<(), CliError> {
+pub(crate) fn upsert_env(env_file: &str, pairs: &[(&str, &str)]) -> Result<(), CliError> {
     if !is_gitignored_secret_path(env_file) {
         return Err(CliError::Io(format!(
             "refusing to write {env_file}: not a gitignored .env/secret path"

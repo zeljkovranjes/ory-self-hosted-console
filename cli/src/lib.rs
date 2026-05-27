@@ -27,6 +27,7 @@
 pub mod bootstrap;
 pub mod client;
 pub mod config_model;
+pub mod emit;
 pub mod online;
 pub mod probe;
 
