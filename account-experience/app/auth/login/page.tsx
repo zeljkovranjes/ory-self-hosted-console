@@ -62,8 +62,10 @@ export default async function LoginPage(props: OryPageParams) {
   )
   return (
     <>
-      <SsoRouting providerInitiateUrls={providerInitiateUrls} />
       <Login flow={flow} config={config} components={{ Card: {} }} />
+      {/* SSO is a SECONDARY entry below the primary password/login card; it
+          renders nothing unless the flow actually carries an SSO provider. */}
+      <SsoRouting providerInitiateUrls={providerInitiateUrls} />
     </>
   )
 }

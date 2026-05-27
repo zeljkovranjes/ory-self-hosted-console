@@ -5,10 +5,14 @@ import { SsoRouting } from "./sso-routing"
 // =============================================================================
 // AX login org-domain->SSO routing (AX-01 / SSO-06 surfacing) unit tests.
 //
-// Proves the inline-on-blur affordance:
-//   1. An org-domain email (the AX server route returns a provider) surfaces a
-//      "Continue with <provider> SSO" control routing to the matching Kratos
-//      OIDC initiate URL.
+// The affordance is now a COLLAPSED secondary entry: it renders nothing unless
+// the flow carries an SSO provider, and the work-email field appears only after
+// the user clicks the "Sign in with SSO" toggle. Tests prove:
+//   0. No provider on the flow (`providerInitiateUrls` empty) -> renders NOTHING
+//      (no toggle, no stray email field).
+//   1. Clicking the toggle reveals the email field; an org-domain email (the AX
+//      server route returns a provider) surfaces a "Continue with <provider> SSO"
+//      control routing to the matching Kratos OIDC initiate URL.
 //   2. An unknown-domain email (the AX server route 404s -> null) surfaces NO
 //      SSO affordance (the normal password login proceeds).
 //   3. The lookup targets the AX's OWN server route (`/api/sso-lookup`), NOT
@@ -46,11 +50,22 @@ describe("AX login org-domain->SSO routing", () => {
     vi.restoreAllMocks()
   })
 
+  it("renders nothing when the flow carries no SSO provider", () => {
+    mockFetchProvider("org-acme")
+    const { container } = render(<SsoRouting providerInitiateUrls={{}} />)
+    expect(screen.queryByTestId("ax-sso-toggle")).toBeNull()
+    expect(screen.queryByTestId("ax-sso-email-input")).toBeNull()
+    expect(container).toBeEmptyDOMElement()
+  })
+
   it("surfaces a 'Continue with SSO' affordance for an org-domain email", async () => {
     mockFetchProvider("org-acme")
     render(
       <SsoRouting providerInitiateUrls={{ "org-acme": "/self-service/login?flow=abc&provider=org-acme" }} />,
     )
+    // The email field is hidden until the SSO entry point is opened.
+    expect(screen.queryByTestId("ax-sso-email-input")).toBeNull()
+    fireEvent.click(screen.getByTestId("ax-sso-toggle"))
     const input = screen.getByTestId("ax-sso-email-input")
     fireEvent.change(input, { target: { value: "user@corp.com" } })
 
@@ -66,6 +81,7 @@ describe("AX login org-domain->SSO routing", () => {
   it("surfaces NO SSO affordance for an unknown-domain email (password login proceeds)", async () => {
     mockFetchProvider(null)
     render(<SsoRouting providerInitiateUrls={{ "org-acme": "/self-service/login?provider=org-acme" }} />)
+    fireEvent.click(screen.getByTestId("ax-sso-toggle"))
     const input = screen.getByTestId("ax-sso-email-input")
     fireEvent.change(input, { target: { value: "user@unknown-domain.example" } })
 
@@ -80,6 +96,7 @@ describe("AX login org-domain->SSO routing", () => {
   it("queries the AX server route (/api/sso-lookup), never Kratos directly", async () => {
     mockFetchProvider("org-acme")
     render(<SsoRouting providerInitiateUrls={{ "org-acme": "/self-service/login?provider=org-acme" }} />)
+    fireEvent.click(screen.getByTestId("ax-sso-toggle"))
     fireEvent.change(screen.getByTestId("ax-sso-email-input"), {
       target: { value: "user@corp.com" },
     })
