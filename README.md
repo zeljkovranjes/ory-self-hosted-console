@@ -4,6 +4,8 @@ A **self-hosted, single-tenant, fully open-source** drop-in replacement for the 
 
 Everything is open source. There are **no licensed or gated features** — every surface that the hosted Ory Console gates behind an Enterprise license (SAML, Organizations, Account Experience, Branding, metrics) is implemented here as a real OSS feature.
 
+![Ory Self-Hosted Console — feature toggles](docs/console-screenshot.png)
+
 ---
 
 ## What it is
