@@ -66,15 +66,37 @@ impl NatsSink {
         event: &OutboundEvent,
         allow_private: bool,
     ) -> Result<(), AppError> {
-        // SSRF-check every broker host:port before connecting (Pitfall 4).
+        // WR-02/WR-03: validate the EXACT broker list we will dial, then dial a
+        // CANONICAL list reconstructed from the validated (host, port) tuples —
+        // never the raw operator string. async-nats does its own parsing of the
+        // string we hand it; if we validated url::Url's view but dialed the raw
+        // string, a value that parses differently (an empty segment we skipped, a
+        // form normalized differently) would be a TOCTOU/parser-differential SSRF
+        // bypass. So: reject empty/extra segments (no silent `continue`), and build
+        // the dialed string ourselves from exactly what passed the guard.
+        let mut canonical: Vec<String> = Vec::new();
         for url in self.broker_url.split(',') {
             let url = url.trim();
             if url.is_empty() {
-                continue;
+                // An empty segment (leading/trailing/double comma) is NOT silently
+                // skipped — it means the raw string the client would parse differs
+                // from what we validated. Reject the whole target.
+                return Err(AppError::BadRequest(
+                    "NATS broker list contains an empty segment.".to_string(),
+                ));
             }
             let (host, port) = parse_nats_host_port(url)?;
             super::assert_broker_host_allowed(&host, port, allow_private).await?;
+            // Canonical, scheme-prefixed, host:port — the only thing we dial.
+            let scheme = if self.tls { "tls" } else { "nats" };
+            canonical.push(format!("{scheme}://{host}:{port}"));
         }
+        if canonical.is_empty() {
+            return Err(AppError::BadRequest(
+                "NATS sink has no broker address.".to_string(),
+            ));
+        }
+        let dial = canonical.join(",");
 
         let mut opts = async_nats::ConnectOptions::new();
         if let (Some(u), Some(p)) = (&self.username, &self.password) {
@@ -88,7 +110,15 @@ impl NatsSink {
             opts = opts.require_tls(true);
         }
 
-        let client = async_nats::connect_with_options(&self.broker_url, opts)
+        // Dial the CANONICAL validated list (WR-02), never the raw broker_url, so
+        // the string async-nats parses is byte-for-byte what the SSRF guard checked.
+        // NOTE: brokers are SSRF-guarded at resolve time only (no IP pin like the
+        // webhook path's resolve_to_addrs) — a DNS-rebind window exists between this
+        // resolve and async-nats's own connect-time resolution. The webhook sink
+        // closes that window via build_pinned_client; the broker clients do not
+        // expose an equivalent resolve-pin hook, so this residual window is the
+        // documented limitation for the (off-by-default) broker adapters.
+        let client = async_nats::connect_with_options(&dial, opts)
             .await
             // Never echo the connect error (may carry the URL/creds) — generic.
             .map_err(|_| AppError::Upstream("nats sink: connect failed".to_string()))?;

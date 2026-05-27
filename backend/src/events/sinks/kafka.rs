@@ -63,18 +63,39 @@ impl KafkaSink {
         event: &OutboundEvent,
         allow_private: bool,
     ) -> Result<(), AppError> {
-        // SSRF-check every broker host:port before connecting (Pitfall 4).
+        // WR-02/WR-03: validate the EXACT broker list we will hand to rdkafka, then
+        // set bootstrap.servers to a CANONICAL list reconstructed from the validated
+        // (host, port) tuples — never the raw operator string. rdkafka does its own
+        // parsing of bootstrap.servers; validating a subset of split(',') while
+        // handing it the raw string (skipping empty segments) is a
+        // parser-differential SSRF bypass. So: reject empty/extra segments (no
+        // silent `continue`) and feed rdkafka exactly what passed the guard.
+        let mut canonical: Vec<String> = Vec::new();
         for broker in self.brokers.split(',') {
             let broker = broker.trim();
             if broker.is_empty() {
-                continue;
+                return Err(AppError::BadRequest(
+                    "Kafka broker list contains an empty segment.".to_string(),
+                ));
             }
             let (host, port) = parse_host_port(broker)?;
             super::assert_broker_host_allowed(&host, port, allow_private).await?;
+            canonical.push(format!("{host}:{port}"));
         }
+        if canonical.is_empty() {
+            return Err(AppError::BadRequest(
+                "Kafka sink has no broker address.".to_string(),
+            ));
+        }
+        let bootstrap = canonical.join(",");
 
         let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", &self.brokers);
+        // bootstrap.servers is the CANONICAL validated list (WR-02), never the raw
+        // brokers string. NOTE: brokers are SSRF-guarded at resolve time only (no
+        // IP pin like the webhook path) — a DNS-rebind window exists between this
+        // resolve and rdkafka's own connect-time resolution. This residual window
+        // is the documented limitation for the off-by-default broker adapters.
+        cfg.set("bootstrap.servers", &bootstrap);
         cfg.set("message.timeout.ms", "10000");
         match (&self.username, &self.password) {
             (Some(u), Some(p)) => {
