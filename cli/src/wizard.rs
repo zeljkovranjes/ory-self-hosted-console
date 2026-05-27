@@ -130,6 +130,9 @@ fn build_interactive<R: std::io::BufRead>(reader: &mut R) -> Result<ConsoleConfi
 
     Ok(ConsoleConfig {
         services,
+        // postgres mode is prompted + set in Task 4 (prompt_postgres); None here
+        // defaults to in-stack (the byte-identical bundled-DB default).
+        postgres: None,
         features: Some(features),
     })
 }

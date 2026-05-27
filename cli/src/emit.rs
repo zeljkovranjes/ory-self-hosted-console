@@ -102,14 +102,54 @@ external_url = "https://sso.example.com"
         assert!(!written.contains("KETO_READ_URL="), "off → no URL: {written}");
         assert!(!written.contains("OATHKEEPER_API_URL="), "in-stack → no URL: {written}");
 
-        // COMPOSE_PROFILES = exactly the in-stack svc-* profiles (kratos, oathkeeper).
+        // COMPOSE_PROFILES = svc-postgres FIRST (no [postgres] → in-stack default)
+        // then the in-stack svc-* profiles (kratos, oathkeeper).
         assert!(
-            written.contains("COMPOSE_PROFILES=svc-kratos,svc-oathkeeper"),
+            written.contains("COMPOSE_PROFILES=svc-postgres,svc-kratos,svc-oathkeeper"),
             "compose profiles: {written}"
         );
+        // In-stack postgres → NO POSTGRES_* override (byte-identical compose default).
+        assert!(!written.contains("POSTGRES_HOST="), "in-stack pg → no host override: {written}");
 
         // NO secret ever written (T-CB-B02).
         assert!(!written.contains("POLIS_API_KEY"), "no secret: {written}");
+        let lower = written.to_ascii_lowercase();
+        assert!(!lower.contains("password"), "no password: {written}");
+    }
+
+    #[test]
+    fn emit_byo_postgres_writes_overrides_and_drops_svc_postgres() {
+        let cfg = parse_config(
+            r#"
+[services.kratos]
+mode = "in-stack"
+[postgres]
+mode = "byo"
+host = "db.ext.example.com"
+port = "6543"
+sslmode = "require"
+"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        emit_env_from_config(&cfg, &env_path.to_string_lossy()).unwrap();
+        let written = std::fs::read_to_string(&env_path).unwrap();
+
+        // POSTGRES_* overrides emitted for byo.
+        assert!(written.contains("POSTGRES_HOST=db.ext.example.com"), "{written}");
+        assert!(written.contains("POSTGRES_PORT=6543"), "{written}");
+        assert!(written.contains("POSTGRES_SSLMODE=require"), "{written}");
+
+        // COMPOSE_PROFILES has svc-kratos but NOT svc-postgres (byo drops it).
+        let prof_line = written
+            .lines()
+            .find(|l| l.starts_with("COMPOSE_PROFILES="))
+            .expect("a COMPOSE_PROFILES line");
+        assert!(prof_line.contains("svc-kratos"), "{prof_line}");
+        assert!(!prof_line.contains("svc-postgres"), "byo drops svc-postgres: {prof_line}");
+
+        // No password ever written.
         let lower = written.to_ascii_lowercase();
         assert!(!lower.contains("password"), "no password: {written}");
     }
@@ -167,6 +207,9 @@ mode = "off"
 mode = "off"
 [services.polis]
 mode = "off"
+[postgres]
+mode = "byo"
+host = "db.ext"
 "#,
         )
         .unwrap();
@@ -174,7 +217,8 @@ mode = "off"
         let env_path = dir.path().join(".env");
         emit_env_from_config(&cfg, &env_path.to_string_lossy()).unwrap();
         let written = std::fs::read_to_string(&env_path).unwrap();
-        // Explicit empty selection — valid (the backend comes up with zero in-stack Ory svcs).
+        // Explicit empty selection — valid (the backend comes up with zero in-stack
+        // svcs; postgres byo too → svc-postgres also dropped).
         assert!(written.contains("COMPOSE_PROFILES=\n") || written.ends_with("COMPOSE_PROFILES="),
             "empty profiles line present: {written}");
     }

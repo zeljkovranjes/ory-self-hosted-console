@@ -74,8 +74,9 @@ fn config_round_trips_and_emits_expected_env_profile_seed() {
         "HYDRA_PUBLIC_URL=https://hydra.ext.example",
         "POLIS_ADMIN_URL=https://polis.ext.example",
         "POLIS_EXTERNAL_URL=https://sso.example.com",
-        // in-stack svc-* only (NOT byo hydra/polis, NOT off keto).
-        "COMPOSE_PROFILES=svc-kratos,svc-oathkeeper",
+        // svc-postgres FIRST (no [postgres] table → in-stack default), then the
+        // in-stack svc-* (NOT byo hydra/polis, NOT off keto).
+        "COMPOSE_PROFILES=svc-postgres,svc-kratos,svc-oathkeeper",
     ] {
         assert!(env.contains(line), "missing `{line}` in:\n{env}");
     }
@@ -83,6 +84,55 @@ fn config_round_trips_and_emits_expected_env_profile_seed() {
     assert!(!env.contains("KRATOS_ADMIN_URL="), "in-stack → no URL");
     assert!(!env.contains("KETO_READ_URL="), "off → no URL");
     assert!(!env.contains("POLIS_API_KEY"), "no secret in emitted .env");
+    // In-stack postgres (default) → no POSTGRES_* override (byte-identical compose).
+    assert!(!env.contains("POSTGRES_HOST="), "in-stack pg → no host override");
+}
+
+/// A BYO-Postgres SAMPLE flows parse → round-trip → emit and yields the
+/// POSTGRES_HOST/PORT/SSLMODE overrides + a COMPOSE_PROFILES line WITHOUT
+/// svc-postgres, with the [postgres] table round-tripping losslessly and carrying
+/// no password. The TTY-free half of the live back-to-back DB check (IUX-BYO-PG).
+#[test]
+fn byo_postgres_config_round_trips_and_emits_overrides_without_svc_postgres() {
+    const BYO_PG: &str = r#"
+[services.kratos]
+mode = "in-stack"
+
+[postgres]
+mode = "byo"
+host = "db.external.example.com"
+port = "6543"
+sslmode = "require"
+"#;
+    let cfg = parse_config(BYO_PG).expect("byo-postgres sample parses");
+
+    // Round-trip lossless + no password.
+    let serialized = to_toml_string(&cfg).unwrap();
+    assert_eq!(cfg, parse_config(&serialized).unwrap(), "round-trip equal");
+    assert!(
+        !serialized.to_ascii_lowercase().contains("password"),
+        "no password in serialized byo-postgres config: {serialized}"
+    );
+
+    // Emit a real .env and assert the BYO overrides + svc-postgres absence.
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join(".env");
+    emit_env_from_config(&cfg, &env_path.to_string_lossy()).unwrap();
+    let env = std::fs::read_to_string(&env_path).unwrap();
+
+    for line in [
+        "POSTGRES_HOST=db.external.example.com",
+        "POSTGRES_PORT=6543",
+        "POSTGRES_SSLMODE=require",
+    ] {
+        assert!(env.contains(line), "missing `{line}` in:\n{env}");
+    }
+    let prof = env
+        .lines()
+        .find(|l| l.starts_with("COMPOSE_PROFILES="))
+        .expect("a COMPOSE_PROFILES line");
+    assert!(prof.contains("svc-kratos"), "{prof}");
+    assert!(!prof.contains("svc-postgres"), "byo postgres drops svc-postgres: {prof}");
 }
 
 /// A live probe that PASSES (mock 200) does not block; flipping to 503 blocks

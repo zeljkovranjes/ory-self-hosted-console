@@ -155,6 +155,95 @@ impl Services {
     }
 }
 
+/// The always-required Postgres backing store (CLI-builder BYO / IUX-BYO-PG-04).
+///
+/// Postgres is NOT a member of [`SERVICES`] — it is ALWAYS required (the backend +
+/// every Ory service needs a DB), so it is modeled directly on [`ConsoleConfig`]
+/// rather than as one of the optional five. Only two modes are valid:
+///   * `in-stack` — run the bundled `postgres` container (the `svc-postgres`
+///     compose profile); emit NO `POSTGRES_*` override (the compose DSN defaults
+///     `@postgres:5432/<db>?sslmode=disable` apply, byte-identical to today).
+///   * `byo`      — point every DSN at an EXTERNAL Postgres via `POSTGRES_HOST` /
+///     `POSTGRES_PORT` / `POSTGRES_SSLMODE`; the bundled container does NOT run.
+///
+/// `off` is INVALID for postgres (the stack cannot run without a DB) — it parses
+/// to a CLEAR error rather than silently degrading.
+///
+/// SECURITY (T-BYO-02): this struct has NO `password` field. The DB password stays
+/// `POSTGRES_PASSWORD` (generated / read via `read_secret`) + the per-service
+/// `*_DB_PASSWORD` in `.env`, NEVER in this TOML. A round-trip test asserts no
+/// `password` key ever appears in the serialized form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgresConfig {
+    /// `in-stack` (default when absent) or `byo`. `off` is rejected at parse time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PostgresModeField>,
+    /// BYO external host (interpolated into `POSTGRES_HOST`). Unset → no override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// BYO external port (`POSTGRES_PORT`). Unset → the `5432` compose default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    /// Reserved per-DB override (the compose DSNs hardcode `/kratos`,`/hydra`,…
+    /// paths; `db` is unused unless set, kept for forward-compat). Not emitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db: Option<String>,
+    /// BYO sslmode (`POSTGRES_SSLMODE`, e.g. `require`). Unset → `disable` default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sslmode: Option<String>,
+    /// An OPTIONAL full connection string the DB probe may use directly (NEVER
+    /// emitted to `.env`; carries no password — operators pass a passwordless URL
+    /// or rely on `POSTGRES_PASSWORD`). For probe convenience only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// A newtype around the postgres mode so an UNKNOWN/`off` mode string yields a
+/// CLEAR parse error (postgres is mandatory — `off` is not a valid choice).
+/// Defaults to `in-stack` when the `mode` key is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PostgresModeField(pub PostgresMode);
+
+/// The two valid postgres modes (NO `off` — the stack cannot run without a DB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostgresMode {
+    /// The bundled in-stack `postgres` container (svc-postgres profile).
+    InStack,
+    /// An external/managed Postgres (POSTGRES_HOST/PORT/SSLMODE overrides).
+    Byo,
+}
+
+impl TryFrom<String> for PostgresModeField {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "in-stack" => Ok(PostgresModeField(PostgresMode::InStack)),
+            "byo" => Ok(PostgresModeField(PostgresMode::Byo)),
+            "off" => Err(
+                "postgres mode `off` is invalid — Postgres is always required \
+                 (choose `in-stack` for the bundled DB or `byo` for an external one)"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "unknown postgres mode `{other}` (expected one of: in-stack, byo)"
+            )),
+        }
+    }
+}
+
+impl From<PostgresModeField> for String {
+    fn from(f: PostgresModeField) -> String {
+        match f.0 {
+            PostgresMode::InStack => "in-stack".to_string(),
+            PostgresMode::Byo => "byo".to_string(),
+        }
+    }
+}
+
+/// The `svc-postgres` compose profile name (prepended for in-stack postgres).
+pub const SVC_POSTGRES_PROFILE: &str = "svc-postgres";
+
 /// The `[features]` table — feature key → enabled bool. Stored as a sorted map so
 /// the serialized form (and any iteration) is deterministic. An absent `[features]`
 /// table yields the locked default set (see [`Features::with_defaults`]).
@@ -205,6 +294,10 @@ impl Features {
 pub struct ConsoleConfig {
     #[serde(default)]
     pub services: Services,
+    /// The always-required Postgres backing store. Absent → in-stack (the bundled
+    /// container), matching the byte-identical compose default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres: Option<PostgresConfig>,
     /// Absent in the file → `None`; `effective_features()` applies the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<Features>,
@@ -232,8 +325,24 @@ impl ConsoleConfig {
                 oathkeeper: in_stack(),
                 polis: in_stack(),
             },
+            // Postgres explicitly in-stack (the bundled DB; svc-postgres profile).
+            postgres: Some(PostgresConfig {
+                mode: Some(PostgresModeField(PostgresMode::InStack)),
+                ..Default::default()
+            }),
             features: Some(Features::with_defaults()),
         }
+    }
+
+    /// The effective Postgres mode: the declared mode, or `in-stack` when the
+    /// `[postgres]` table (or its `mode` key) is absent (the byte-identical
+    /// bundled-DB default).
+    pub fn postgres_mode(&self) -> PostgresMode {
+        self.postgres
+            .as_ref()
+            .and_then(|p| p.mode)
+            .map(|m| m.0)
+            .unwrap_or(PostgresMode::InStack)
     }
 
     /// The effective mode for one service (public accessor over the internal
@@ -279,17 +388,43 @@ impl ConsoleConfig {
                 }
             }
         }
+        // 3. BYO-Postgres overrides — emit POSTGRES_HOST/PORT/SSLMODE ONLY when
+        //    postgres mode is byo AND the field is present (mirrors the byo-URL-
+        //    only discipline above). In-stack postgres emits NO override, so the
+        //    compose ${VAR:-default} fallbacks render byte-identical to today.
+        if self.postgres_mode() == PostgresMode::Byo {
+            if let Some(pg) = &self.postgres {
+                if let Some(host) = &pg.host {
+                    pairs.push(("POSTGRES_HOST".to_string(), host.clone()));
+                }
+                if let Some(port) = &pg.port {
+                    pairs.push(("POSTGRES_PORT".to_string(), port.clone()));
+                }
+                if let Some(sslmode) = &pg.sslmode {
+                    pairs.push(("POSTGRES_SSLMODE".to_string(), sslmode.clone()));
+                }
+            }
+        }
         pairs
     }
 
     /// The `svc-*` compose profile names for `in-stack` services ONLY (stable
     /// order). byo/off services have no in-stack container, so no profile.
     pub fn to_compose_profiles(&self) -> Vec<String> {
-        SERVICES
-            .iter()
-            .filter(|svc| self.services.mode_of(svc) == ServiceMode::InStack)
-            .map(|svc| format!("svc-{svc}"))
-            .collect()
+        let mut profiles: Vec<String> = Vec::new();
+        // svc-postgres FIRST when postgres is in-stack (the bundled DB), so the
+        // default emit is `svc-postgres,svc-kratos,…`. A byo postgres drops it so
+        // the in-stack container + db/init never start.
+        if self.postgres_mode() == PostgresMode::InStack {
+            profiles.push(SVC_POSTGRES_PROFILE.to_string());
+        }
+        profiles.extend(
+            SERVICES
+                .iter()
+                .filter(|svc| self.services.mode_of(svc) == ServiceMode::InStack)
+                .map(|svc| format!("svc-{svc}")),
+        );
+        profiles
     }
 
     /// The service→mode map the backend reconcile consumes (identical content to
@@ -451,11 +586,15 @@ mode = "sometimes"
     #[test]
     fn config_model_to_compose_profiles_is_in_stack_only() {
         let cfg = parse_config(sample_toml()).unwrap();
-        // kratos in-stack + oathkeeper (absent → in-stack). NOT hydra/polis (byo)
-        // or keto (off).
+        // svc-postgres FIRST (no [postgres] table → in-stack default), then kratos
+        // in-stack + oathkeeper (absent → in-stack). NOT hydra/polis (byo) or keto (off).
         assert_eq!(
             cfg.to_compose_profiles(),
-            vec!["svc-kratos".to_string(), "svc-oathkeeper".to_string()]
+            vec![
+                "svc-postgres".to_string(),
+                "svc-kratos".to_string(),
+                "svc-oathkeeper".to_string()
+            ]
         );
     }
 
@@ -494,6 +633,121 @@ mode = "in-stack"
         assert_eq!(feats.0.get("observability"), Some(&false));
         // an unspecified ON-default key keeps its default.
         assert_eq!(feats.0.get("oauth2"), Some(&true));
+    }
+
+    // --- BYO-Postgres (IUX-BYO-PG-04) ---------------------------------------
+
+    #[test]
+    fn postgres_absent_defaults_in_stack_emits_no_override_and_svc_postgres_first() {
+        // No [postgres] table → in-stack default.
+        let cfg = parse_config(
+            r#"[services.kratos]
+mode = "in-stack"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.postgres_mode(), PostgresMode::InStack);
+
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert!(!map.contains_key("POSTGRES_HOST"), "in-stack → no POSTGRES_HOST");
+        assert!(!map.contains_key("POSTGRES_PORT"), "in-stack → no POSTGRES_PORT");
+        assert!(!map.contains_key("POSTGRES_SSLMODE"), "in-stack → no POSTGRES_SSLMODE");
+
+        // svc-postgres is FIRST in the profile list.
+        let profiles = cfg.to_compose_profiles();
+        assert_eq!(profiles.first().map(String::as_str), Some("svc-postgres"));
+    }
+
+    #[test]
+    fn postgres_byo_emits_overrides_and_drops_svc_postgres() {
+        let cfg = parse_config(
+            r#"
+[postgres]
+mode = "byo"
+host = "db.ext.example.com"
+port = "6543"
+sslmode = "require"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.postgres_mode(), PostgresMode::Byo);
+
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert_eq!(map.get("POSTGRES_HOST").map(String::as_str), Some("db.ext.example.com"));
+        assert_eq!(map.get("POSTGRES_PORT").map(String::as_str), Some("6543"));
+        assert_eq!(map.get("POSTGRES_SSLMODE").map(String::as_str), Some("require"));
+
+        // byo → svc-postgres is NOT in the profile list.
+        assert!(
+            !cfg.to_compose_profiles().contains(&"svc-postgres".to_string()),
+            "byo postgres drops svc-postgres"
+        );
+    }
+
+    #[test]
+    fn postgres_byo_omits_absent_override_fields() {
+        // byo with only host set → only POSTGRES_HOST emitted (port/sslmode fall
+        // back to the compose ${VAR:-default}).
+        let cfg = parse_config(
+            r#"
+[postgres]
+mode = "byo"
+host = "db.ext"
+"#,
+        )
+        .unwrap();
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert_eq!(map.get("POSTGRES_HOST").map(String::as_str), Some("db.ext"));
+        assert!(!map.contains_key("POSTGRES_PORT"), "absent port → no override");
+        assert!(!map.contains_key("POSTGRES_SSLMODE"), "absent sslmode → no override");
+    }
+
+    #[test]
+    fn postgres_mode_off_is_a_clear_error() {
+        let err = parse_config(
+            r#"
+[postgres]
+mode = "off"
+"#,
+        )
+        .expect_err("postgres off must error");
+        let msg = err.to_string();
+        assert!(msg.contains("off"), "names the invalid mode: {msg}");
+        assert!(msg.contains("always required") || msg.contains("in-stack"), "explains: {msg}");
+    }
+
+    #[test]
+    fn postgres_round_trips_losslessly_with_no_password_key() {
+        let cfg = parse_config(
+            r#"
+[postgres]
+mode = "byo"
+host = "db.ext"
+port = "5432"
+sslmode = "require"
+"#,
+        )
+        .unwrap();
+        let serialized = to_toml_string(&cfg).unwrap();
+        let reparsed = parse_config(&serialized).unwrap();
+        assert_eq!(cfg, reparsed, "[postgres] round-trips losslessly");
+        let lower = serialized.to_ascii_lowercase();
+        assert!(!lower.contains("password"), "no password key in postgres toml: {serialized}");
+        assert!(!lower.contains("secret"), "no secret key in postgres toml: {serialized}");
+    }
+
+    #[test]
+    fn all_in_stack_default_sets_postgres_in_stack() {
+        let cfg = ConsoleConfig::all_in_stack_default();
+        assert_eq!(cfg.postgres_mode(), PostgresMode::InStack);
+        assert_eq!(
+            cfg.to_compose_profiles().first().map(String::as_str),
+            Some("svc-postgres"),
+            "defaults put svc-postgres first"
+        );
+        // Round-trips (self-documenting reproducible default).
+        let s = to_toml_string(&cfg).unwrap();
+        assert_eq!(cfg, parse_config(&s).unwrap());
     }
 
     #[test]
