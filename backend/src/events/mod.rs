@@ -28,8 +28,9 @@
 pub mod queries;
 pub mod redact;
 pub mod sinks;
+pub mod worker;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -184,7 +185,7 @@ impl From<EventSinkRow> for EventSinkView {
 /// `id` is the idempotency key (EVT-02) — it IS the source `console_audit_log`
 /// row's UUID, so an at-least-once retry carries the SAME id and consumers dedupe
 /// on it. `data` is the PII-redacted payload (EVT-03) produced by [`redact::redact`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundEvent {
     /// Idempotency key = the source audit row id (EVT-02).
     pub id: Uuid,

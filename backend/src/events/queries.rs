@@ -106,6 +106,25 @@ pub async fn list_sinks(pool: &PgPool) -> Result<Vec<EventSinkView>, AppError> {
         .collect())
 }
 
+/// List every ENABLED sink as a full row (incl. cursor + credential) for the
+/// fan-out worker. NEVER rendered to a response (EventSinkRow is not `Serialize`).
+pub async fn list_enabled_sinks(pool: &PgPool) -> Result<Vec<EventSinkRow>, AppError> {
+    let rows = sqlx::query_as!(
+        EventSinkRow,
+        r#"
+        SELECT id, name, kind, target, subject, events, secret, sasl_username,
+               tls, enabled, last_event_id, last_event_cursor_at,
+               created_at, updated_at
+        FROM event_sinks
+        WHERE enabled = true
+        ORDER BY created_at ASC
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Fetch the full row (incl. credential) by id. Used by the worker + update merge
 /// — NEVER rendered to a response directly (EventSinkRow is not `Serialize`).
 pub async fn get_sink(pool: &PgPool, id: Uuid) -> Result<Option<EventSinkRow>, AppError> {

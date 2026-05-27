@@ -18,6 +18,7 @@ use ory_console_backend::auth::setup::ensure_bootstrap_token;
 use ory_console_backend::config::Config;
 use ory_console_backend::db::queries;
 use ory_console_backend::error::AppError;
+use ory_console_backend::events;
 use ory_console_backend::webhooks;
 use ory_console_backend::{db, routes};
 
@@ -33,6 +34,11 @@ const WEBHOOK_TICK_INTERVAL: Duration = Duration::from_secs(2);
 /// HOOK-03: how often the webhook maintenance task prunes terminal deliveries
 /// and recovers stale 'delivering' rows. Hourly is ample.
 const WEBHOOK_MAINT_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// EVT-01: how often the event-stream fan-out task reads new audit rows past each
+/// sink's cursor and enqueues deliveries. A short cadence keeps the stream fresh
+/// without scanning the audit log too aggressively on a low-volume console.
+const EVENT_FANOUT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Initialize structured logging. Keeps the Phase-1 default filter ("info").
 fn init_tracing() {
@@ -150,6 +156,65 @@ async fn main() -> Result<(), AppError> {
                 }
                 if let Err(e) = webhooks::worker::reap_stale_tick(&maint_pool).await {
                     tracing::warn!(error = %e, "webhook stale-reap tick failed");
+                }
+            }
+        });
+    }
+
+    // EVT-01/02/03: the event-stream workers (Phase 17). Three detached tokio
+    // tasks mirroring the HOOK worker pattern, reusing the SAME OFF-by-default
+    // `WEBHOOK_ALLOW_PRIVATE_TARGETS` escape hatch (production = false) so they
+    // share one outbound-SSRF posture with the webhook worker — no second env var.
+    //
+    //   (1) fan-out: read new console_audit_log rows past each enabled sink's
+    //       cursor, redact, and enqueue one event_deliveries row per (sink, event).
+    //   (2) delivery: claim due deliveries (SKIP LOCKED) and dispatch through the
+    //       Sink registry (webhook re-validates SSRF at delivery time), recording
+    //       delivered | backoff retry | dead.
+    //   (3) maintenance: prune terminal deliveries past retention + recover stale
+    //       'delivering' rows.
+    {
+        // (1) fan-out — audit → event_deliveries.
+        let fanout_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(EVENT_FANOUT_INTERVAL);
+            loop {
+                ticker.tick().await;
+                if let Err(e) =
+                    events::worker::fan_out_tick(&fanout_pool, events::worker::FANOUT_BATCH).await
+                {
+                    tracing::warn!(error = %e, "event fan-out tick failed");
+                }
+            }
+        });
+
+        // (2) delivery — claim → dispatch via Sink::deliver. Reuses the SAME
+        // allow_private posture as the webhook worker (production false).
+        let delivery_pool = pool.clone();
+        let event_allow_private = cfg.webhook_allow_private_targets();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(WEBHOOK_TICK_INTERVAL);
+            loop {
+                ticker.tick().await;
+                if let Err(e) =
+                    events::worker::delivery_tick_with(&delivery_pool, event_allow_private).await
+                {
+                    tracing::warn!(error = %e, "event delivery tick failed");
+                }
+            }
+        });
+
+        // (3) maintenance — prune + reap, hourly.
+        let event_maint_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(WEBHOOK_MAINT_INTERVAL);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = events::worker::prune_tick(&event_maint_pool).await {
+                    tracing::warn!(error = %e, "event pruning tick failed");
+                }
+                if let Err(e) = events::worker::reap_stale_tick(&event_maint_pool).await {
+                    tracing::warn!(error = %e, "event stale-reap tick failed");
                 }
             }
         });
