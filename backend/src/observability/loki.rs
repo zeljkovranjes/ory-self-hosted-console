@@ -68,7 +68,12 @@ fn logql_for_intent(intent: &str, service: Option<&str>) -> Option<String> {
             if !is_allowed_service(svc) {
                 return None;
             }
-            Some(format!(r#"{{job="docker"}} |~ "(?i)\b{svc}\b""#))
+            // NB: LogQL double-quoted string literals process Go escape sequences
+            // BEFORE the RE2 engine sees the pattern, so a single `\b` would be
+            // unescaped to a backspace (0x08) and match nothing. Emit `\\b` so the
+            // literal yields `\b` for RE2 (a word boundary). Mirrors how the
+            // `errors` intent escapes its embedded quotes.
+            Some(format!(r#"{{job="docker"}} |~ "(?i)\\b{svc}\\b""#))
         }
         _ => None,
     }
@@ -271,7 +276,10 @@ mod tests {
     fn service_selector_is_exact_template() {
         assert_eq!(
             logql_for_intent("service", Some("backend")).unwrap(),
-            "{job=\"docker\"} |~ \"(?i)\\bbackend\\b\""
+            // The LogQL carries the LITERAL two-char `\b` sequence (a backslash +
+            // 'b') so Loki's string-unescape yields a RE2 word boundary — written
+            // here as `\\b` in a normal Rust string (each is one backslash + 'b').
+            "{job=\"docker\"} |~ \"(?i)\\\\bbackend\\\\b\""
         );
     }
 
