@@ -35,10 +35,24 @@ import { readTranslationsOverride } from "@/lib/overrides"
 const customTranslations = readTranslationsOverride()
 
 const config: OryClientConfiguration = {
-  // sdk.url is an ALTERNATIVE to the ORY_SDK_URL env var. We rely on the env var
-  // (read by @ory/nextjs internally) so the internal hostname stays server-only;
-  // setting it here from process.env would be equivalent, but the env path keeps
-  // the value out of any bundled module graph that a client import might drag in.
+  // sdk.url is the PUBLIC, BROWSER-REACHABLE Account-Experience origin — NOT the
+  // internal Kratos URL. Ory Elements uses THIS value, in the BROWSER, for two
+  // things: (a) the in-page affordance links it renders —
+  // `config.sdk.url + "/self-service/<registration|recovery|verification>/browser"`
+  // (the "Sign up" / "Forgot password?" links) — and (b) the base for client-side
+  // flow submission (`updateLoginFlow` et al). Both must be same-origin so the
+  // middleware proxies `/self-service/*` to internal Kratos. It is DISTINCT from
+  // the server-only `ORY_SDK_URL` that @ory/nextjs reads via `orySdkUrl()` for the
+  // proxy upstream + server-side flow fetch. Leaving this UNSET made Elements fall
+  // back to resolving the SDK URL from `ORY_SDK_URL` (the internal host), so the
+  // affordance links and the flow submission pointed the browser at an unreachable
+  // `http://kratos:4433/...`. Resolved server-side at module init (runtime
+  // `AX_PUBLIC_URL`, default the local compose origin) and serialized to the client
+  // via the `<Login config>` prop — only the PUBLIC origin reaches the bundle, the
+  // internal Kratos host never does.
+  sdk: {
+    url: (process.env.AX_PUBLIC_URL ?? "http://localhost:3001").replace(/\/$/, ""),
+  },
   intl: {
     locale: "en",
     // AX-03: the console-written catalog (read at boot). `undefined` when no

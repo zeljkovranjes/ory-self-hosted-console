@@ -668,7 +668,39 @@ services:
       # internal network. It is NOT a NEXT_PUBLIC_ var, so the internal hostname
       # never reaches the client bundle. ORY_PROJECT_API_TOKEN is intentionally
       # UNSET (Network-only; harmless when absent for self-hosted).
-      ORY_SDK_URL: http://ory-kratos:4433
+      #
+      # MUST string-match Kratos's `serve.public.base_url` ORIGIN (config/kratos/
+      # kratos.yml -> `http://kratos:4433/`). @ory/nextjs makes the proxied flows
+      # same-origin by string-REPLACING this value with the AX origin in every
+      # Kratos response URL (middleware `rewriteUrls` + server-component
+      # `rewriteJsonResponse`). If this host differs from the host Kratos stamps
+      # into `ui.action` (it stamps `base_url`), the replace never fires and the
+      # login form keeps an unreachable internal action — so use `kratos:4433`
+      # here, NOT the `ory-kratos` container alias (both resolve on the network;
+      # only `kratos` matches base_url's string).
+      ORY_SDK_URL: http://kratos:4433
+      # @ory/nextjs derives the BROWSER-facing flow URLs (the flow-init redirect to
+      # /self-service/<flow>/browser and the rewrite target for ui.action) two
+      # different ways: in "production" it assumes ORY_SDK_URL is itself browser-
+      # reachable (the Ory Network case) and points the browser straight at it; in
+      # non-production it derives the public origin from the request Host header.
+      # Our topology is the Network-inverse — Kratos is internal-only and reached
+      # ONLY through the same-origin middleware proxy — which matches the NON-prod
+      # derivation (request-Host origin = http://localhost:3001). Without this the
+      # browser is 307'd to the internal http://kratos:4433 and the AX never loads.
+      # This flag is read by @ory/nextjs's own `getEnv()` (dynamic process.env
+      # lookup, NOT Next's build-time inliner) and ONLY influences URL derivation
+      # (`isProduction()` is used nowhere else in @ory/nextjs — cookie `secure` is
+      # gated on x-forwarded-proto, not this). The REAL NODE_ENV stays "production"
+      # (baked into the standalone build), so React/Next remain fully optimized.
+      NEXT_PUBLIC_NODE_ENV: "development"
+      # PUBLIC, browser-reachable AX origin (must match the host the operator opens
+      # and the `selfservice.flows.*.ui_url` origin in config/kratos/kratos.yml).
+      # ory.config.ts feeds this to Ory Elements as `sdk.url` — the base Elements
+      # uses IN THE BROWSER for the "Sign up"/"Forgot password?" links and for
+      # client-side flow submission. It is the PUBLIC origin (safe to reach the
+      # client bundle), NOT the internal Kratos host (ORY_SDK_URL stays server-only).
+      AX_PUBLIC_URL: http://localhost:3001
       # AX-02/AX-03 override files (theming + localization). The AX reads
       # theme.css + translations.json from this READ-ONLY mounted dir at BOOT
       # (lib/overrides.ts). The backend's PUT /api/account-experience/* routes are
