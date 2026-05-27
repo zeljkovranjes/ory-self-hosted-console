@@ -1,43 +1,149 @@
 # Ory Self-Hosted Console (`ory-ui`)
 
-A **self-hosted, single-tenant, fully open-source** drop-in replacement for the Ory Network Console. One `docker compose up` brings up the entire stack — Postgres, Ory Kratos, Hydra, Keto, Oathkeeper, a Rust/Salvo backend (the single API layer), and a Next.js admin console — and a one-time `/setup` page gives you a production-grade console for managing identities, OAuth2 clients, permissions, SSO, and all service configuration against **your own** Ory services, with zero manual plumbing.
+![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)
+![Ory](https://img.shields.io/badge/Ory-v26.2.0-5528FF?logo=ory&logoColor=white)
+![Backend: Rust + Salvo](https://img.shields.io/badge/Backend-Rust%20%2B%20Salvo-CE422B?logo=rust&logoColor=white)
+![Frontend: Next.js 16](https://img.shields.io/badge/Frontend-Next.js%2016-black?logo=nextdotjs&logoColor=white)
+![Runs with Docker Compose](https://img.shields.io/badge/Runs%20with-Docker%20Compose-2496ED?logo=docker&logoColor=white)
+![No gated features](https://img.shields.io/badge/features-100%25%20OSS-brightgreen)
 
-Everything is open source. There are **no licensed or gated features** — every surface that the hosted Ory Console gates behind an Enterprise license (SAML, Organizations, Account Experience, Branding, metrics) is implemented here as a real OSS feature.
+> A fully open-source, single-tenant, drop-in replacement for the **Ory Network Console** — run the whole Ory stack and manage it from one admin UI, on your own infrastructure.
 
-![Ory Self-Hosted Console — feature toggles](docs/console-screenshot.png)
+![Ory Self-Hosted Console](docs/console-screenshot.png)
 
----
+## ✨ Highlights
 
-## What it is
+- **One command up.** `docker compose up` brings up Postgres + Ory Kratos, Hydra, Keto, Oathkeeper + a Rust backend + a Next.js console.
+- **No gated features.** Everything the hosted Console locks behind an Enterprise license — SAML, Organizations, Account Experience, branding, metrics — is here as real open source.
+- **Manage everything in the UI.** Identities, OAuth2 clients, permissions, SSO, and all service configuration — against **your own** Ory services.
+- **Build it your way.** A guided `ory-console` CLI lets you choose which Ory services to run, bring your own externally-hosted ones, and toggle features.
+- **Secure by design.** The browser only ever talks to the backend; Ory admin ports are never exposed to the host.
 
-- **Single API layer.** The browser never talks to Ory directly. The Rust/Salvo backend is the only thing that reaches the Ory Admin APIs (which stay on an internal-only Docker network and are never published to the host). The Next.js frontend talks only to the backend.
-- **Config = mounted YAML + scoped restart.** Self-hosted Ory has no live config API, so configuration pages edit the mounted service config, validate it against each service's JSON Schema, write atomically, and restart **only** the affected service through a hardened, container-name-scoped socket-proxy broker — never a raw Docker socket.
-- **Backend-owned state.** Console accounts, sessions, feature flags, webhook/event-sink configs + delivery logs, audit log, API keys, and SSO/Organizations data live in a dedicated `console` Postgres database with its own migrations.
-- **Version-locked.** All Ory images are pinned to `v26.2.0-distroless` and the Rust per-service crates (`ory-kratos/hydra/keto/oathkeeper-client`) track the image tags in lockstep.
+> [!NOTE]
+> Designed for a team running **its own** Ory stack (single-tenant, operator-controlled) — not a multi-tenant SaaS.
+
+## 🚀 Quickstart
+
+**Prerequisites:** Docker + Docker Compose v2.
+
+```bash
+# 1. Create your .env from the template (or use the CLI builder, below)
+cp .env.example .env        # then edit the secrets
+
+# 2. Bring up the stack
+docker compose up -d --wait
+
+# 3. Grab the one-time setup token printed on first boot
+docker compose logs backend | grep -i bootstrap
+
+# 4. Open http://localhost:3000/setup, paste the token, create your admin
+```
+
+Then log in at **http://localhost:3000**.
+
+> [!TIP]
+> Prefer guided setup over editing `.env` by hand? Use the [`ory-console init` builder](#️-cli-builder).
 
 ## Features
 
 **Identity & access**
-- Users & identities CRUD, identity-schema editor (JSON-Schema presets + Monaco), CLI-compatible bulk import
-- OAuth2/OIDC client management (Hydra), token introspect/revoke, and all Hydra config sections
-- Permissions: relation-tuple CRUD + check/expand, and an **Ory Permission Language editor with syntax highlighting and real-time validation** (Monaco + live Keto syntax-check)
+- Users & identities CRUD, JSON-Schema identity-schema editor (Monaco), bulk import
+- OAuth2 / OIDC clients (Hydra), token introspect/revoke, full Hydra config
+- Permissions: relation-tuple CRUD, check/expand, and a live-validated Ory Permission Language editor
 - Oathkeeper access-rules editor
 
-**Authentication & SSO (all OSS — no Enterprise license)**
-- All Kratos auth config: methods, passwordless/passkeys, MFA, social OIDC, recovery, verification, sessions, SMTP, SMS
-- **SAML Sign-In** via an embedded **Ory Polis** (Apache-2.0) SAML→OIDC bridge — IdP-connection CRUD with mandatory signing-cert enforcement, SSRF-guarded metadata, and an `email_verified`-gated identity mapper (no account-takeover)
-- **Organizations** — email-domain → SSO-connection mapping with IDNA/public-suffix domain normalization
-- **Account Experience UI** — a self-hosted end-user login/registration/recovery/verification/settings app (Ory Elements), with console editors for theming, localization, and custom domains
+**Authentication & SSO** — all OSS, no license
+
+- Full Kratos auth config: methods, passwordless/passkeys, MFA, social OIDC, recovery, verification, sessions, SMTP, SMS
+- SAML sign-in via an embedded Ory Polis (Apache-2.0) SAML→OIDC bridge
+- Organizations — email-domain → SSO-connection mapping
+- Account Experience — a self-hosted end-user login / recovery / settings app, with theming & localization editors
 
 **Operations**
-- **Feature toggles** — enable/disable any console feature; gated server-side (not just hidden in the nav)
-- **Optional observability** — Prometheus + Grafana + Loki + Alloy as an opt-in compose profile (default off, internal-only), powering a real Activity metrics dashboard and a log search, with Grafana behind an authenticated backend proxy
-- **Event streams** — forward console audit events to external sinks (HTTP webhook by default; NATS/Kafka behind build features) with idempotency, dead-letter, and PII redaction
-- **Webhook dispatcher** — durable, retrying, HMAC-signed, SSRF-guarded
-- Project overview/health, members, console API keys, audit log
-- An **optional operator CLI** for first-run setup and day-2 operations
+- Server-side feature toggles
+- Optional observability (Prometheus + Grafana + Loki + Alloy)
+- Event streams + a durable, HMAC-signed webhook dispatcher
+- Project overview, members, API keys, audit log
+
+## 🛠️ CLI builder
+
+`ory-console init` is a guided builder: choose your services, point at your own Ory instances, and pick features. In host mode it also brings the stack up and health-checks it end-to-end.
+
+```bash
+ory-console init                                # interactive wizard
+ory-console init --defaults                     # recommended defaults, no prompts
+ory-console init --config console.config.toml   # re-apply a saved build
+```
+
+- **Selective services** — Kratos, Hydra, Keto, Oathkeeper, and Polis are each `in-stack | bring-your-own | off`. Turning one **off** also disables its console features server-side. Postgres, backend, and frontend are always required.
+- **Bring-your-own** — point at an Ory service you already host; the wizard health-checks the connection and **blocks on failure** (`--skip-checks` to override).
+- **Reproducible** — writes a `console.config.toml` you can commit and re-apply. Secrets stay in `.env`, never the config file.
+
+<details>
+<summary>Day-2 commands (run in-container)</summary>
+
+These authenticate to the backend API and drive the same validated routes the UI uses:
+
+```bash
+docker compose run --rm cli feature enable saml
+docker compose run --rm cli feature list
+docker compose run --rm cli observability on
+docker compose run --rm cli org add --label "Acme" --domain acme.com
+docker compose run --rm cli oauth github set                  # prompts for the secret
+docker compose run --rm cli admin create --via-setup --name "Admin" --email you@example.com
+```
+
+Secrets are always read from an env var / `--*-file` / prompt — never an argv flag.
+</details>
+
+## ⚙️ Configuration
+
+- **Service config** (Kratos/Hydra/Keto/Oathkeeper/Polis) is edited **in the console** — it writes the mounted YAML, validates it, and restarts only the affected service.
+- **Secrets** come from `.env` / secret files and are never logged or sent to the browser.
+- Interoperates with the official `ory` CLI (identity schemas, OAuth2 clients, Keto tuples).
+
+### Email & SMS
+
+Recovery, verification, and one-time-code sign-in are wired end-to-end. For local development, an opt-in profile ships mail/SMS catchers so the flows work with no external accounts:
+
+```bash
+docker compose --profile dev-mail up -d --wait
+```
+
+Read captured email at **http://localhost:8025** (Mailpit) and SMS at **http://localhost:8026**.
+
+> [!WARNING]
+> The catchers are dev-only and never start with a plain `docker compose up`. **In production**, point Kratos at a real SMTP server and SMS gateway via the console's **Email/SMTP** and **SMS** pages. Until you do, recovery/verification mail queues but is not delivered.
+
+### Optional observability
+
+```bash
+docker compose --profile observability up -d --wait
+```
+
+Then enable the **Observability** feature. Grafana is reachable only through the authenticated backend proxy — never published to the host.
+
+## 🔒 Security
+
+- Ory admin ports are **never published to the host** — only the backend reaches them, on an internal-only network.
+- Service restarts go through a scoped socket-proxy broker; the backend holds **no** Docker socket.
+- Console auth: Argon2id passwords, opaque DB-backed sessions behind a `__Host-` cookie, CSRF protection, rate limiting, a one-time bootstrap token, optional GitHub OAuth.
+- Feature flags are enforced server-side; outbound webhooks are SSRF-guarded; SAML enforces IdP signing certs with an `email_verified`-gated mapper.
+
+<details>
+<summary>Documented residual risks (single-tenant, operator-controlled)</summary>
+
+- Account Experience shares an internal network segment with Kratos, which co-listens its admin port; the AX has no admin credentials and the port is not host-published. Full isolation would need an L7 proxy in front of Kratos.
+- The backend `/metrics` endpoint is unauthenticated (Prometheus pull model) and relies on its port not being host-published.
+- Hydra runs with `--dev` — documented and acceptable for single-tenant self-hosting.
+</details>
 
 ## Architecture
+
+<details>
+<summary>How it fits together</summary>
+
+The browser talks **only** to the Rust/Salvo backend — the single API layer. The Ory admin APIs stay on an internal-only network with no host ports. Console state (accounts, sessions, feature flags, webhooks, audit log, API keys) lives in a dedicated `console` Postgres database.
 
 ```
                  ┌─────────────── edge network ───────────────┐
@@ -54,141 +160,17 @@ Everything is open source. There are **no licensed or gated features** — every
                  └───────────────────────────────────────────────────────────────┘
 ```
 
-## Installation / Quickstart
+All Ory images are pinned to `v26.2.0-distroless`, with the Rust client crates tracked in lockstep.
+</details>
 
-**Prerequisites:** Docker + Docker Compose v2.
+<details>
+<summary>Development</summary>
 
-```bash
-# 1. Provide the required secrets (DB passwords, etc.) — copy the example and fill it in
-#    (or use the operator CLI bootstrap, below):
-cp .env.example .env      # then edit .env
-
-# 2. Bring up the full stack on a fresh volume:
-docker compose up -d --wait
-
-# 3. The backend prints a one-time bootstrap token to its logs on first boot:
-docker compose logs backend | grep -i bootstrap
-
-# 4. Open the console and complete first-run setup:
-#    http://localhost:3000/setup   (paste the bootstrap token, create the local admin)
-```
-
-After `/setup`, log in at `http://localhost:3000`. GitHub OAuth login appears on the `/login` page when GitHub OAuth credentials are configured (env, or via the CLI).
-
-**Optional observability stack** (default off):
-
-```bash
-docker compose --profile observability up -d --wait
-```
-
-Then enable the **Observability** feature toggle (Project → Features). Grafana is reachable only through the authenticated backend proxy — never published to the host.
-
-**Local dev — email/SMS capture** (optional, default off):
-
-```bash
-docker compose --profile dev-mail up -d --wait
-```
-
-Brings up the bundled Mailpit + sms-sink catchers so recovery/verification mail and SMS one-time codes are captured locally (read them at http://localhost:8025 and http://localhost:8026). A plain `docker compose up` does **not** start them; in production you point Kratos at a real SMTP server / SMS gateway via the console pages instead (see [Email & SMS delivery](#email--sms-delivery)).
-
-## Configuration
-
-- Service config (Kratos/Hydra/Keto/Oathkeeper/Polis) is edited **in the console** — it writes the mounted config, validates, and restarts only that service via the broker.
-- Secrets (DB passwords, GitHub OAuth, SMTP/SMS, Polis keys) come from `.env` / secret files and are never logged or sent to the frontend.
-- Ory CLI compatibility: identity schemas, OAuth2 client shapes, and Keto relation tuples interoperate with the official `ory` CLI.
-
-### Email & SMS delivery
-
-Account recovery (password reset), address verification, and one-time-code sign-in are wired end-to-end. For **local development** the stack ships two **dev catchers** so these flows work immediately with no external accounts — but they run **only under the opt-in `dev-mail` compose profile (default OFF)**:
-
-```bash
-docker compose --profile dev-mail up -d --wait
-```
-
-- **Email → Mailpit.** Kratos's courier sends recovery/verification mail to a bundled [Mailpit](https://mailpit.axllent.org/) catcher. While the `dev-mail` profile is up, read the captured messages (and their codes) at **http://localhost:8025**.
-- **SMS → sms-sink.** Kratos POSTs one-time SMS login codes to a tiny bundled HTTP catcher. While the profile is up, view captured texts at **http://localhost:8026**. (Sign-in by SMS uses the optional `phone` trait on the identity schema; email keeps password sign-in.)
-
-Those URLs resolve **only while `--profile dev-mail` is up**. The committed `config/kratos/kratos.yml` courier block points at `mailpit:1025` / `sms-sink:8080` as the dev default, so the catchers light up as soon as you enable the profile.
-
-**Production posture.** A plain `docker compose up` does **NOT** start the catchers — they are unencrypted and do not forward mail/SMS, so they must never run in production. Instead, leave the `dev-mail` profile off and point Kratos at a real SMTP server and SMS gateway via the console's **Email/SMTP** and **SMS** pages (they rewrite the Kratos `courier` config and restart the service). Until you configure a real provider, Kratos's courier has no backend: recovery/verification mail queues but is not delivered, and SMS POSTs fail — that is the expected, documented production posture.
-
-## Operator CLI / Builder (optional)
-
-The console works fully without the CLI (via `/setup` + env). The `ory-console` CLI adds a **guided builder** for first-run setup plus day-2 ops. Secrets are always read from an env var / `--*-file` / interactive prompt — **never** an argv flag.
-
-### `ory-console init` — guided builder
-
-The builder stands up a console tailored to you: pick which Ory services to run, optionally point at your own externally-hosted instances, choose console features, and — in host mode — bring the stack up and health-check it end-to-end.
-
-```bash
-# Interactive wizard. In HOST mode (Docker available) it writes config, runs
-# `docker compose up` with the chosen services, health-checks them, applies the
-# feature set, and creates the first-run admin:
-ory-console init
-
-# Accept the recommended defaults, no prompts — all 5 Ory services in-stack;
-# advanced features (SAML, Organizations, Observability, Event Streams) OFF;
-# everything else ON:
-ory-console init --defaults
-
-# Re-apply a saved build byte-for-byte (existing .env secrets are NOT rotated):
-ory-console init --config console.config.toml
-
-# Config-only (no Docker socket): writes .env + console.config.toml, validates any
-# bring-your-own connections, then prints the remaining day-1/day-2 steps:
-ory-console init --no-docker
-```
-
-What the wizard configures:
-
-- **Selective services** — Kratos, Hydra, Keto, Oathkeeper, and Polis are each `in-stack | bring-your-own | off`. Turning a service **off** also disables its console features **server-side** (the routes 404 and the nav entries hide), not just visually. Postgres + backend + frontend are always required.
-- **Bring-your-own** — point the console at an Ory service you already host (its admin URL); the wizard **health-checks** the connection and **blocks** on failure with a clear diagnostic (override with `--skip-checks`).
-- **Reproducible** — writes a declarative `console.config.toml` (service modes, BYO URLs, feature set) you can commit and re-apply with `--config`. Secrets stay in `.env`/secret files — never in the toml.
-- **Full first-run** — generates secrets into `.env`, seeds the feature set, creates the first-run admin (`/setup`), and optionally configures SMTP / SMS / GitHub login.
-
-> The builder selects services via per-service Compose profiles (`svc-kratos`, `svc-hydra`, …) in `COMPOSE_PROFILES`; a plain `docker compose up` with none set still starts the full default stack.
-
-### Day-2 ops (in-container)
-
-The ONLINE/BOOTSTRAP commands run through Compose for ongoing operations — authenticated to the backend HTTP API (`Authorization: Api-Key`), driving the SAME validated routes (the CLI is never a second writer of config):
-
-```bash
-docker compose run --rm cli feature enable saml
-docker compose run --rm cli feature list
-docker compose run --rm cli observability on
-docker compose run --rm cli sso add-saml --tenant <org> --metadata-xml-file ./idp-metadata.xml \
-  --default-redirect-url https://console.example.com/ --redirect-url https://console.example.com/
-docker compose run --rm cli org add --label "Acme" --domain acme.com
-docker compose run --rm cli oauth github set                  # GitHub login OAuth (prompts for the secret)
-docker compose run --rm cli admin create --via-setup --name "Admin" --email you@example.com
-```
-
-## Security
-
-Security hardening is a top priority:
-
-- Ory **Admin ports are never published to the host** — only the backend reaches them, on an internal-only network.
-- Service **restarts go only through a scoped socket-proxy** broker; the backend holds no Docker socket.
-- Console auth: Argon2id passwords, DB-backed opaque sessions behind a `__Host-` cookie, CSRF protection, rate limiting, a one-time bootstrap token, optional GitHub OAuth.
-- SAML: mandatory IdP signing-cert enforcement; the backend is the sole metadata fetcher behind an SSRF guard (DNS-rebind defended); the OIDC mapper is `email_verified`-default-false (no account-takeover).
-- Feature flags are enforced **server-side** (a disabled feature's routes 404 even with a valid session).
-- Outbound webhooks/event-sinks are SSRF-guarded with write-only credentials and PII-redacted payloads.
-- The Account Experience UI uses a per-request nonce CSP and a session fully isolated from the admin console.
-
-### Documented residual risks (single-tenant, operator-controlled deployment)
-
-- The Account Experience service shares an internal network segment with Kratos, which co-listens its admin port on the same interface — the AX service has no admin URL/credentials and never calls it, and the admin port is not host-published; full network isolation would require an L7 public-only proxy in front of Kratos.
-- The backend `/metrics` endpoint is unauthenticated (Prometheus pull model) and relies on its metrics port not being host-published.
-- Hydra runs with `--dev` (carried from v1); documented and acceptable for self-hosted single-tenant.
-
-See `.planning/v2-MILESTONE-AUDIT.md` for the full audit and tech-debt register.
-
-## Development
-
-- **Backend:** Rust (Cargo workspace: `console-core` shared DTOs + `backend` + `cli`), Salvo 0.93, sqlx 0.9 with committed offline metadata (`--locked` offline Docker builds).
+- **Backend:** Rust (Cargo workspace: `console-core` shared DTOs + `backend` + `cli`), Salvo 0.93, sqlx 0.9 with committed offline metadata.
 - **Frontend:** Next.js 16 + React 19 + TypeScript, TanStack Table/Query, React Hook Form + Zod, shadcn/ui, Monaco (vendored same-origin — zero CDN egress). npm only.
-- **Verification:** each feature area ships a live acceptance harness under `scripts/verify/phaseNN-acceptance.sh` that brings up the real stack and asserts behavior (including negative/security assertions). Optional Kafka support builds via `backend/Dockerfile.kafka`.
+- **Verification:** each feature area ships a live acceptance harness under `scripts/verify/` that brings up the real stack and asserts behavior, including negative/security checks.
+</details>
 
 ## License
 
-Open source. No gated or license-restricted features.
+Licensed under **Apache-2.0** (declared in the crate manifests). No gated or license-restricted features.
