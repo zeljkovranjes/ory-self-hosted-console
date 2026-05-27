@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::audit::AuditView;
 use crate::error::AppError;
 
-use super::{EventSinkRow, EventSinkView};
+use super::{EventDeliveryView, EventSinkRow, EventSinkView};
 
 /// A row claimed off the delivery queue (the worker's working set). Carries only
 /// what the worker needs to deliver — NOT the credential (it fetches the owning
@@ -292,6 +292,50 @@ pub async fn insert_delivery(
     .fetch_one(pool)
     .await?;
     Ok(row.id)
+}
+
+/// List deliveries (optionally filtered by `sink_id` and/or `status`), newest
+/// first, bounded — the delivery-log view (clone of `webhooks::queries::list_deliveries`).
+pub async fn list_deliveries(
+    pool: &PgPool,
+    sink_id: Option<Uuid>,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<EventDeliveryView>, AppError> {
+    let rows = sqlx::query_as!(
+        EventDeliveryView,
+        r#"
+        SELECT id, sink_id, event, payload, status, attempt, max_attempts,
+               next_attempt_at, last_status_code, last_error, created_at, updated_at
+        FROM event_deliveries
+        WHERE ($1::uuid IS NULL OR sink_id = $1)
+          AND ($2::text IS NULL OR status = $2)
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+        sink_id,
+        status,
+        limit
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Fetch a single delivery by id.
+pub async fn get_delivery(pool: &PgPool, id: Uuid) -> Result<Option<EventDeliveryView>, AppError> {
+    let row = sqlx::query_as!(
+        EventDeliveryView,
+        r#"
+        SELECT id, sink_id, event, payload, status, attempt, max_attempts,
+               next_attempt_at, last_status_code, last_error, created_at, updated_at
+        FROM event_deliveries WHERE id = $1
+        "#,
+        id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// Atomically claim up to `limit` due deliveries with FOR UPDATE SKIP LOCKED.

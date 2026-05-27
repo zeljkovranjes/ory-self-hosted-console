@@ -857,6 +857,50 @@ pub fn build(
             Router::with_path("api/webhooks")
                 .get(crate::webhooks::routes::list_webhooks) // HOOK-03 list (masked secret)
                 .post(crate::webhooks::routes::create_webhook), // HOOK-02/03 create (one-time secret)
+        )
+        // Phase 17 (EVT-01/02/03) the event-stream sinks. Console-OWNED state, NO
+        // Ory call (like webhooks). All inherit `auth_guard` (401) + `csrf_guard`
+        // (403 on state changes) AND are GATED by `FeatureFlagHoop::new("event_streams")`
+        // (seeded OFF) — so a flag-OFF request 404s even with a valid session +
+        // matching CSRF (FLAG-01 / T-17-07). The credential is write-only end-to-end:
+        // create (webhook kind) + rotate-secret reveal it ONCE; GET/list return the
+        // masked `secret_set`/`sasl_username_set` badges only (T-17-09). `create`
+        // SSRF-validates a webhook URL for fast 422; the worker re-validates at
+        // delivery time (DNS-rebind, T-17-08). Most specific paths FIRST so the
+        // literal `deliveries` segment is not captured by `{id}` (mirrors the
+        // webhook block ordering).
+        .push(
+            Router::with_path("api/event-sinks/deliveries")
+                .hoop(crate::features::FeatureFlagHoop::new("event_streams"))
+                .get(crate::events::routes::list_deliveries),
+        )
+        .push(
+            Router::with_path("api/event-sinks/deliveries/{id}/redeliver")
+                .hoop(crate::features::FeatureFlagHoop::new("event_streams"))
+                .post(crate::events::routes::redeliver),
+        )
+        .push(
+            Router::with_path("api/event-sinks/deliveries/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("event_streams"))
+                .get(crate::events::routes::get_delivery),
+        )
+        .push(
+            Router::with_path("api/event-sinks/{id}/rotate-secret")
+                .hoop(crate::features::FeatureFlagHoop::new("event_streams"))
+                .post(crate::events::routes::rotate_secret),
+        )
+        .push(
+            Router::with_path("api/event-sinks/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("event_streams"))
+                .get(crate::events::routes::get_sink)
+                .put(crate::events::routes::update_sink)
+                .delete(crate::events::routes::delete_sink),
+        )
+        .push(
+            Router::with_path("api/event-sinks")
+                .hoop(crate::features::FeatureFlagHoop::new("event_streams"))
+                .get(crate::events::routes::list_sinks)
+                .post(crate::events::routes::create_sink),
         );
 
     // Phase 12 (FLAG-01): the KEYSTONE gated probe. A minimal self-contained route

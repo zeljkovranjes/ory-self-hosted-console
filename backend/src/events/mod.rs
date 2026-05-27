@@ -27,6 +27,7 @@
 
 pub mod queries;
 pub mod redact;
+pub mod routes;
 pub mod sinks;
 pub mod worker;
 
@@ -196,6 +197,28 @@ pub struct OutboundEvent {
     pub occurred_at: OffsetDateTime,
     /// The redacted payload — no raw PII / secrets (EVT-03).
     pub data: serde_json::Value,
+}
+
+/// A single `event_deliveries` row for the delivery-log view. Safe to serialize:
+/// the `payload` is the ALREADY-REDACTED [`OutboundEvent`] (EVT-03), and the table
+/// carries no credential column.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct EventDeliveryView {
+    pub id: Uuid,
+    pub sink_id: Uuid,
+    pub event: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub attempt: i32,
+    pub max_attempts: i32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub next_attempt_at: OffsetDateTime,
+    pub last_status_code: Option<i32>,
+    pub last_error: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
 }
 
 #[cfg(test)]
