@@ -423,7 +423,14 @@ services:
   # ===========================================================================
   backend:
     build:
-      context: ./backend
+      # WORKSPACE LAYOUT (Phase 19 / Plan 01 note): the repo root is now a Cargo
+      # workspace (console-core + backend + cli). The backend Dockerfile's build
+      # context MUST be the REPO ROOT so a `--locked` build sees the workspace-root
+      # Cargo.toml + the single root Cargo.lock + the console-core crate. Only
+      # `-p ory-console-backend` is built, so clap/the CLI never enter this image
+      # (leanness invariant — `cargo tree -p ory-console-backend` has no clap).
+      context: .
+      dockerfile: backend/Dockerfile
       args:
         # WR-01: OFF by default — a normal `docker compose up` builds the hardened
         # production backend with NO `/api/features/_probe` keystone probe. The
@@ -545,6 +552,51 @@ services:
         # compromised peer cannot forge the auth-proxy header from a different IP).
         ipv4_address: 172.30.0.10
       edge: {}
+
+  # ===========================================================================
+  # Operator CLI (Phase 19, CLI-02..06) — OPTIONAL, one-shot, internal-only.
+  #
+  # The `console-cli` image (cli/Dockerfile) built from the workspace root. It is
+  # a SEPARATE, tiny image from the backend so the backend runtime stays lean (no
+  # clap/CLI code in it — LOCKED constraint). The CLI never talks to Ory/the DB
+  # directly: ONLINE commands are HTTP clients of the EXISTING backend routes via
+  # `Authorization: Api-Key <raw>` (never a second writer); BOOTSTRAP commands
+  # write only gitignored `.env`/secret files.
+  #
+  # OPTIONALITY (CLI-02 / T-19-16): this service carries `profiles: ["cli"]`, so a
+  # plain `docker compose up` (and `up -d --wait`) NEVER starts it — the full stack
+  # + every feature comes up without it. NO base-stack service has a `depends_on`
+  # pointing at `cli`. It is invoked one-shot:
+  #
+  #   docker compose run --rm cli feature enable saml
+  #   docker compose run --rm cli feature list
+  #   docker compose run --rm cli observability on
+  #
+  # INFRA-05 / T-19-15: attached to the INTERNAL network ONLY, with NO `ports:` —
+  # it reaches `backend:8080` container-to-container and publishes no host port.
+  #
+  # SECRETS: `CONSOLE_API_KEY` is passed via the environment / `.env` (NEVER a
+  # literal here, NEVER on argv). For BOOTSTRAP commands that write `./.env`, run
+  # the cli with the repo root bind-mounted, e.g.:
+  #   docker compose run --rm -v "$PWD:/work" cli oauth github set
+  # (the secret VALUE itself comes from an env var / --*-file / prompt — see README).
+  # ===========================================================================
+  cli:
+    build:
+      context: .
+      dockerfile: cli/Dockerfile
+    image: ory-console-cli
+    profiles: ["cli"]
+    environment:
+      # The CLI reaches the backend on the internal network. Overridable, but the
+      # default points at the in-stack backend service.
+      CONSOLE_API_URL: ${CONSOLE_API_URL:-http://backend:8080}
+      # The issued console API key (from the console API-keys page). Passed through
+      # from the operator's environment / .env — NEVER inlined, NEVER on argv.
+      CONSOLE_API_KEY: ${CONSOLE_API_KEY:-}
+    networks: [internal]
+    # NO ports: — internal-only (INFRA-05). NO depends_on FROM the base stack
+    # points here; the CLI is optional and run on demand.
 
   # ===========================================================================
   # Frontend (Next.js skeleton). Edge-only; publishes 3000 to host.
