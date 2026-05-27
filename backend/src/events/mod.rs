@@ -33,6 +33,71 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::error::AppError;
+use sinks::webhook::WebhookSink;
+#[cfg(feature = "events-nats")]
+use sinks::nats::NatsSink;
+#[cfg(feature = "events-kafka")]
+use sinks::kafka::KafkaSink;
+
+/// Runtime sink-dispatch registry (EVT-01).
+///
+/// An ENUM (not `Box<dyn EventSink>`): native async-fn-in-trait is stable on the
+/// 1.95 toolchain, so we get async dispatch with NO `async-trait`, NO `dyn`, and
+/// NO heap allocation, and the compiler proves match exhaustiveness. Crucially, a
+/// disabled adapter is an ABSENT `#[cfg]` variant AND an absent match arm
+/// ([`Sink::build`]), so the default build never references the missing crate
+/// (T-17-06).
+#[derive(Debug)]
+pub enum Sink {
+    /// The DEFAULT sink — always present, zero new deps (reuses
+    /// `webhooks::{ssrf, hmac}`).
+    Webhook(WebhookSink),
+    #[cfg(feature = "events-nats")]
+    Nats(NatsSink),
+    #[cfg(feature = "events-kafka")]
+    Kafka(KafkaSink),
+}
+
+impl Sink {
+    /// Construct the concrete sink for a stored row, dispatching on `row.kind`.
+    ///
+    /// A kind whose adapter feature is NOT compiled in (or an unknown kind) falls
+    /// through to a clean `BadRequest("... not available in this build")` — a
+    /// recorded error, NEVER a panic (EVT-01).
+    pub fn build(row: &EventSinkRow) -> Result<Self, AppError> {
+        match row.kind.as_str() {
+            "webhook" => Ok(Sink::Webhook(WebhookSink::from_row(row)?)),
+            #[cfg(feature = "events-nats")]
+            "nats" => Ok(Sink::Nats(NatsSink::from_row(row)?)),
+            #[cfg(feature = "events-kafka")]
+            "kafka" => Ok(Sink::Kafka(KafkaSink::from_row(row)?)),
+            other => Err(AppError::BadRequest(format!(
+                "sink type '{other}' is not available in this build"
+            ))),
+        }
+    }
+
+    /// Deliver one already-redacted event through the concrete sink.
+    ///
+    /// `allow_private` is the test/CI escape hatch forwarded to the SSRF guard —
+    /// production callers pass `false`. Errors are recorded by the worker as
+    /// retry/dead exactly like a webhook non-2xx/transport failure.
+    pub async fn deliver(
+        &self,
+        event: &OutboundEvent,
+        allow_private: bool,
+    ) -> Result<(), AppError> {
+        match self {
+            Sink::Webhook(s) => s.deliver(event, allow_private).await,
+            #[cfg(feature = "events-nats")]
+            Sink::Nats(s) => s.deliver(event, allow_private).await,
+            #[cfg(feature = "events-kafka")]
+            Sink::Kafka(s) => s.deliver(event, allow_private).await,
+        }
+    }
+}
+
 /// A full `event_sinks` row, INCLUDING the recoverable `secret` + `sasl_username`.
 ///
 /// Deliberately NOT `Serialize` (mirrors [`crate::webhooks::WebhookRow`]): because
@@ -130,4 +195,108 @@ pub struct OutboundEvent {
     pub occurred_at: OffsetDateTime,
     /// The redacted payload — no raw PII / secrets (EVT-03).
     pub data: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `EventSinkRow` for registry/view tests.
+    fn row(kind: &str, target: &str, secret: &str) -> EventSinkRow {
+        let now = OffsetDateTime::now_utc();
+        EventSinkRow {
+            id: Uuid::new_v4(),
+            name: "test".into(),
+            kind: kind.into(),
+            target: target.into(),
+            subject: None,
+            events: vec!["identity.created".into()],
+            secret: secret.into(),
+            sasl_username: None,
+            tls: false,
+            enabled: true,
+            last_event_id: None,
+            last_event_cursor_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// `Sink::build` resolves the always-present webhook adapter.
+    #[test]
+    fn build_resolves_webhook() {
+        let s = Sink::build(&row("webhook", "https://example.com/hook", "sek"));
+        assert!(matches!(s, Ok(Sink::Webhook(_))));
+    }
+
+    /// A sink kind whose adapter feature is NOT compiled in is a clean
+    /// `BadRequest` naming the build, NEVER a panic (registry_unavailable_sink_type).
+    #[cfg(not(feature = "events-nats"))]
+    #[test]
+    fn build_rejects_feature_absent_nats() {
+        let err = Sink::build(&row("nats", "nats://broker.example.com:4222", "creds"))
+            .unwrap_err();
+        match err {
+            AppError::BadRequest(m) => {
+                assert!(m.contains("not available in this build"), "msg: {m}");
+                assert!(m.contains("nats"), "msg: {m}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "events-kafka"))]
+    #[test]
+    fn build_rejects_feature_absent_kafka() {
+        let err = Sink::build(&row("kafka", "broker.example.com:9092", "sasl-pw"))
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    /// An unknown kind is rejected, never panics.
+    #[test]
+    fn build_rejects_unknown_kind() {
+        let err = Sink::build(&row("smoke-signals", "x", "")).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    /// EventSinkView never carries the raw secret — only the masked badges
+    /// (T-17-01). (Compile-time: EventSinkRow has no Serialize derive.)
+    #[test]
+    fn view_masks_secret_and_username() {
+        let mut r = row("webhook", "https://example.com/hook", "the-secret");
+        r.sasl_username = Some("svc-user".into());
+        let v = EventSinkView::from(r);
+        assert!(v.secret_set);
+        assert!(v.sasl_username_set);
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains("the-secret"), "secret leaked into view JSON: {json}");
+        assert!(!json.contains("svc-user"), "username leaked into view JSON: {json}");
+    }
+
+    /// An empty secret / absent username produce `false` badges.
+    #[test]
+    fn view_badges_false_when_empty() {
+        let v = EventSinkView::from(row("webhook", "https://example.com/hook", ""));
+        assert!(!v.secret_set);
+        assert!(!v.sasl_username_set);
+    }
+
+    /// The webhook sink rejects a loopback target through the SHARED ssrf guard
+    /// when allow_private = false (proves reuse, not reimplementation).
+    #[tokio::test]
+    async fn webhook_delivery_blocked_by_shared_ssrf_guard() {
+        let sink = WebhookSink {
+            url: "http://127.0.0.1/hook".into(),
+            secret: "sek".into(),
+        };
+        let event = OutboundEvent {
+            id: Uuid::new_v4(),
+            event: "identity.created".into(),
+            occurred_at: OffsetDateTime::now_utc(),
+            data: serde_json::json!({"ok": true}),
+        };
+        let err = sink.deliver(&event, false).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
 }
