@@ -152,15 +152,19 @@ BOOTSTRAP_ENV_REL=".env.cli-bootstrap-$$"
 BOOTSTRAP_ENV_ABS="${REPO_ROOT}/${BOOTSTRAP_ENV_REL}"
 
 teardown() {
+  # Bring the stack down BEFORE removing the ephemeral env-file: $DC references it
+  # via `--env-file`, so deleting it first would make `down` unable to resolve the
+  # project and silently leave the stack up (the temp files are gitignored either
+  # way, but the stack must actually come down).
+  if [ "${KEEP_STACK:-0}" = "1" ]; then
+    echo "KEEP_STACK=1 — leaving the stack up (run '$DC --profile cli down -v' to clean)."
+  else
+    echo
+    echo "--- teardown: docker compose down -v (incl. the cli profile) ---"
+    $DC --profile cli down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
   rm -f "$POLIS_ENV_FILE" 2>/dev/null || true
   rm -f "$BOOTSTRAP_ENV_ABS" 2>/dev/null || true
-  if [ "${KEEP_STACK:-0}" = "1" ]; then
-    echo "KEEP_STACK=1 — leaving the stack up (run '$DC down -v' to clean)."
-    return 0
-  fi
-  echo
-  echo "--- teardown: docker compose down -v (incl. the cli profile) ---"
-  $DC --profile cli down -v >/dev/null 2>&1 || true
 }
 trap teardown EXIT
 
@@ -339,8 +343,14 @@ SETUP_TOKEN="$($DC logs backend 2>/dev/null \
   | grep -oE 'FIRST-RUN SETUP TOKEN: [A-Za-z0-9_-]+' \
   | tail -n1 | sed 's/^FIRST-RUN SETUP TOKEN: //')"
 
-ADMIN_EMAIL_TEST="phase19-admin@example.com"
-ADMIN_PW_TEST="phase19-acceptance-pw"
+# IMPORTANT: the OPTIONALITY re-run above runs phase12-acceptance.sh, which
+# completes the one-time /setup and creates ITS admin (phase12-admin@…). /setup
+# is then closed (404) for the rest of this stack's life, so a fresh phase19 admin
+# can NEVER be created. We therefore AUTHENTICATE AS THE phase12 admin (the single
+# admin minted by the one /setup this stack allows) — the api-key / cli / bootstrap
+# criteria are independent of which admin name issued the session.
+ADMIN_EMAIL_TEST="phase12-admin@example.com"
+ADMIN_PW_TEST="phase12-acceptance-pw"
 : "${SESSION_COOKIE_NAME:=console_session}"
 
 state_now="$(curl -s --max-time 10 "${BACKEND_BASE_URL}/api/console/state" 2>/dev/null)"
@@ -627,7 +637,10 @@ else
   _fail "[T-19-19] the bootstrap .env is missing or lacks the GITHUB_OAUTH_* keys (out: $(printf '%s' "$boot_out" | head -c 300))"
 fi
 # `git check-ignore` MUST match (the written path is gitignored) — explicit match.
-if git -C "$REPO_ROOT" check-ignore "$BOOTSTRAP_ENV_REL" >/dev/null 2>&1; then
+# Run from the repo root (the script already cd'd there) with a RELATIVE path:
+# `git -C "<MSYS path with spaces>"` does not survive MSYS_NO_PATHCONV=1 path
+# translation, which spuriously fails the chdir and false-reds this assertion.
+if ( cd "$REPO_ROOT" && git check-ignore "$BOOTSTRAP_ENV_REL" ) >/dev/null 2>&1; then
   _pass "[T-19-19] git check-ignore matches ${BOOTSTRAP_ENV_REL} (the bootstrap write targets only gitignored paths)"
 else
   _fail "[T-19-19] git check-ignore did NOT match ${BOOTSTRAP_ENV_REL} (a bootstrap secret file could be committed!)"
