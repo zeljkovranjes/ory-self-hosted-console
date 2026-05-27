@@ -29,9 +29,11 @@ pub mod client;
 pub mod config_model;
 pub mod emit;
 pub mod online;
+pub mod orchestrate;
 pub mod probe;
+pub mod wizard;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// The optional operator CLI.
 ///
@@ -64,6 +66,17 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
+    /// First-run BUILDER wizard (CLI-builder Wave 3 / WIZARD, HYBRID). Resolves a
+    /// `console.config.toml` three ways — `--defaults` (all-in-stack-on, no
+    /// prompts), `--config <file>` (re-apply a saved config), or interactive
+    /// prompts — then writes the config + `.env`, generates any missing required
+    /// secrets, and (on a Docker host) orchestrates `docker compose up` +
+    /// post-boot feature apply + first-run admin. With NO Docker socket it
+    /// degrades to config-only and prints the day-2 ONLINE command sequence.
+    ///
+    /// Carries ONLY non-secret flags (see [`InitArgs`]); every secret stays on
+    /// env / `--*-file` / prompt (the no-argv-secret guard holds).
+    Init(InitArgs),
     /// Feature flags (CLI-03, ONLINE) — GET/PUT /api/console/features.
     Feature {
         #[command(subcommand)]
@@ -100,6 +113,47 @@ pub enum Cmd {
         #[command(subcommand)]
         action: BootstrapAction,
     },
+}
+
+/// Flags for the `init` builder wizard.
+///
+/// SECURITY (T-CB-C03 / Pitfall 2): this carries ONLY non-secret flags. No
+/// value-taking secret flag exists here — the admin password, POLIS_API_KEY,
+/// SMTP/SMS/OAuth secrets are ALL read via `bootstrap::read_secret` (env /
+/// `--*-file` / interactive prompt), never argv. The clap-introspection guard
+/// `no_subcommand_accepts_a_value_taking_secret_flag` enforces this structurally.
+#[derive(Args, Debug, Default, Clone)]
+pub struct InitArgs {
+    /// Fast path: apply the LOCKED defaults (all five Ory services in-stack ON;
+    /// advanced features saml/organizations/observability/event_streams OFF; the
+    /// rest ON) with NO prompts. Mutually exclusive with `--config`.
+    #[arg(long, conflicts_with = "config")]
+    pub defaults: bool,
+
+    /// Re-apply a saved `console.config.toml` non-interactively (the `--config`
+    /// round-trip contract). Mutually exclusive with `--defaults`.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<String>,
+
+    /// Proceed even when a readiness/connection check fails (the explicit override
+    /// to the default BLOCK-on-failure policy). The choice is surfaced in output.
+    #[arg(long)]
+    pub skip_checks: bool,
+
+    /// Target `.env` file the wizard writes (CONSOLE_SERVICE_*, byo URLs,
+    /// COMPOSE_PROFILES, generated secrets). Must be a gitignored path.
+    #[arg(long, value_name = "PATH", default_value = ".env")]
+    pub env_file: String,
+
+    /// Where to write the reproducible `console.config.toml` (secrets excluded).
+    #[arg(long, value_name = "PATH", default_value = "console.config.toml")]
+    pub config_out: String,
+
+    /// Force config-only mode (skip the host `docker compose up` + post-boot
+    /// in-stack steps) even when a Docker daemon IS reachable. The in-container
+    /// CLI (INFRA-05, no socket) degrades automatically; this is the manual lever.
+    #[arg(long)]
+    pub no_docker: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -308,6 +362,9 @@ pub enum BootstrapAction {
 /// the network — they write only gitignored `.env`/secret paths.
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.cmd {
+        // The builder wizard owns its own config/secret/orchestration flow; it
+        // reuses the global --api-url/--api-key for the post-boot ONLINE steps.
+        Cmd::Init(args) => wizard::run_init(args, &cli.api_url, cli.api_key.as_deref()).await,
         Cmd::Feature { action } => {
             let client = client::ApiClient::new(&cli.api_url, cli.api_key.as_deref())?;
             online::feature(&client, action).await
