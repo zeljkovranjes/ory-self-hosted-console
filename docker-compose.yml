@@ -20,6 +20,31 @@
 #     scoped restart-broker (BACK-05).
 #
 # Compose v2: the obsolete top-level `version:` key is intentionally OMITTED.
+#
+# -----------------------------------------------------------------------------
+# PER-SERVICE PROFILES — selective Ory services (CLI-builder, COMPOSE-PROFILES).
+# -----------------------------------------------------------------------------
+# Each of the five Ory services (+ its migrate one-shot) carries a profile named
+# after the service so the operator/wizard can EXCLUDE one by dropping its
+# profile from COMPOSE_PROFILES:
+#   svc-kratos      -> kratos      + kratos-migrate
+#   svc-hydra       -> hydra       + hydra-migrate
+#   svc-keto        -> keto        + keto-migrate
+#   svc-oathkeeper  -> oathkeeper  + oathkeeper-jwks-init
+#   svc-polis       -> polis
+# Postgres + backend + frontend (+ account-experience) carry NO profile and are
+# ALWAYS started.
+#
+# Compose does NOT start a profiled service unless its profile is active, so to
+# keep the DEFAULT "all five Ory services on" posture UNCHANGED, COMPOSE_PROFILES
+# DEFAULTS to all five svc-* profiles. The committed `.env`/`.env.example` set:
+#   COMPOSE_PROFILES=svc-kratos,svc-hydra,svc-keto,svc-oathkeeper,svc-polis
+# so a plain `docker compose up -d --wait` brings up the full stack exactly as
+# before. The CLI-builder wizard rewrites COMPOSE_PROFILES to DROP a service's
+# svc-* profile when that service is selected `off` (and the backend's env-driven
+# boot reconcile cascade-disables that service's console feature flag). This is
+# the deterministic, INFRA-04-safe switch — no generated override file, and the
+# x-images anchors / image literals are untouched (the grep still counts 4).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -156,6 +181,7 @@ services:
   kratos-migrate:
     image: *kratos-image
     container_name: kratos-migrate
+    profiles: ["svc-kratos"]
     command: ["migrate", "sql", "-e", "--yes"]
     environment:
       DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@postgres:5432/kratos?sslmode=disable
@@ -168,6 +194,7 @@ services:
   hydra-migrate:
     image: *hydra-image
     container_name: hydra-migrate
+    profiles: ["svc-hydra"]
     command: ["migrate", "sql", "-e", "--yes"]
     environment:
       DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@postgres:5432/hydra?sslmode=disable
@@ -180,6 +207,7 @@ services:
   keto-migrate:
     image: *keto-image
     container_name: keto-migrate
+    profiles: ["svc-keto"]
     # Keto: `migrate up`, NO -e flag; DSN from the DSN env var.
     command: ["migrate", "up", "-c", "/etc/config/keto/keto.yml", "--yes"]
     environment:
@@ -203,6 +231,7 @@ services:
   kratos:
     image: *kratos-image
     container_name: ory-kratos
+    profiles: ["svc-kratos"]
     # --watch-courier: run the mail courier IN-PROCESS so recovery/verification
     # (and any other) emails queued by Kratos are actually dispatched to SMTP
     # (the Mailpit catcher below in dev; a real SMTP server in prod). Without it,
@@ -335,6 +364,7 @@ services:
       args:
         BASE_IMAGE: *hydra-image
     container_name: ory-hydra
+    profiles: ["svc-hydra"]
     # --dev: serves Hydra over plain HTTP on the internal-only network (no public
     # port is published; TLS termination is a reverse-proxy concern out of scope
     # here). Without --dev, Hydra refuses a non-HTTPS `urls.self.issuer`.
@@ -370,6 +400,7 @@ services:
       args:
         BASE_IMAGE: *keto-image
     container_name: ory-keto
+    profiles: ["svc-keto"]
     command: ["serve", "-c", "/etc/config/keto/keto.yml"]
     environment:
       DSN: postgres://keto:${KETO_DB_PASSWORD:?set KETO_DB_PASSWORD}@postgres:5432/keto?sslmode=disable
@@ -398,6 +429,7 @@ services:
   oathkeeper-jwks-init:
     image: *oathkeeper-tools-image
     container_name: oathkeeper-jwks-init
+    profiles: ["svc-oathkeeper"]
     # Runs as root ONLY to create the key file in the fresh (root-owned) volume,
     # then hands it to Oathkeeper read-only. The long-lived oathkeeper service
     # mounts the volume :ro and runs as its own non-root user. This one-shot has
@@ -429,6 +461,7 @@ services:
       args:
         BASE_IMAGE: *oathkeeper-image
     container_name: ory-oathkeeper
+    profiles: ["svc-oathkeeper"]
     # Stateless: no DB, no migrate dependency — serve only.
     command: ["serve", "--config", "/etc/config/oathkeeper/config.yaml"]
     volumes:
@@ -610,17 +643,28 @@ services:
       # Read-WRITE config mount (the ONLY rw config mount) — Phase 4 edit subsystem.
       - ./config:/etc/config:rw
     depends_on:
-      # Gate the backend (and therefore `--wait`) on all four Ory services'
-      # in-image healthchecks, so a successful `up -d --wait` genuinely means
-      # every Ory service is up before the backend (and the harness) probe them.
+      # CLI-builder (COMPOSE-PROFILES / T-CB-A04): the four Ory deps are now
+      # CROSS-PROFILE with `required: false` (compose v2.20.2+, the same form
+      # grafana/alloy use). When a service's svc-* profile IS active, `--wait`
+      # still gates the backend on that service's in-image healthcheck — so a
+      # full `up -d --wait` genuinely means every present Ory service is healthy
+      # before the backend (and the harness) probe them. When a profile is
+      # OMITTED (the service is `off`), the dep is simply skipped: the backend
+      # comes up healthy with ZERO Ory services and `--wait` does NOT hang on the
+      # absent dependency. The backend's env-driven boot reconcile then
+      # cascade-disables the off service's console feature flag (404 + nav hide).
       kratos:
         condition: service_healthy
+        required: false
       hydra:
         condition: service_healthy
+        required: false
       keto:
         condition: service_healthy
+        required: false
       oathkeeper:
         condition: service_healthy
+        required: false
       restart-broker:
         condition: service_started
     healthcheck:
@@ -829,9 +873,14 @@ services:
       start_period: 30s
     depends_on:
       # Gate readiness (and `--wait`) on a healthy Kratos so the very first proxied
-      # flow init finds a reachable Kratos public endpoint.
+      # flow init finds a reachable Kratos public endpoint. CLI-builder: now
+      # `required: false` (cross-profile) so a Kratos-`off` selection (svc-kratos
+      # profile dropped) does not break the AX startup — the AX is itself only
+      # meaningful with Kratos present, but the dep must not wedge compose when
+      # Kratos is absent.
       kratos:
         condition: service_healthy
+        required: false
     ports:
       - "${ACCOUNT_EXPERIENCE_PORT:-3001}:3000"
     volumes:
@@ -876,6 +925,7 @@ services:
   polis:
     image: boxyhq/jackson:26.2.0
     container_name: polis              # MUST match Service::Polis.container() (13-02) + broker regex
+    profiles: ["svc-polis"]
     # IN-02: ingest the console-managed NON-secret settings file. The /api/config/
     # polis writer persists allowlisted KEY=value pairs to host
     # `./config/polis/settings.env` (== the backend's `<config_dir>/polis/
