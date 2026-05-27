@@ -171,6 +171,10 @@ All Ory images are pinned to `v26.2.0-distroless`, with the Rust client crates t
 - **Verification:** each feature area ships a live acceptance harness under `scripts/verify/` that brings up the real stack and asserts behavior, including negative/security checks.
 </details>
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=zeljkovranjes/ory-self-hosted-console&type=date&legend=top-left)](https://www.star-history.com/?repos=zeljkovranjes%2Fory-self-hosted-console&type=date&legend=top-left)
+
 ## License
 
 Licensed under **Apache-2.0** (declared in the crate manifests). No gated or license-restricted features.
