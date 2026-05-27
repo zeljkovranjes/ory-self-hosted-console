@@ -229,22 +229,38 @@ services:
     networks: [internal, ax-public]
 
   # ===========================================================================
-  # Mailpit — DEV mail catcher (SMTP sink + web UI).
+  # DEV-MAIL PROFILE (mailpit + sms-sink) — opt-in, DEFAULT OFF.
+  # ===========================================================================
+  # Both catchers are gated behind `profiles: ["dev-mail"]` (the observability-
+  # /acceptance-profile precedent): a plain `docker compose up` does NOT start
+  # them; `docker compose --profile dev-mail up` does. This keeps the unencrypted,
+  # non-forwarding dev catchers out of a production stack. NO base-stack service
+  # `depends_on` mailpit or sms-sink — Kratos reaches them at SEND time, never at
+  # boot — so gating them is safe. The committed kratos.yml courier block still
+  # points at `mailpit:1025` / `sms-sink:8080` as the documented dev default;
+  # production operators leave this profile OFF and point Kratos at a real SMTP
+  # server / SMS gateway via the console Email/SMTP + SMS pages.
+  # ---------------------------------------------------------------------------
+  # Mailpit — DEV mail catcher (SMTP sink + web UI). Runs ONLY under
+  # `--profile dev-mail` (default OFF).
   #
   # Captures every email Kratos's courier sends (recovery, verification, etc.) so
-  # the self-hosted console works end-to-end out of the box WITHOUT a real mail
-  # provider. SMTP :1025 stays on the internal network (Kratos reaches it as
-  # `mailpit:1025`); the web UI :8025 is host-published so the operator can read
-  # the captured messages (recovery codes/links) at http://localhost:8025.
+  # the self-hosted console works end-to-end WITHOUT a real mail provider when the
+  # dev-mail profile is up. SMTP :1025 stays on the internal network (Kratos
+  # reaches it as `mailpit:1025`); the web UI :8025 is host-published so the
+  # operator can read the captured messages (recovery codes/links) at
+  # http://localhost:8025 — but only while the profile is up.
   #
   # NOT a production mail server: it neither encrypts nor forwards. For real
-  # delivery the operator points Kratos at an external SMTP server via the console
-  # Email/SMTP page (it rewrites courier.smtp in kratos.yml + restarts Kratos).
-  # MP_SMTP_AUTH_ACCEPT_ANY + _ALLOW_INSECURE let Kratos send over plain SMTP with
-  # no credentials (matching `smtp://mailpit:1025/?disable_starttls=true`).
+  # delivery the operator leaves this profile off and points Kratos at an external
+  # SMTP server via the console Email/SMTP page (it rewrites courier.smtp in
+  # kratos.yml + restarts Kratos). MP_SMTP_AUTH_ACCEPT_ANY + _ALLOW_INSECURE let
+  # Kratos send over plain SMTP with no credentials (matching
+  # `smtp://mailpit:1025/?disable_starttls=true`).
   mailpit:
     image: axllent/mailpit:v1.21.8
     container_name: mailpit
+    profiles: ["dev-mail"]
     restart: unless-stopped
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
@@ -264,17 +280,20 @@ services:
 
   # ===========================================================================
   # SMS sink — DEV "SMS catcher" (the SMS analog of the Mailpit mail catcher).
+  # Runs ONLY under `--profile dev-mail` (default OFF).
   #
   # Kratos has no built-in SMS provider; it sends SMS by POSTing to an HTTP
   # gateway (courier.channels[sms] in kratos.yml). With no real provider there is
   # nothing to send to, so this tiny zero-dependency Node service stands in as the
   # gateway: it captures Kratos's SMS POSTs and serves a web UI + JSON API so the
   # operator can READ the codes (the dev equivalent of opening Mailpit) at
-  # http://localhost:8026. NOT a real SMS provider — production points Kratos at a
-  # real gateway via the console SMS page. The server is mounted (no image build).
+  # http://localhost:8026 — but only while the dev-mail profile is up. NOT a real
+  # SMS provider — production leaves this profile off and points Kratos at a real
+  # gateway via the console SMS page. The server is mounted (no image build).
   sms-sink:
     image: node:24-slim
     container_name: sms-sink
+    profiles: ["dev-mail"]
     restart: unless-stopped
     command: ["node", "/app/server.js"]
     environment:
