@@ -244,6 +244,95 @@ impl From<PostgresModeField> for String {
 /// The `svc-postgres` compose profile name (prepended for in-stack postgres).
 pub const SVC_POSTGRES_PROFILE: &str = "svc-postgres";
 
+/// The opt-in `observability` compose profile name (Prometheus + Grafana + Loki +
+/// Alloy). Appended to COMPOSE_PROFILES ONLY for `in-stack` observability — NEVER
+/// for `byo` (external backends, no in-stack containers) or `off` (the default).
+pub const OBSERVABILITY_PROFILE: &str = "observability";
+
+/// The bring-your-own / external observability backing store
+/// (quick-260527-k0j). Mirrors the BYO-Postgres / BYO-Ory-service pattern but is
+/// NOT a member of [`SERVICES`] (those are the five Ory services). Three modes:
+///   * `off`      — the DEFAULT (matches today's opt-in-profile-default-OFF). No
+///                  compose profile, no `*_URL`, the `observability` FEATURE OFF.
+///                  Emits NOTHING, so a plain `docker compose config` /
+///                  `init --defaults` stays byte-identical to today.
+///   * `in-stack` — run the bundled Prometheus/Grafana/Loki/Alloy via the
+///                  `observability` compose profile (still opt-in) + the
+///                  `observability` FEATURE ON.
+///   * `byo`      — point the backend at EXTERNAL Prometheus/Loki/Grafana via
+///                  `PROMETHEUS_URL`/`LOKI_URL`/`GRAFANA_URL`; do NOT add the
+///                  compose profile; the `observability` FEATURE is ON so the
+///                  console surfaces work against the external backends.
+///
+/// SECURITY: this struct has NO secret fields. Prometheus/Loki query endpoints are
+/// URL-only (PromQL/LogQL); Grafana auth is its OWN concern (see the byo-Grafana
+/// caveat documented in the wizard/orchestrate code comments + the SUMMARY). A
+/// round-trip test asserts no secret key ever appears in the serialized form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    /// `off` (default when absent) / `in-stack` / `byo`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ObservabilityModeField>,
+    /// BYO external Prometheus base URL (`PROMETHEUS_URL`). byo-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prometheus_url: Option<String>,
+    /// BYO external Loki base URL (`LOKI_URL`). byo-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loki_url: Option<String>,
+    /// BYO external Grafana base URL (`GRAFANA_URL`). byo-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grafana_url: Option<String>,
+}
+
+/// A newtype around the observability mode so an UNKNOWN mode string yields a
+/// CLEAR parse error. Defaults to `off` when the `mode` key is absent (the locked
+/// opt-in-OFF default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ObservabilityModeField(pub ObservabilityMode);
+
+/// The three valid observability modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservabilityMode {
+    /// External Prometheus/Loki/Grafana (PROMETHEUS_URL/LOKI_URL/GRAFANA_URL).
+    Byo,
+    /// The bundled `observability` compose profile (opt-in).
+    InStack,
+    /// Absent — the DEFAULT. No profile, no URLs, the feature OFF.
+    Off,
+}
+
+impl ObservabilityMode {
+    /// The wire string for this mode.
+    fn as_wire(self) -> &'static str {
+        match self {
+            ObservabilityMode::Byo => "byo",
+            ObservabilityMode::InStack => "in-stack",
+            ObservabilityMode::Off => "off",
+        }
+    }
+}
+
+impl TryFrom<String> for ObservabilityModeField {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "in-stack" => Ok(ObservabilityModeField(ObservabilityMode::InStack)),
+            "byo" => Ok(ObservabilityModeField(ObservabilityMode::Byo)),
+            "off" => Ok(ObservabilityModeField(ObservabilityMode::Off)),
+            other => Err(format!(
+                "unknown observability mode `{other}` (expected one of: in-stack, byo, off)"
+            )),
+        }
+    }
+}
+
+impl From<ObservabilityModeField> for String {
+    fn from(f: ObservabilityModeField) -> String {
+        f.0.as_wire().to_string()
+    }
+}
+
 /// The `[features]` table — feature key → enabled bool. Stored as a sorted map so
 /// the serialized form (and any iteration) is deterministic. An absent `[features]`
 /// table yields the locked default set (see [`Features::with_defaults`]).
@@ -298,6 +387,11 @@ pub struct ConsoleConfig {
     /// container), matching the byte-identical compose default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresConfig>,
+    /// The OPTIONAL observability backing store (Prometheus/Grafana/Loki). Absent →
+    /// `off` (the locked opt-in-OFF default), so a plain compose / `--defaults`
+    /// emit stays byte-identical to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<ObservabilityConfig>,
     /// Absent in the file → `None`; `effective_features()` applies the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<Features>,
@@ -330,8 +424,26 @@ impl ConsoleConfig {
                 mode: Some(PostgresModeField(PostgresMode::InStack)),
                 ..Default::default()
             }),
+            // Observability explicitly OFF — the LOCKED default (opt-in profile,
+            // default-OFF). `--defaults` keeps it off so the emit (no profile, no
+            // URLs, observability FEATURE off) is byte-identical to today.
+            observability: Some(ObservabilityConfig {
+                mode: Some(ObservabilityModeField(ObservabilityMode::Off)),
+                ..Default::default()
+            }),
             features: Some(Features::with_defaults()),
         }
+    }
+
+    /// The effective observability mode: the declared mode, or `off` when the
+    /// `[observability]` table (or its `mode` key) is absent (the locked
+    /// opt-in-OFF default).
+    pub fn observability_mode(&self) -> ObservabilityMode {
+        self.observability
+            .as_ref()
+            .and_then(|o| o.mode)
+            .map(|m| m.0)
+            .unwrap_or(ObservabilityMode::Off)
     }
 
     /// The effective Postgres mode: the declared mode, or `in-stack` when the
@@ -354,11 +466,22 @@ impl ConsoleConfig {
 
     /// The effective feature set: the operator's `[features]` merged onto the
     /// locked defaults, or the bare defaults when `[features]` is absent.
+    ///
+    /// The `observability` FEATURE flag is DERIVED from the `[observability]` mode
+    /// (NOT independently set): `in-stack`/`byo` force it ON (so the console
+    /// surfaces work against the bundled or external backends), `off` forces it OFF
+    /// — overriding any stale `[features].observability` value so the feature can
+    /// never contradict the chosen mode. The default `off` mode keeps the feature
+    /// OFF, byte-identical to today.
     pub fn effective_features(&self) -> Features {
-        match &self.features {
+        let mut feats = match &self.features {
             Some(f) => f.merged_with_defaults(),
             None => Features::with_defaults(),
-        }
+        };
+        let observability_on =
+            !matches!(self.observability_mode(), ObservabilityMode::Off);
+        feats.0.insert("observability".to_string(), observability_on);
+        feats
     }
 
     /// The deterministic `(KEY, value)` `.env` list:
@@ -405,6 +528,25 @@ impl ConsoleConfig {
                 }
             }
         }
+        // 4. BYO-Observability overrides — emit PROMETHEUS_URL/LOKI_URL/GRAFANA_URL
+        //    ONLY when observability mode is byo AND the field is present. `in-stack`
+        //    uses the compose-default internal URLs (the `observability` profile
+        //    containers); `off` (the default) emits NOTHING, so the compose render
+        //    is byte-identical to today. NEVER a secret (the model has none; Grafana
+        //    auth is its own concern — see the byo-Grafana caveat in wizard.rs).
+        if self.observability_mode() == ObservabilityMode::Byo {
+            if let Some(obs) = &self.observability {
+                if let Some(p) = &obs.prometheus_url {
+                    pairs.push(("PROMETHEUS_URL".to_string(), p.clone()));
+                }
+                if let Some(l) = &obs.loki_url {
+                    pairs.push(("LOKI_URL".to_string(), l.clone()));
+                }
+                if let Some(g) = &obs.grafana_url {
+                    pairs.push(("GRAFANA_URL".to_string(), g.clone()));
+                }
+            }
+        }
         pairs
     }
 
@@ -424,6 +566,13 @@ impl ConsoleConfig {
                 .filter(|svc| self.services.mode_of(svc) == ServiceMode::InStack)
                 .map(|svc| format!("svc-{svc}")),
         );
+        // The opt-in `observability` profile — appended ONLY for `in-stack`
+        // observability (the bundled Prometheus/Grafana/Loki/Alloy). `byo` points
+        // at external backends (no in-stack container → no profile); `off` (the
+        // default) adds nothing, so the default COMPOSE_PROFILES is unchanged.
+        if self.observability_mode() == ObservabilityMode::InStack {
+            profiles.push(OBSERVABILITY_PROFILE.to_string());
+        }
         profiles
     }
 
@@ -748,6 +897,193 @@ sslmode = "require"
         // Round-trips (self-documenting reproducible default).
         let s = to_toml_string(&cfg).unwrap();
         assert_eq!(cfg, parse_config(&s).unwrap());
+    }
+
+    // --- BYO-Observability (quick-260527-k0j) -------------------------------
+
+    #[test]
+    fn observability_absent_defaults_off_emits_nothing_and_feature_off() {
+        // No [observability] table → off (the locked default).
+        let cfg = parse_config(
+            r#"[services.kratos]
+mode = "in-stack"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::Off);
+
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert!(!map.contains_key("PROMETHEUS_URL"), "off → no PROMETHEUS_URL");
+        assert!(!map.contains_key("LOKI_URL"), "off → no LOKI_URL");
+        assert!(!map.contains_key("GRAFANA_URL"), "off → no GRAFANA_URL");
+
+        // No `observability` compose profile (default-OFF, byte-identical to today).
+        assert!(
+            !cfg.to_compose_profiles().contains(&"observability".to_string()),
+            "off → no observability profile"
+        );
+        // The observability FEATURE is OFF.
+        assert_eq!(
+            cfg.effective_features().0.get("observability"),
+            Some(&false),
+            "off mode → feature OFF"
+        );
+    }
+
+    #[test]
+    fn observability_byo_emits_urls_feature_on_no_profile() {
+        let cfg = parse_config(
+            r#"
+[observability]
+mode = "byo"
+prometheus_url = "https://prom.ext.example"
+loki_url = "https://loki.ext.example"
+grafana_url = "https://grafana.ext.example"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::Byo);
+
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert_eq!(map.get("PROMETHEUS_URL").map(String::as_str), Some("https://prom.ext.example"));
+        assert_eq!(map.get("LOKI_URL").map(String::as_str), Some("https://loki.ext.example"));
+        assert_eq!(map.get("GRAFANA_URL").map(String::as_str), Some("https://grafana.ext.example"));
+
+        // byo → external backends, so NO in-stack observability profile.
+        assert!(
+            !cfg.to_compose_profiles().contains(&"observability".to_string()),
+            "byo drops the observability profile"
+        );
+        // The observability FEATURE is ON (console surfaces work against externals).
+        assert_eq!(cfg.effective_features().0.get("observability"), Some(&true));
+    }
+
+    #[test]
+    fn observability_in_stack_adds_profile_feature_on_no_urls() {
+        let cfg = parse_config(
+            r#"
+[observability]
+mode = "in-stack"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::InStack);
+
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        // in-stack uses the compose-default internal URLs → NO override emitted.
+        assert!(!map.contains_key("PROMETHEUS_URL"), "in-stack → no URL override");
+        assert!(!map.contains_key("LOKI_URL"), "in-stack → no URL override");
+        assert!(!map.contains_key("GRAFANA_URL"), "in-stack → no URL override");
+
+        // in-stack → the `observability` compose profile is appended.
+        assert!(
+            cfg.to_compose_profiles().contains(&"observability".to_string()),
+            "in-stack adds the observability profile"
+        );
+        // Feature ON.
+        assert_eq!(cfg.effective_features().0.get("observability"), Some(&true));
+    }
+
+    #[test]
+    fn observability_unknown_mode_is_a_clear_error() {
+        let err = parse_config(
+            r#"
+[observability]
+mode = "sometimes"
+"#,
+        )
+        .expect_err("unknown observability mode must error");
+        let msg = err.to_string();
+        assert!(msg.contains("sometimes"), "names the bad mode: {msg}");
+        assert!(msg.contains("in-stack"), "lists valid modes: {msg}");
+    }
+
+    #[test]
+    fn observability_feature_flag_is_derived_from_mode_overriding_stale_features() {
+        // A stale [features].observability = true with mode off → feature forced OFF.
+        let cfg_off = parse_config(
+            r#"
+[observability]
+mode = "off"
+[features]
+observability = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg_off.effective_features().0.get("observability"),
+            Some(&false),
+            "off mode overrides a stale features.observability=true"
+        );
+
+        // A stale [features].observability = false with mode byo → feature forced ON.
+        let cfg_byo = parse_config(
+            r#"
+[observability]
+mode = "byo"
+prometheus_url = "https://p.ext"
+[features]
+observability = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg_byo.effective_features().0.get("observability"),
+            Some(&true),
+            "byo mode overrides a stale features.observability=false"
+        );
+    }
+
+    #[test]
+    fn observability_byo_omits_absent_url_fields() {
+        // byo with only prometheus set → only PROMETHEUS_URL emitted.
+        let cfg = parse_config(
+            r#"
+[observability]
+mode = "byo"
+prometheus_url = "https://p.ext"
+"#,
+        )
+        .unwrap();
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert_eq!(map.get("PROMETHEUS_URL").map(String::as_str), Some("https://p.ext"));
+        assert!(!map.contains_key("LOKI_URL"), "absent loki → no override");
+        assert!(!map.contains_key("GRAFANA_URL"), "absent grafana → no override");
+    }
+
+    #[test]
+    fn observability_round_trips_losslessly_with_no_secret_key() {
+        let cfg = parse_config(
+            r#"
+[observability]
+mode = "byo"
+prometheus_url = "https://p.ext"
+loki_url = "https://l.ext"
+grafana_url = "https://g.ext"
+"#,
+        )
+        .unwrap();
+        let serialized = to_toml_string(&cfg).unwrap();
+        let reparsed = parse_config(&serialized).unwrap();
+        assert_eq!(cfg, reparsed, "[observability] round-trips losslessly");
+        let lower = serialized.to_ascii_lowercase();
+        assert!(!lower.contains("password"), "no password key: {serialized}");
+        assert!(!lower.contains("secret"), "no secret key: {serialized}");
+        assert!(!lower.contains("api_key"), "no api_key: {serialized}");
+    }
+
+    #[test]
+    fn all_in_stack_default_keeps_observability_off() {
+        // The LOCKED default keeps observability off — byte-identical to today.
+        let cfg = ConsoleConfig::all_in_stack_default();
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::Off);
+        assert!(
+            !cfg.to_compose_profiles().contains(&"observability".to_string()),
+            "--defaults must not add the observability profile"
+        );
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert!(!map.contains_key("PROMETHEUS_URL"), "--defaults emits no PROMETHEUS_URL");
+        assert_eq!(cfg.effective_features().0.get("observability"), Some(&false));
     }
 
     #[test]
