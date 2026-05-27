@@ -482,9 +482,16 @@ impl Prompter for ScriptedPrompter {
     fn password(&self, prompt: &str) -> Result<String, CliError> {
         // No masking on the scripted/Plain path (no TTY); the value is read but
         // NEVER echoed by this helper.
+        //
+        // WR-01: EOF / a bare Enter is NOT a valid empty secret — return a clear
+        // error so every caller fails LOUDLY instead of silently proceeding with an
+        // empty secret. (`read_secret`'s own empty-check stays as defense-in-depth.)
         eprintln!("{prompt}");
         match self.read_answer()? {
-            None => Ok(String::new()),
+            None => Err(CliError::Io(
+                "no value provided on the prompt (EOF / empty input); set it via env or a --*-file"
+                    .into(),
+            )),
             Some(ans) => Ok(ans),
         }
     }
@@ -649,6 +656,19 @@ mod tests {
             .multiselect("feats", &["a", "b", "c"], &[true, false, false])
             .unwrap();
         assert_eq!(chosen, vec![1, 2]);
+    }
+
+    #[test]
+    fn scripted_prompter_password_eof_is_error_not_empty() {
+        // WR-01: EOF (or a bare Enter) must be a clear error, never a silent Ok("").
+        let p = ScriptedPrompter::new(Cursor::new(Vec::new()));
+        let err = p
+            .password("secret (hidden)")
+            .expect_err("EOF must error, not return an empty secret");
+        assert!(matches!(err, CliError::Io(_)), "{err:?}");
+        // A non-empty answer still flows through unchanged.
+        let p2 = ScriptedPrompter::new(Cursor::new(b"hunter2\n".to_vec()));
+        assert_eq!(p2.password("secret").unwrap(), "hunter2");
     }
 
     #[test]
