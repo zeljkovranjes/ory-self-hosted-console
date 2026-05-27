@@ -893,7 +893,14 @@ pub fn build(
     // Root: inject shared state, then the public index + both subtrees.
     // Phase 12 (FLAG-01): the FeatureFlags cache rides the same affix_state chain
     // as the pool/cfg/clients; the FeatureFlagHoop reads it via depot.obtain.
+    //
+    // Phase 16 (WR-02 / OBS-03): the response-phase `latency_hoop` is the OUTERMOST
+    // hoop so it times the FULL request chain (state injection + both subtrees) and
+    // records each request's wall-clock into the aggregate, label-free
+    // `http_request_duration_seconds` histogram the Activity p95 panel reads. It is
+    // a pure observation — it never short-circuits or alters a response.
     Ok(Router::new()
+        .hoop(crate::metrics::latency_hoop)
         .hoop(affix_state::inject(pool).inject(cfg).inject(ory_clients).inject(flags))
         .get(index)
         .push(public)

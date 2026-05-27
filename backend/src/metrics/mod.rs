@@ -83,7 +83,32 @@ pub fn install_recorder() {
             "Total successful first-run console /setup completions."
         );
         metrics::counter!("console_setup_completions_total").increment(0);
+
+        // Backend HTTP request-duration histogram (OBS-03 `login-latency` panel,
+        // WR-02). AGGREGATE across ALL routes — NO per-route/per-identity label
+        // (T-16-04): a per-route label would grow with the route count and a
+        // per-identity one is forbidden PII. The exporter renders this as the
+        // `http_request_duration_seconds_bucket{le}` / `_sum` / `_count` family the
+        // Activity p95 query (`histogram_quantile(0.95, sum by (le) (rate(...)))`)
+        // reads. Described here so a scrape before any request still emits the
+        // `# HELP`/`# TYPE` lines (the buckets populate on first traffic).
+        metrics::describe_histogram!(
+            "http_request_duration_seconds",
+            metrics::Unit::Seconds,
+            "Backend HTTP request handling latency in seconds, aggregated across all routes (no per-route/per-identity label)."
+        );
     });
+}
+
+/// Record one completed HTTP request's handling latency (seconds) into the
+/// aggregate `http_request_duration_seconds` histogram (WR-02 / OBS-03).
+///
+/// NO label is attached — the distribution is a single aggregate across every
+/// route (T-16-04: never a per-route or per-identity dimension). Called by the
+/// response-phase latency hoop once per request; a no-op until
+/// [`install_recorder`] has run.
+pub fn record_request_duration(elapsed_secs: f64) {
+    metrics::histogram!("http_request_duration_seconds").record(elapsed_secs);
 }
 
 /// Increment the console login-attempt counter for an aggregate `result`.
@@ -119,4 +144,28 @@ pub async fn metrics_text(res: &mut Response) {
     // `version=0.0.4` parameter is optional; plain text/plain is accepted by every
     // Prometheus scraper.)
     res.render(Text::Plain(body));
+}
+
+/// Response-phase latency hoop (WR-02 / OBS-03). Mounted at the router ROOT so it
+/// wraps EVERY downstream handler: it starts a timer, `ctrl.call_next(...)`s the
+/// rest of the chain, then records the elapsed wall-clock into the aggregate
+/// `http_request_duration_seconds` histogram once the response is produced.
+///
+/// The histogram carries NO label (T-16-04) — a single aggregate distribution
+/// across all routes, never a per-route/per-identity dimension. It is a pure
+/// observation: it never short-circuits, mutates, or fails the request (no
+/// `skip_rest`), so it cannot affect any handler's behavior. It deliberately does
+/// NOT exclude the `/metrics` scrape path itself; the self-observation is a
+/// negligible, low-cardinality data point and keeping the hoop unconditional avoids
+/// a per-request path string comparison.
+#[handler]
+pub async fn latency_hoop(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let started = std::time::Instant::now();
+    ctrl.call_next(req, depot, res).await;
+    record_request_duration(started.elapsed().as_secs_f64());
 }
