@@ -46,6 +46,12 @@ selfservice:
       enabled: true
     code:
       enabled: true
+      # passwordless_enabled: lets an identity whose schema marks a trait as a
+      # `code` credential (the optional `phone` trait below, via: sms) sign in with
+      # a one-time SMS code — the canonical Kratos SMS path. Email keeps using
+      # password; recovery/verification keep using the same code method for their
+      # one-time email codes.
+      passwordless_enabled: true
       config:
         lifespan: 15m
   flows:
@@ -83,6 +89,21 @@ courier:
     connection_uri: smtp://mailpit:1025/?disable_starttls=true
     from_address: no-reply@ory-console.local
     from_name: Ory Self-Hosted Console
+  # SMS delivery: Kratos has no built-in SMS provider — it POSTs each SMS to an
+  # HTTP gateway. In dev that gateway is the `sms-sink` service (captures + shows
+  # the codes at http://localhost:8026); the body template maps Kratos's message
+  # to the gateway's JSON shape (config/kratos/sms.body.jsonnet). For PRODUCTION,
+  # point this at a real SMS provider (e.g. Twilio) via the console SMS page —
+  # rewrite the url/headers/body template and restart Kratos.
+  channels:
+    - id: sms
+      type: http
+      request_config:
+        url: http://sms-sink:8080/send
+        method: POST
+        body: file:///etc/config/kratos/sms.body.jsonnet
+        headers:
+          Content-Type: application/json
 
 secrets:
   # PLACEHOLDER 32-char values — Plan 04 overrides via env/.env. Do NOT use in production.

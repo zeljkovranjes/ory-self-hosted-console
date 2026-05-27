@@ -262,6 +262,43 @@ services:
     # gateway, so the UI port must ride the bridge network).
     networks: [internal, edge]
 
+  # ===========================================================================
+  # SMS sink — DEV "SMS catcher" (the SMS analog of the Mailpit mail catcher).
+  #
+  # Kratos has no built-in SMS provider; it sends SMS by POSTing to an HTTP
+  # gateway (courier.channels[sms] in kratos.yml). With no real provider there is
+  # nothing to send to, so this tiny zero-dependency Node service stands in as the
+  # gateway: it captures Kratos's SMS POSTs and serves a web UI + JSON API so the
+  # operator can READ the codes (the dev equivalent of opening Mailpit) at
+  # http://localhost:8026. NOT a real SMS provider — production points Kratos at a
+  # real gateway via the console SMS page. The server is mounted (no image build).
+  sms-sink:
+    image: node:24-slim
+    container_name: sms-sink
+    restart: unless-stopped
+    command: ["node", "/app/server.js"]
+    environment:
+      PORT: "8080"
+    volumes:
+      - ./docker/sms-sink:/app:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    ports:
+      - "${SMS_SINK_PORT:-8026}:8080"
+    # internal: Kratos (also on internal) reaches the gateway at sms-sink:8080.
+    # edge: carries the host-published web UI (internal:true has no host gateway).
+    networks: [internal, edge]
+
   # NOTE on Hydra/Keto/Oathkeeper healthchecks (Pitfall 1 — distroless has no
   # shell/curl, and only Kratos ships an in-image `remote status`): each of these
   # three services is built from a thin wrapper (docker/ory-healthcheck/Dockerfile)
