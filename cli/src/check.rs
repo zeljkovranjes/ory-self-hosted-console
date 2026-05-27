@@ -325,6 +325,10 @@ fn scan_env_key_presence(env_path: &str, required: &[String]) -> Vec<(String, Ke
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // WR-06: strip a leading `export ` token (a common, shell-sourced `.env`
+            // grammar) before splitting on `=`, so `export KEY=val` is recognized as
+            // the key `KEY` (present), not `export KEY` (a false `missing`).
+            let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
             if let Some((k, v)) = line.split_once('=') {
                 let key = k.trim().to_string();
                 if v.trim().is_empty() {
@@ -562,6 +566,38 @@ mode = "off"
             "the presence scan must never carry the secret value: {dbg}"
         );
         assert_eq!(result[0].1, KeyPresence::Present);
+    }
+
+    /// WR-06: an `export KEY=val` line (shell-sourced `.env` grammar) is recognized
+    /// as the key `KEY` being PRESENT — the `export ` prefix is stripped before the
+    /// `=` split, so a real secret is never misreported as `missing`.
+    #[test]
+    fn scan_env_recognizes_export_prefixed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "export POSTGRES_PASSWORD=super-secret\nexport HYDRA_SECRETS_SYSTEM=\n",
+        )
+        .unwrap();
+        let required = vec![
+            "POSTGRES_PASSWORD".to_string(),
+            "HYDRA_SECRETS_SYSTEM".to_string(),
+        ];
+        let presence: std::collections::HashMap<_, _> =
+            scan_env_key_presence(env_path.to_str().unwrap(), &required)
+                .into_iter()
+                .collect();
+        assert_eq!(
+            presence.get("POSTGRES_PASSWORD"),
+            Some(&KeyPresence::Present),
+            "an `export KEY=val` line must be recognized as present"
+        );
+        assert_eq!(
+            presence.get("HYDRA_SECRETS_SYSTEM"),
+            Some(&KeyPresence::Empty),
+            "an `export KEY=` line with no value is empty, not missing"
+        );
     }
 
     #[test]

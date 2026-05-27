@@ -370,6 +370,13 @@ fn read_existing_keys(env_file: &str) -> std::collections::HashSet<String> {
     let mut keys = std::collections::HashSet::new();
     if let Ok(content) = std::fs::read_to_string(env_file) {
         for line in content.lines() {
+            // WR-06: strip a leading `export ` token (a common shell-sourced `.env`
+            // grammar) before splitting on `=`, so `export KEY=val` records the key
+            // `KEY` (present) rather than `export KEY` — otherwise a present secret
+            // is treated as absent and `generate_missing_secrets` would re-generate
+            // it, rotating a live credential.
+            let line = line.trim();
+            let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
             if let Some((k, v)) = line.split_once('=') {
                 if !v.trim().is_empty() {
                     keys.insert(k.trim().to_string());
