@@ -26,9 +26,14 @@ import {
   InfoIcon,
   Loader2Icon,
 } from "lucide-react";
+import type { OnMount } from "@monaco-editor/react";
 
 import { api, ApiError } from "@/lib/api";
 import { MonacoEditor } from "@/components/monaco-editor";
+import {
+  useLiveOplValidate,
+  type OplEditorHandle,
+} from "./use-live-opl-validate";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -126,6 +131,31 @@ export default function PermissionModelPage() {
   );
   const [validating, setValidating] = React.useState(false);
 
+  // PERM-04 live validation: the (editor, monaco) handle from MonacoEditor's
+  // onMount (Plan 18-01) feeds the debounced live-validate hook, which paints
+  // inline markers and reports a NON-BLOCKING `unavailable` state on a
+  // transport/502 failure. This is ADDITIVE UX ONLY — it never touches the
+  // pre-save Validate/Save gate below (T-18-07).
+  const [editorHandle, setEditorHandle] =
+    React.useState<OplEditorHandle | null>(null);
+
+  const handleEditorMount = React.useCallback<OnMount>((editor, monaco) => {
+    setEditorHandle({
+      editor: { getModel: () => editor.getModel() },
+      monaco: {
+        editor: {
+          setModelMarkers: (model, owner, markers) =>
+            monaco.editor.setModelMarkers(
+              model as Parameters<typeof monaco.editor.setModelMarkers>[0],
+              owner,
+              markers,
+            ),
+        },
+        MarkerSeverity: { Error: monaco.MarkerSeverity.Error },
+      },
+    });
+  }, []);
+
   // Load the active model on mount.
   React.useEffect(() => {
     let cancelled = false;
@@ -152,6 +182,14 @@ export default function PermissionModelPage() {
   const validationClean =
     validation?.ok === true && validatedSource === value;
   const canSave = isDirty && validationClean;
+
+  // PERM-04: drive the live, as-you-type markers off the current editor text.
+  // Disabled while the model failed to load (no point validating a blank shell).
+  const { unavailable: liveUnavailable } = useLiveOplValidate({
+    source: value,
+    handle: editorHandle,
+    enabled: !loadError,
+  });
 
   function onEditorChange(next: string) {
     setValue(next);
@@ -242,12 +280,29 @@ export default function PermissionModelPage() {
           ) : null}
 
           <MonacoEditor
-            language="plaintext"
+            language="ory-opl"
             value={value}
             onChange={onEditorChange}
+            onMount={handleEditorMount}
             ariaLabel="Permission model (Ory Permission Language)"
             height={420}
           />
+
+          {/* PERM-04 live-validation hint. A transport/502 failure of the live
+              check degrades to this SUBTLE, NON-BLOCKING status line — NEVER a
+              destructive "invalid" verdict and NEVER a Save gate (T-18-05). The
+              inline red squiggles (when the live check DOES return errors) are
+              painted directly on the editor model by useLiveOplValidate. */}
+          {liveUnavailable ? (
+            <p
+              role="status"
+              aria-live="polite"
+              className="text-muted-foreground text-xs"
+            >
+              Live validation unavailable — the editor cannot reach the
+              validator right now. Use the Validate button before saving.
+            </p>
+          ) : null}
 
           {/* Validation banner (PERM-01). */}
           {validation && validatedSource === value ? (
