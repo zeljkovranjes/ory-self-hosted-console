@@ -32,6 +32,7 @@ pub mod emit;
 pub mod online;
 pub mod orchestrate;
 pub mod probe;
+pub mod ui;
 pub mod wizard;
 
 use clap::{Args, Parser, Subcommand};

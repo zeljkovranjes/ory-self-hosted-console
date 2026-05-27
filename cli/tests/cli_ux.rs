@@ -230,7 +230,6 @@ async fn check_exit_code_reflects_health() {
 /// inline AND the file compiles against today's surface; the test stays
 /// `#[ignore]`-gated regardless.
 #[test]
-#[ignore = "Wave 1: ui diff core (console_cli::ui::{feature_default_mask, diff_features}) not yet implemented"]
 fn multiselect_defaults_match_current() {
     #[cfg(feature = "wave1")]
     {
