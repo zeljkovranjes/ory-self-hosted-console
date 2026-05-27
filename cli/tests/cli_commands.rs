@@ -15,9 +15,16 @@
 //! uses.
 
 use clap::{CommandFactory, Parser};
+use console_cli::ui::Ui;
 use console_cli::{
     client::ApiClient, online, Cli, FeatureAction, ObservabilityAction, OrgAction, SsoAction,
 };
+
+/// A Plain-mode [`Ui`] for the route tests — drives the production rendering path
+/// with zero ANSI / no widgets (the assertions are on the HTTP request, unchanged).
+fn test_ui() -> Ui {
+    Ui::new(console_cli::ui::OutputMode::Plain)
+}
 
 // ─── Route correctness (mockito) ──────────────────────────────────────────────
 
@@ -38,7 +45,7 @@ async fn feature_enable_issues_put_with_api_key_no_csrf() {
         .await;
 
     let client = ApiClient::new(&server.url(), Some("test-raw-key")).unwrap();
-    online::feature(&client, FeatureAction::Enable { key: "saml".into() })
+    online::feature(&client, FeatureAction::Enable { key: Some("saml".into()) }, test_ui())
         .await
         .expect("feature enable should succeed");
 
@@ -61,8 +68,9 @@ async fn feature_disable_sends_enabled_false() {
     online::feature(
         &client,
         FeatureAction::Disable {
-            key: "organizations".into(),
+            key: Some("organizations".into()),
         },
+        test_ui(),
     )
     .await
     .unwrap();
@@ -82,7 +90,7 @@ async fn feature_list_issues_get() {
         .await;
 
     let client = ApiClient::new(&server.url(), Some("k")).unwrap();
-    online::feature(&client, FeatureAction::List).await.unwrap();
+    online::feature(&client, FeatureAction::List, test_ui()).await.unwrap();
     m.assert_async().await;
 }
 
@@ -99,7 +107,7 @@ async fn observability_on_targets_observability_key() {
         .await;
 
     let client = ApiClient::new(&server.url(), Some("k")).unwrap();
-    online::observability(&client, ObservabilityAction::On)
+    online::observability(&client, ObservabilityAction::On, test_ui())
         .await
         .unwrap();
     m.assert_async().await;
@@ -129,6 +137,7 @@ async fn org_add_posts_organizations_body() {
             domain: vec!["acme.test".into(), "acme.example".into()],
             sso_connection_tenant: None,
         },
+        test_ui(),
     )
     .await
     .unwrap();
@@ -169,6 +178,7 @@ async fn sso_add_saml_posts_connections_from_file() {
             redirect_url: vec!["https://console.test/cb".into()],
             name: None,
         },
+        test_ui(),
     )
     .await
     .unwrap();
@@ -219,6 +229,7 @@ async fn sso_add_oidc_puts_config_edit_array_root_pointer() {
             mapper_url: None,
             scope: vec![],
         },
+        test_ui(),
     )
     .await
     .unwrap();
@@ -238,7 +249,7 @@ async fn admin_list_issues_get_members() {
         .await;
 
     let client = ApiClient::new(&server.url(), Some("k")).unwrap();
-    online::admin_list(&client).await.unwrap();
+    online::admin_list(&client, test_ui()).await.unwrap();
     m.assert_async().await;
 }
 
@@ -340,7 +351,7 @@ async fn unauthorized_maps_to_friendly_message() {
         .await;
 
     let client = ApiClient::new(&server.url(), Some("k")).unwrap();
-    let err = online::feature(&client, FeatureAction::List)
+    let err = online::feature(&client, FeatureAction::List, test_ui())
         .await
         .expect_err("401 should be an error");
     let msg = err.to_string();

@@ -55,6 +55,7 @@
 //! dispatch fns directly where possible (NOT a subprocess); the Api-Key header
 //! value is `"Api-Key <raw>"`.
 
+use console_cli::ui::{OutputMode, Ui};
 use console_cli::{client::ApiClient, online, FeatureAction};
 
 // ─── CLI-09: `edit features` reuses the EXISTING PUT route (runs TODAY) ─────────
@@ -82,9 +83,13 @@ async fn edit_features_calls_put_route() {
         .await;
 
     let client = ApiClient::new(&server.url(), Some("k")).unwrap();
-    online::feature(&client, FeatureAction::Enable { key: "saml".into() })
-        .await
-        .expect("the PUT /api/console/features/{key} apply path must succeed");
+    online::feature(
+        &client,
+        FeatureAction::Enable { key: Some("saml".into()) },
+        Ui::new(OutputMode::Plain),
+    )
+    .await
+    .expect("the PUT /api/console/features/{key} apply path must succeed");
 
     // The matcher asserts EXACT method + path + body + Api-Key header. Wave-3
     // `edit features` MUST route through this same PUT; this proves the contract
@@ -368,7 +373,6 @@ fn run_bin_with_deadline(
 /// through). This is the falsifiable detector for the control-sequence-injection /
 /// log-forgery threat (T-20-ANSI).
 #[test]
-#[ignore = "Wave 2: --text flag + ui plain mode (zero-ANSI degradation) not yet implemented"]
 fn zero_ansi_when_piped() {
     // A local mockito server returning a small features body for `feature list`.
     let mut server = mockito::Server::new();
@@ -428,7 +432,6 @@ fn contains_ansi_introducer(bytes: &[u8]) -> bool {
 ///     a message mentioning `--defaults` or `--config` (the existing
 ///     `interactive_config` TTY guard, generalized in Wave 2) — never blocks.
 #[test]
-#[ignore = "Wave 2: bare-invocation guard (non-TTY → usage + exit 2, never hang) not yet implemented"]
 fn non_tty_never_hangs() {
     let deadline = Duration::from_secs(5);
 

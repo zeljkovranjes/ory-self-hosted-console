@@ -19,6 +19,7 @@ use console_core::{CreateOrgBody, SsoCreateBody, ToggleRequest};
 use serde_json::json;
 
 use crate::client::ApiClient;
+use crate::ui::Ui;
 use crate::{
     CliError, FeatureAction, ObservabilityAction, OrgAction, SsoAction,
 };
@@ -31,39 +32,135 @@ const OIDC_PROVIDERS_POINTER: &str = "/selfservice/methods/oidc/config/providers
 const OIDC_ENABLED_POINTER: &str = "/selfservice/methods/oidc/enabled";
 
 /// `feature` subcommand → GET (list) or PUT (enable/disable).
-pub async fn feature(client: &ApiClient, action: FeatureAction) -> Result<(), CliError> {
+///
+/// PRESENTATION ONLY differs by [`Ui`] mode — the HTTP method/path/body/headers
+/// are byte-for-byte UNCHANGED (the `cli_commands.rs` route matchers still pass).
+/// `list` renders an aligned semantic table (`feature` + `enabled` ✓/✗) via
+/// [`Ui::table`]; enable/disable render a [`Ui::status_ok`] line instead of dumping
+/// the raw response body. When `enable`/`disable` is invoked WITHOUT a key on a
+/// Rich TTY, an interactive [`crate::ui::Prompter::select`] of the valid keys is
+/// offered (CLI-07 omitted-positional picker); on a non-TTY the omission errors
+/// clearly (it never hangs).
+pub async fn feature(
+    client: &ApiClient,
+    action: FeatureAction,
+    ui: Ui,
+) -> Result<(), CliError> {
     match action {
         FeatureAction::List => {
             let body = client.get("/api/console/features").await?;
-            print!("{body}");
+            render_feature_table(&body, ui);
             Ok(())
         }
-        FeatureAction::Enable { key } => set_flag(client, &key, true).await,
-        FeatureAction::Disable { key } => set_flag(client, &key, false).await,
+        FeatureAction::Enable { key } => {
+            let key = resolve_feature_key(client, key, ui, true).await?;
+            set_flag(client, &key, true, ui).await
+        }
+        FeatureAction::Disable { key } => {
+            let key = resolve_feature_key(client, key, ui, false).await?;
+            set_flag(client, &key, false, ui).await
+        }
     }
+}
+
+/// Resolve the feature key for an enable/disable: the explicit arg if given, else
+/// an interactive `Select` of the current valid keys on a Rich TTY. On a Plain /
+/// non-TTY path a missing key is a CLEAR error (no widget, no hang).
+async fn resolve_feature_key(
+    client: &ApiClient,
+    key: Option<String>,
+    ui: Ui,
+    _enable: bool,
+) -> Result<String, CliError> {
+    if let Some(k) = key {
+        return Ok(k);
+    }
+    if ui.mode != crate::ui::OutputMode::Rich {
+        return Err(CliError::Backend(
+            "no feature key given — pass the key (e.g. `feature enable saml`). \
+             (Interactive key selection needs a TTY.)"
+                .into(),
+        ));
+    }
+    // Rich TTY: fetch the current flags and present a Select of the keys.
+    let body = client.get("/api/console/features").await?;
+    let keys = feature_keys(&body);
+    if keys.is_empty() {
+        return Err(CliError::Backend(
+            "no feature keys returned by the backend to choose from".into(),
+        ));
+    }
+    let items: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let idx = ui.prompter().select("Which feature?", &items, 0)?;
+    Ok(keys[idx].clone())
 }
 
 /// `observability on|off` → PUT /api/console/features/observability {enabled}.
 pub async fn observability(
     client: &ApiClient,
     action: ObservabilityAction,
+    ui: Ui,
 ) -> Result<(), CliError> {
     let enabled = matches!(action, ObservabilityAction::On);
-    set_flag(client, "observability", enabled).await
+    set_flag(client, "observability", enabled, ui).await
 }
 
 /// PUT /api/console/features/{key} with the shared `ToggleRequest` DTO — the
 /// CLI-02 "never a second writer" exemplar (goes through the route, not the DB).
-async fn set_flag(client: &ApiClient, key: &str, enabled: bool) -> Result<(), CliError> {
+/// The request is UNCHANGED; only the result rendering routes through [`Ui`].
+async fn set_flag(client: &ApiClient, key: &str, enabled: bool, ui: Ui) -> Result<(), CliError> {
     let path = format!("/api/console/features/{key}");
-    let body = client.put_json(&path, &ToggleRequest { enabled }).await?;
-    print!("{body}");
+    let _body = client.put_json(&path, &ToggleRequest { enabled }).await?;
+    let verb = if enabled { "enabled" } else { "disabled" };
+    ui.status_ok(&format!("{key} {verb}"));
     Ok(())
+}
+
+/// Extract the feature keys from a `GET /api/console/features` body. Tolerates
+/// either a top-level `{"features": {k: bool}}` envelope or a bare `{k: bool}` map.
+fn feature_keys(body: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let map = v.get("features").unwrap_or(&v);
+    match map.as_object() {
+        Some(obj) => obj.keys().cloned().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Render the feature flags as an aligned `feature` / `enabled` table. Untrusted
+/// backend strings (the feature keys) are placed in table CELLS only — never used
+/// as a format/control string (T-20-ANSI). In Plain mode [`Ui::table`] emits a
+/// borderless, colorless table → zero ANSI bytes. A body that does not parse falls
+/// back to printing it verbatim (still no ui-added color).
+fn render_feature_table(body: &str, ui: Ui) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        print!("{body}");
+        return;
+    };
+    let map = v.get("features").unwrap_or(&v);
+    let Some(obj) = map.as_object() else {
+        print!("{body}");
+        return;
+    };
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    let rows: Vec<Vec<String>> = keys
+        .iter()
+        .map(|k| {
+            let enabled = obj.get(*k).and_then(|x| x.as_bool()).unwrap_or(false);
+            // Semantic glyph in the cell; comfy-table colors nothing in Plain.
+            let mark = if enabled { "✓" } else { "✗" };
+            vec![(*k).clone(), mark.to_string()]
+        })
+        .collect();
+    ui.table(&["feature", "enabled"], &rows);
 }
 
 /// `sso` subcommand → POST /api/sso/connections (add-saml) or PUT config-edit
 /// (add-oidc, A1). Both reuse existing validated routes.
-pub async fn sso(client: &ApiClient, action: SsoAction) -> Result<(), CliError> {
+pub async fn sso(client: &ApiClient, action: SsoAction, ui: Ui) -> Result<(), CliError> {
     match action {
         SsoAction::AddSaml {
             tenant,
@@ -95,8 +192,8 @@ pub async fn sso(client: &ApiClient, action: SsoAction) -> Result<(), CliError> 
                 redirect_url,
                 name,
             };
-            let resp = client.post_json("/api/sso/connections", &body).await?;
-            print!("{resp}");
+            let _resp = client.post_json("/api/sso/connections", &body).await?;
+            ui.status_ok("SAML connection created");
             Ok(())
         }
         SsoAction::AddOidc {
@@ -147,15 +244,15 @@ pub async fn sso(client: &ApiClient, action: SsoAction) -> Result<(), CliError> 
                 OIDC_ENABLED_POINTER: true,
                 OIDC_PROVIDERS_POINTER: [provider_obj],
             });
-            let resp = client.put_json("/api/config/kratos/oidc", &body).await?;
-            print!("{resp}");
+            let _resp = client.put_json("/api/config/kratos/oidc", &body).await?;
+            ui.status_ok(&format!("OIDC provider `{id}` written"));
             Ok(())
         }
     }
 }
 
 /// `org add` → POST /api/organizations with the shared `CreateOrgBody`.
-pub async fn org(client: &ApiClient, action: OrgAction) -> Result<(), CliError> {
+pub async fn org(client: &ApiClient, action: OrgAction, ui: Ui) -> Result<(), CliError> {
     match action {
         OrgAction::Add {
             label,
@@ -163,20 +260,48 @@ pub async fn org(client: &ApiClient, action: OrgAction) -> Result<(), CliError> 
             sso_connection_tenant,
         } => {
             let body = CreateOrgBody {
-                label,
+                label: label.clone(),
                 domains: domain,
                 sso_connection_tenant,
             };
-            let resp = client.post_json("/api/organizations", &body).await?;
-            print!("{resp}");
+            let _resp = client.post_json("/api/organizations", &body).await?;
+            ui.status_ok(&format!("organization `{label}` created"));
             Ok(())
         }
     }
 }
 
-/// `admin list` → GET /api/console/members (secret-free MemberView).
-pub async fn admin_list(client: &ApiClient) -> Result<(), CliError> {
+/// `admin list` → GET /api/console/members (secret-free MemberView). Renders an
+/// aligned table; the request is UNCHANGED. Untrusted member strings (email, name)
+/// are placed in table CELLS only (T-20-ANSI).
+pub async fn admin_list(client: &ApiClient, ui: Ui) -> Result<(), CliError> {
     let body = client.get("/api/console/members").await?;
-    print!("{body}");
+    render_member_table(&body, ui);
     Ok(())
+}
+
+/// Render the console members as an aligned `email` / `name` / `role` table.
+/// Tolerates a top-level array or a `{"members": [...]}` envelope; an unparseable
+/// body falls back to printing it verbatim.
+fn render_member_table(body: &str, ui: Ui) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        print!("{body}");
+        return;
+    };
+    let arr = v.get("members").unwrap_or(&v);
+    let Some(items) = arr.as_array() else {
+        print!("{body}");
+        return;
+    };
+    let cell = |m: &serde_json::Value, k: &str| {
+        m.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|m| vec![cell(m, "email"), cell(m, "name"), cell(m, "role")])
+        .collect();
+    ui.table(&["email", "name", "role"], &rows);
 }

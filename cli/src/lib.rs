@@ -25,9 +25,11 @@
 //! binary uses, WITHOUT spawning a subprocess.
 
 pub mod bootstrap;
+pub mod check;
 pub mod client;
 pub mod config_model;
 pub mod db_probe;
+pub mod edit;
 pub mod emit;
 pub mod online;
 pub mod orchestrate;
@@ -35,7 +37,9 @@ pub mod probe;
 pub mod ui;
 pub mod wizard;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+
+use crate::ui::{OutputMode, Ui};
 
 /// The optional operator CLI.
 ///
@@ -62,8 +66,19 @@ pub struct Cli {
     #[arg(long, env = "CONSOLE_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,
 
+    /// Force PLAIN output (CLI-07e): no color, no box-drawing tables, no spinners,
+    /// no interactive widgets — line-based prompts only, ZERO ANSI escape bytes.
+    /// A non-secret bool (the no-argv-secret guard ignores it). Output is ALSO
+    /// forced plain automatically on a non-TTY / under `NO_COLOR` (see
+    /// [`ui::resolve_mode`]); this is the explicit operator lever for the same.
+    #[arg(long, global = true)]
+    pub text: bool,
+
+    /// The subcommand to run. OPTIONAL so a bare `ory-console` (no subcommand)
+    /// parses — on a TTY it launches the guided home menu, on a non-TTY it prints
+    /// usage and exits code 2 (it never hangs). See [`run`].
     #[command(subcommand)]
-    pub cmd: Cmd,
+    pub cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,6 +130,71 @@ pub enum Cmd {
         #[command(subcommand)]
         action: BootstrapAction,
     },
+    /// READ-ONLY inspection (CLI-08) — stack health, configured modes, config
+    /// validity, effective feature flags. `check` writes NOTHING (no `.env` /
+    /// `console.config.toml` / DB / YAML mutation — T-20-WRITE) and its exit code
+    /// reflects health (`0` = all selected healthy, non-zero otherwise; CLI-08b).
+    /// The module bodies land in a later Wave 3; the variant is scaffolded HERE so
+    /// lib.rs stays single-writer for the command tree.
+    Check {
+        #[command(subcommand)]
+        action: CheckAction,
+    },
+    /// GUIDED editing (CLI-09) — interactive `[x]`/`[ ]` feature toggles, per-service
+    /// mode re-pick, and `console.config.toml` re-edit. `edit` mutates ONLY through
+    /// the EXISTING backend feature route + the EXISTING config/`.env` writers — it
+    /// is never a second writer of the console DB or service YAML. Module bodies
+    /// land in a later Wave 3; the variant is scaffolded HERE.
+    Edit {
+        #[command(subcommand)]
+        action: EditAction,
+    },
+}
+
+/// READ-ONLY `check` subcommands (CLI-08). The LOCKED variant set; the per-command
+/// logic lands in [`check`] (Wave 3). NONE carries a value-taking secret flag.
+#[derive(Subcommand, Debug)]
+pub enum CheckAction {
+    /// Per-service health/mode table + an overall verdict; exit code reflects
+    /// health (CLI-08b).
+    Status,
+    /// Configured mode (in-stack/byo/off) + reachability per service.
+    Services,
+    /// Validate `console.config.toml` shape + `.env` presence/required-key shape.
+    /// Writes nothing; prints no secret values.
+    Config {
+        /// Path to the `console.config.toml` to validate (default handled in the
+        /// module). A PLAIN path — not a secret.
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
+    /// Current effective feature flags as a table.
+    Features,
+}
+
+/// GUIDED `edit` subcommands (CLI-09). The LOCKED variant set; the per-command
+/// logic lands in [`edit`] (Wave 3). NONE carries a value-taking secret flag.
+#[derive(Subcommand, Debug)]
+pub enum EditAction {
+    /// The `[x]`/`[ ]` checkbox feature toggle list, pre-checked to current state;
+    /// applies changed keys via the EXISTING PUT `/api/console/features/{key}` route.
+    Features,
+    /// Re-pick per-service mode + BYO URLs via select prompts; re-emit config + `.env`
+    /// through the EXISTING writers.
+    Services {
+        /// Path to the `console.config.toml` to load/edit/re-write (default handled
+        /// in the module). A PLAIN path — not a secret.
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
+    /// Load an existing `console.config.toml`, edit it interactively, re-write it
+    /// through the EXISTING writers.
+    Config {
+        /// Path to the `console.config.toml` to load/edit/re-write (default handled
+        /// in the module). A PLAIN path — not a secret.
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
 }
 
 /// Flags for the `init` builder wizard.
@@ -162,13 +242,17 @@ pub struct InitArgs {
 pub enum FeatureAction {
     /// Enable a feature flag (PUT /api/console/features/{key} {"enabled":true}).
     Enable {
-        /// The feature key (e.g. `saml`, `organizations`).
-        key: String,
+        /// The feature key (e.g. `saml`, `organizations`). OPTIONAL: when omitted
+        /// on a Rich TTY the CLI offers an interactive `Select` of the valid keys
+        /// (CLI-07 omitted-positional picker) instead of a clap usage error; on a
+        /// non-TTY it errors clearly. A PLAIN key — not a secret.
+        key: Option<String>,
     },
     /// Disable a feature flag (PUT /api/console/features/{key} {"enabled":false}).
     Disable {
-        /// The feature key.
-        key: String,
+        /// The feature key. OPTIONAL — same omitted-positional picker as `enable`.
+        /// A PLAIN key — not a secret.
+        key: Option<String>,
     },
     /// List all feature flags (GET /api/console/features).
     List,
@@ -363,36 +447,131 @@ pub enum BootstrapAction {
 /// issue exactly the documented HTTP request. BOOTSTRAP subcommands never touch
 /// the network — they write only gitignored `.env`/secret paths.
 pub async fn run(cli: Cli) -> Result<(), CliError> {
-    match cli.cmd {
+    // Resolve the output mode ONCE (the `ui` authority): `--text` / non-TTY /
+    // NO_COLOR all force Plain. EVERY downstream widget + table + status line
+    // branches on this; a `dialoguer` widget is never constructed off a Rich path.
+    let ui = Ui::from_flag(cli.text);
+    dispatch(cli, ui).await
+}
+
+/// The mode-aware dispatch core (split out of [`run`] so the resolved [`Ui`] is
+/// passed explicitly to every handler).
+async fn dispatch(cli: Cli, ui: Ui) -> Result<(), CliError> {
+    let cmd = match cli.cmd {
+        Some(c) => c,
+        // BARE invocation (no subcommand): a guided home menu on a Rich TTY, a
+        // usage dump + exit-2 sentinel on a Plain/non-TTY path (never a hang —
+        // `home_menu_or_usage` only constructs a widget when `ui.mode == Rich`).
+        None => return home_menu_or_usage(ui, &cli.api_url, cli.api_key.as_deref()).await,
+    };
+    match cmd {
         // The builder wizard owns its own config/secret/orchestration flow; it
         // reuses the global --api-url/--api-key for the post-boot ONLINE steps.
         Cmd::Init(args) => wizard::run_init(args, &cli.api_url, cli.api_key.as_deref()).await,
         Cmd::Feature { action } => {
             let client = client::ApiClient::new(&cli.api_url, cli.api_key.as_deref())?;
-            online::feature(&client, action).await
+            online::feature(&client, action, ui).await
         }
         Cmd::Observability { action } => {
             let client = client::ApiClient::new(&cli.api_url, cli.api_key.as_deref())?;
-            online::observability(&client, action).await
+            online::observability(&client, action, ui).await
         }
         Cmd::Sso { action } => {
             let client = client::ApiClient::new(&cli.api_url, cli.api_key.as_deref())?;
-            online::sso(&client, action).await
+            online::sso(&client, action, ui).await
         }
         Cmd::Org { action } => {
             let client = client::ApiClient::new(&cli.api_url, cli.api_key.as_deref())?;
-            online::org(&client, action).await
+            online::org(&client, action, ui).await
         }
         Cmd::Admin { action } => match action {
             // `admin list` is ONLINE; create/reset-password are BOOTSTRAP/offline.
             AdminAction::List => {
                 let client = client::ApiClient::new(&cli.api_url, cli.api_key.as_deref())?;
-                online::admin_list(&client).await
+                online::admin_list(&client, ui).await
             }
             other => bootstrap::admin(&cli.api_url, cli.api_key.as_deref(), other).await,
         },
         Cmd::Oauth { action } => bootstrap::oauth(action),
         Cmd::Bootstrap { action } => bootstrap::bootstrap(action),
+        Cmd::Check { action } => check::run_check(action, &cli.api_url, cli.api_key.as_deref(), ui).await,
+        Cmd::Edit { action } => edit::run_edit(action, &cli.api_url, cli.api_key.as_deref(), ui).await,
+    }
+}
+
+/// Bare-invocation entry: a guided home menu on a Rich TTY, usage + exit-2 on a
+/// Plain/non-TTY path.
+///
+/// In [`OutputMode::Plain`] we NEVER construct an interactive widget (a non-TTY
+/// caller would block forever) — we print the clap long help to stderr and return
+/// [`CliError::Usage`], which `main` maps to the LOCKED bare-non-TTY exit code `2`
+/// (the `non_tty_never_hangs` contract). In [`OutputMode::Rich`] we present a
+/// `Select` home menu routing into the command groups.
+async fn home_menu_or_usage(
+    ui: Ui,
+    api_url: &str,
+    api_key: Option<&str>,
+) -> Result<(), CliError> {
+    if ui.mode == OutputMode::Plain {
+        // Usage to STDERR; the exit code (2) is the operator signal, not stdout.
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help();
+        eprintln!("{help}");
+        return Err(CliError::Usage);
+    }
+
+    // Rich TTY: a guided home menu. Re-dispatch the chosen group through `run`-style
+    // construction so each group's own interactive form drives the rest.
+    let prompter = ui.prompter();
+    let items = [
+        "Build / Init  — first-run setup wizard",
+        "Check         — read-only stack/config/feature inspection",
+        "Edit          — guided feature/service/config editing",
+        "Day-2         — feature/observability/sso/org/admin commands",
+        "Quit",
+    ];
+    loop {
+        let choice = prompter.select("What would you like to do?", &items, 0)?;
+        match choice {
+            // Build → the interactive init wizard (default args = the prompt path).
+            0 => return wizard::run_init(InitArgs::default(), api_url, api_key).await,
+            // Check → sub-Select of the check actions.
+            1 => {
+                let actions = ["status", "services", "config", "features"];
+                let a = prompter.select("check —", &actions, 0)?;
+                let action = match a {
+                    0 => CheckAction::Status,
+                    1 => CheckAction::Services,
+                    2 => CheckAction::Config { config: None },
+                    _ => CheckAction::Features,
+                };
+                return check::run_check(action, api_url, api_key, ui).await;
+            }
+            // Edit → sub-Select of the edit actions.
+            2 => {
+                let actions = ["features", "services", "config"];
+                let a = prompter.select("edit —", &actions, 0)?;
+                let action = match a {
+                    0 => EditAction::Features,
+                    1 => EditAction::Services { config: None },
+                    _ => EditAction::Config { config: None },
+                };
+                return edit::run_edit(action, api_url, api_key, ui).await;
+            }
+            // Day-2 → point the operator at the day-2 verbs (these take args, so we
+            // surface the help rather than guess; an unguided list keeps it simple).
+            3 => {
+                ui.heading("Day-2 commands");
+                ui.hint(
+                    "feature <enable|disable|list> · observability <on|off> · \
+                     sso <add-saml|add-oidc> · org add · admin list · oauth github set · \
+                     bootstrap <token|rotate-secrets>",
+                );
+                return Ok(());
+            }
+            // Quit.
+            _ => return Ok(()),
+        }
     }
 }
 
@@ -410,6 +589,10 @@ pub enum CliError {
     Io(String),
     /// The command is not available in this build (e.g. needs `offline-admin`).
     Unsupported(String),
+    /// A bare invocation on a non-TTY: usage was printed; `main` maps this to the
+    /// LOCKED exit code `2` (the `non_tty_never_hangs` contract). Carries no
+    /// message of its own (the rendered help is the operator-facing output).
+    Usage,
 }
 
 impl std::fmt::Display for CliError {
@@ -423,6 +606,9 @@ impl std::fmt::Display for CliError {
             CliError::Backend(m) => write!(f, "{m}"),
             CliError::Io(m) => write!(f, "io error: {m}"),
             CliError::Unsupported(m) => write!(f, "{m}"),
+            // The rendered long help (printed by `home_menu_or_usage`) IS the
+            // operator output; this Display is a terse fallback only.
+            CliError::Usage => write!(f, "no subcommand given (run with --help)"),
         }
     }
 }

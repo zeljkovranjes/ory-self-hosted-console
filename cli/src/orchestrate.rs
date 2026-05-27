@@ -317,13 +317,17 @@ async fn apply_advanced_features(config: &ConsoleConfig, api_url: &str, api_key:
             return;
         }
     };
+    // The orchestration post-boot apply prints its own progress lines; render the
+    // feature handler in Plain mode (the explicit key is always supplied here, so
+    // no interactive picker is ever reached).
+    let ui = crate::ui::Ui::new(crate::ui::OutputMode::Plain);
     for (key, on) in advanced {
         let action = if on {
-            crate::FeatureAction::Enable { key: key.clone() }
+            crate::FeatureAction::Enable { key: Some(key.clone()) }
         } else {
-            crate::FeatureAction::Disable { key: key.clone() }
+            crate::FeatureAction::Disable { key: Some(key.clone()) }
         };
-        match crate::online::feature(&client, action).await {
+        match crate::online::feature(&client, action, ui).await {
             Ok(()) => eprintln!("  applied feature {key} = {on}"),
             Err(e) => eprintln!("  (could not apply feature {key}: {e} — apply it day-2)"),
         }

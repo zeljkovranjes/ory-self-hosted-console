@@ -7,14 +7,22 @@
 //! dispatch without spawning a process.
 
 use clap::Parser;
-use console_cli::{run, Cli};
+use console_cli::{run, Cli, CliError};
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
-        // The error Display is operator-safe and NEVER contains a secret value.
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        match e {
+            // A bare invocation on a non-TTY: `home_menu_or_usage` already printed
+            // the long help to stderr; the LOCKED exit code is 2 (never hang,
+            // never 0). `non_tty_never_hangs` pins this.
+            CliError::Usage => std::process::exit(2),
+            // The error Display is operator-safe and NEVER contains a secret value.
+            other => {
+                eprintln!("error: {other}");
+                std::process::exit(1);
+            }
+        }
     }
 }
