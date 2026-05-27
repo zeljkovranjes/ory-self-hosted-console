@@ -21,16 +21,21 @@
 //! as `POLIS_API_KEY` are routed through [`bootstrap::read_secret`]
 //! (env / `--*-file` / prompt), never argv.
 //!
-//! The prompts use plain stdin lines (the zero-new-dep posture from
-//! `bootstrap::read_secret`) — NO interactive-prompt crate is added (T-CB-SC).
+//! Phase 20 (CLI-07): the prompts now route through the `ui::Prompter`
+//! abstraction — arrow-key `Select` for every mode (no typed-literal answer) and a
+//! single `[x]`/`[ ]` `MultiSelect` for the advanced features, pre-checked to the
+//! current state. `build_interactive` stays the pure decision FLOW (it takes a
+//! `&dyn ui::Prompter`), so the scripted-flow tests drive it via a
+//! `ui::ScriptedPrompter` over a `Cursor` answer stream with NO TTY.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 
 use crate::config_model::{
     self, ConsoleConfig, ObservabilityConfig, ObservabilityMode, ObservabilityModeField,
     PostgresConfig, PostgresMode, PostgresModeField, ServiceConfig, ServiceMode, ServiceModeField,
     SERVICES,
 };
+use crate::ui::{self, Prompter};
 use crate::{bootstrap, emit, orchestrate, InitArgs, CliError};
 
 /// The advanced (opt-in, OFF-by-default) FEATURE-flag toggles the interactive path
@@ -99,46 +104,61 @@ fn interactive_config() -> Result<ConsoleConfig, CliError> {
                 .into(),
         ));
     }
-    // Delegate to the reader-generic core so the prompt FLOW is unit-testable
-    // without a TTY (the only TTY-specific part is the guard above).
-    let stdin = std::io::stdin();
-    build_interactive(&mut stdin.lock())
+    // We are on a TTY → build the Rich `DialoguerPrompter` (arrow-key widgets) and
+    // drive the reader-generic flow. The flow itself is widget-agnostic so the
+    // scripted tests drive it with a `ScriptedPrompter` instead (no TTY).
+    let prompter = ui::DialoguerPrompter;
+    build_interactive(&prompter)
 }
 
-/// The reader-generic interactive build: prompt per service (+ BYO URLs) and per
-/// advanced feature off a `BufRead`. Pure of any TTY assumption so a test can feed
-/// a scripted answer stream (proving the same flow the live binary runs).
-fn build_interactive<R: std::io::BufRead>(reader: &mut R) -> Result<ConsoleConfig, CliError> {
-    eprintln!("Interactive setup — press Enter to accept the [default] for each prompt.");
+/// The prompter-generic interactive build: prompt per service (+ BYO URLs) via the
+/// `ui::Prompter` abstraction. Pure of any TTY assumption — a test feeds a
+/// `ScriptedPrompter`, the live binary feeds a `DialoguerPrompter`, and BOTH run
+/// the exact same decision FLOW.
+fn build_interactive(prompter: &dyn Prompter) -> Result<ConsoleConfig, CliError> {
+    eprintln!("Interactive setup — arrow keys move, Enter accepts the highlighted default.");
     let mut services = config_model::Services::default();
 
     for svc in SERVICES {
-        let mode = prompt_service_mode(reader, svc)?;
+        let mode = prompt_service_mode(prompter, svc)?;
         let mut cfg = ServiceConfig {
             mode: Some(ServiceModeField(mode)),
             ..Default::default()
         };
         if mode == ServiceMode::Byo {
-            prompt_byo_urls(reader, svc, &mut cfg)?;
+            prompt_byo_urls(prompter, svc, &mut cfg)?;
         }
         services.set(svc, cfg);
     }
 
     // Postgres — the always-required backing store (in-stack bundled DB, or BYO
     // external). Prompted AFTER the services so its place in the flow is stable.
-    let postgres = prompt_postgres(reader)?;
+    let postgres = prompt_postgres(prompter)?;
 
     // Observability — the OPTIONAL metrics+logs backing store (off/in-stack/byo).
     // Prompted with the other backing stores (after postgres, before the feature
     // toggles) since byo collects URLs much like a byo service.
-    let observability = prompt_observability(reader)?;
+    let observability = prompt_observability(prompter)?;
 
-    // Advanced features — default OFF (locked CONTEXT default). The ON-by-default
-    // set is not prompted; it follows from the service selection + the defaults.
+    // Advanced features — a SINGLE `[x]`/`[ ]` MultiSelect pre-checked to the
+    // current default state (Req 2 / CLI-07b). The list is the locked advanced
+    // feature set; a bare Enter keeps exactly the pre-checked rows (a no-op). The
+    // resolved enabled set equals exactly the rows left `[x]`.
     let mut features = config_model::Features::with_defaults();
-    for key in ADVANCED_FEATURES {
-        let on = prompt_yes_no(reader, &format!("Enable advanced feature `{key}`?"), false)?;
-        features.0.insert(key.to_string(), on);
+    let ordered_keys: Vec<String> = ADVANCED_FEATURES.iter().map(|s| s.to_string()).collect();
+    // Pre-check mask = current default state of each advanced key (all OFF by the
+    // locked default; `feature_default_mask` reads whatever is currently set).
+    let defaults = ui::feature_default_mask(&features, &ordered_keys);
+    let labels: Vec<&str> = ADVANCED_FEATURES.to_vec();
+    let chosen = prompter.multiselect(
+        "Advanced features — Space toggles [x], Enter confirms",
+        &labels,
+        &defaults,
+    )?;
+    // The enabled set is EXACTLY the rows left checked; everything else is OFF.
+    let checked: std::collections::HashSet<usize> = chosen.into_iter().collect();
+    for (i, key) in ADVANCED_FEATURES.iter().enumerate() {
+        features.0.insert((*key).to_string(), checked.contains(&i));
     }
 
     Ok(ConsoleConfig {
@@ -153,14 +173,11 @@ fn build_interactive<R: std::io::BufRead>(reader: &mut R) -> Result<ConsoleConfi
 /// default) or `byo` (external — prompt host/port/sslmode). The DB password is a
 /// SECRET (POSTGRES_PASSWORD + the per-service `*_DB_PASSWORD`) read via
 /// env/`--*-file`/prompt — NEVER prompted as a config value here / never argv.
-fn prompt_postgres<R: std::io::BufRead>(reader: &mut R) -> Result<PostgresConfig, CliError> {
-    let mode = loop {
-        let ans = prompt_line(reader, "Postgres — in-stack (bundled) / byo (external)", "in-stack")?;
-        match ans.as_str() {
-            "in-stack" => break PostgresMode::InStack,
-            "byo" => break PostgresMode::Byo,
-            other => eprintln!("  `{other}` is not one of in-stack/byo — try again."),
-        }
+fn prompt_postgres(prompter: &dyn Prompter) -> Result<PostgresConfig, CliError> {
+    // Arrow-key Select (index → mode), default in-stack (index 0). No typed literal.
+    let mode = match prompter.select("Postgres backing store", &["in-stack", "byo"], 0)? {
+        0 => PostgresMode::InStack,
+        _ => PostgresMode::Byo,
     };
 
     let mut cfg = PostgresConfig {
@@ -169,10 +186,10 @@ fn prompt_postgres<R: std::io::BufRead>(reader: &mut R) -> Result<PostgresConfig
     };
 
     if mode == PostgresMode::Byo {
-        cfg.host = opt(prompt_line(reader, "  postgres host", "")?);
-        cfg.port = opt(prompt_line(reader, "  postgres port", "5432")?);
+        cfg.host = opt(prompter.input("  postgres host", "")?);
+        cfg.port = opt(prompter.input("  postgres port", "5432")?);
         // External Postgres usually mandates TLS → default sslmode=require.
-        cfg.sslmode = opt(prompt_line(reader, "  postgres sslmode", "require")?);
+        cfg.sslmode = opt(prompter.input("  postgres sslmode", "require")?);
         // The DB password(s) are SECRETS — never collected here / never argv.
         eprintln!(
             "  (POSTGRES_PASSWORD + the per-service *_DB_PASSWORD values are SECRETS — provide \
@@ -199,21 +216,16 @@ fn prompt_postgres<R: std::io::BufRead>(reader: &mut R) -> Result<PostgresConfig
 /// is the minimal correct behavior: nothing in the console silently bypasses an
 /// external Grafana's auth — the operator configures auth on their own Grafana.
 /// Prometheus/Loki (PromQL/LogQL queries) need only the URL — no auth caveat.
-fn prompt_observability<R: std::io::BufRead>(
-    reader: &mut R,
-) -> Result<ObservabilityConfig, CliError> {
-    let mode = loop {
-        let ans = prompt_line(
-            reader,
-            "Observability (Prometheus/Grafana/Loki) — off / in-stack / byo",
-            "off",
-        )?;
-        match ans.as_str() {
-            "off" => break ObservabilityMode::Off,
-            "in-stack" => break ObservabilityMode::InStack,
-            "byo" => break ObservabilityMode::Byo,
-            other => eprintln!("  `{other}` is not one of off/in-stack/byo — try again."),
-        }
+fn prompt_observability(prompter: &dyn Prompter) -> Result<ObservabilityConfig, CliError> {
+    // Arrow-key Select (index → mode), default off (index 0). No typed literal.
+    let mode = match prompter.select(
+        "Observability (Prometheus/Grafana/Loki)",
+        &["off", "in-stack", "byo"],
+        0,
+    )? {
+        0 => ObservabilityMode::Off,
+        1 => ObservabilityMode::InStack,
+        _ => ObservabilityMode::Byo,
     };
 
     let mut cfg = ObservabilityConfig {
@@ -222,9 +234,9 @@ fn prompt_observability<R: std::io::BufRead>(
     };
 
     if mode == ObservabilityMode::Byo {
-        cfg.prometheus_url = opt(prompt_line(reader, "  Prometheus base URL", "")?);
-        cfg.loki_url = opt(prompt_line(reader, "  Loki base URL", "")?);
-        cfg.grafana_url = opt(prompt_line(reader, "  Grafana base URL", "")?);
+        cfg.prometheus_url = opt(prompter.input("  Prometheus base URL", "")?);
+        cfg.loki_url = opt(prompter.input("  Loki base URL", "")?);
+        cfg.grafana_url = opt(prompter.input("  Grafana base URL", "")?);
         // The byo-Grafana auth caveat (surfaced so the operator is not surprised the
         // console does not auto-authenticate them into an external Grafana).
         eprintln!(
@@ -237,47 +249,42 @@ fn prompt_observability<R: std::io::BufRead>(
     Ok(cfg)
 }
 
-/// Prompt for one service's mode (`in-stack | byo | off`), defaulting to in-stack.
-fn prompt_service_mode<R: std::io::BufRead>(
-    reader: &mut R,
-    service: &str,
-) -> Result<ServiceMode, CliError> {
-    loop {
-        let ans = prompt_line(
-            reader,
-            &format!("Service `{service}` — in-stack / byo / off"),
-            "in-stack",
-        )?;
-        match ans.as_str() {
-            "in-stack" => return Ok(ServiceMode::InStack),
-            "byo" => return Ok(ServiceMode::Byo),
-            "off" => return Ok(ServiceMode::Off),
-            other => eprintln!("  `{other}` is not one of in-stack/byo/off — try again."),
-        }
-    }
+/// Prompt for one service's mode via an arrow-key Select (index → mode),
+/// defaulting to in-stack (index 0). No typed-literal answer is possible.
+fn prompt_service_mode(prompter: &dyn Prompter, service: &str) -> Result<ServiceMode, CliError> {
+    let idx = prompter.select(
+        &format!("Service `{service}` mode"),
+        &["in-stack", "byo", "off"],
+        0,
+    )?;
+    Ok(match idx {
+        0 => ServiceMode::InStack,
+        1 => ServiceMode::Byo,
+        _ => ServiceMode::Off,
+    })
 }
 
 /// Prompt for the BYO external URL slot(s) for a service. Empty answers leave the
 /// slot unset (the probe then falls back to the in-stack default for that slot).
-fn prompt_byo_urls<R: std::io::BufRead>(
-    reader: &mut R,
+fn prompt_byo_urls(
+    prompter: &dyn Prompter,
     service: &str,
     cfg: &mut ServiceConfig,
 ) -> Result<(), CliError> {
     match service {
-        "kratos" => cfg.admin_url = opt(prompt_line(reader, "  kratos admin URL", "")?),
+        "kratos" => cfg.admin_url = opt(prompter.input("  kratos admin URL", "")?),
         "hydra" => {
-            cfg.admin_url = opt(prompt_line(reader, "  hydra admin URL", "")?);
-            cfg.public_url = opt(prompt_line(reader, "  hydra public URL", "")?);
+            cfg.admin_url = opt(prompter.input("  hydra admin URL", "")?);
+            cfg.public_url = opt(prompter.input("  hydra public URL", "")?);
         }
         "keto" => {
-            cfg.read_url = opt(prompt_line(reader, "  keto read URL", "")?);
-            cfg.write_url = opt(prompt_line(reader, "  keto write URL", "")?);
+            cfg.read_url = opt(prompter.input("  keto read URL", "")?);
+            cfg.write_url = opt(prompter.input("  keto write URL", "")?);
         }
-        "oathkeeper" => cfg.admin_url = opt(prompt_line(reader, "  oathkeeper API URL", "")?),
+        "oathkeeper" => cfg.admin_url = opt(prompter.input("  oathkeeper API URL", "")?),
         "polis" => {
-            cfg.admin_url = opt(prompt_line(reader, "  polis admin URL", "")?);
-            cfg.external_url = opt(prompt_line(reader, "  polis external (OIDC issuer) URL", "")?);
+            cfg.admin_url = opt(prompter.input("  polis admin URL", "")?);
+            cfg.external_url = opt(prompter.input("  polis external (OIDC issuer) URL", "")?);
             // The Polis API key is a SECRET — read via read_secret (env/file/prompt),
             // NEVER from a config field or argv. We surface the requirement here but
             // store nothing in the config; orchestration upserts it into .env.
@@ -298,54 +305,6 @@ fn opt(s: String) -> Option<String> {
         None
     } else {
         Some(t)
-    }
-}
-
-/// A yes/no prompt with a default. Accepts y/yes/n/no (case-insensitive).
-fn prompt_yes_no<R: std::io::BufRead>(
-    reader: &mut R,
-    question: &str,
-    default: bool,
-) -> Result<bool, CliError> {
-    let def_str = if default { "y" } else { "n" };
-    loop {
-        let ans = prompt_line(reader, question, def_str)?;
-        match ans.to_ascii_lowercase().as_str() {
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            other => eprintln!("  please answer y or n (got `{other}`)"),
-        }
-    }
-}
-
-/// Read a single trimmed line from `reader`, showing `[default]`. A bare Enter
-/// returns the default. NEVER used for secrets (those go through read_secret).
-fn prompt_line<R: std::io::BufRead>(
-    reader: &mut R,
-    label: &str,
-    default: &str,
-) -> Result<String, CliError> {
-    if default.is_empty() {
-        eprint!("{label}: ");
-    } else {
-        eprint!("{label} [{default}]: ");
-    }
-    std::io::stderr().flush().ok();
-
-    let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .map_err(|e| CliError::Io(format!("reading stdin: {e}")))?;
-    if n == 0 {
-        // EOF before an answer → fall back to the default (a scripted/piped stream
-        // that ran out, or a closed stdin: accept the default rather than loop).
-        return Ok(default.to_string());
-    }
-    let trimmed = line.trim().to_string();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed)
     }
 }
 
@@ -481,9 +440,20 @@ mod tests {
         assert_eq!(first, second, "idempotent: present secrets never regenerated");
     }
 
+    /// Build a `ScriptedPrompter` over a scripted line-answer stream (the test seam
+    /// that drives the SAME `build_interactive` flow the live `DialoguerPrompter`
+    /// does — proving the prompt FLOW without a TTY).
+    fn scripted(script: &str) -> ui::ScriptedPrompter {
+        ui::ScriptedPrompter::new(std::io::Cursor::new(script.as_bytes().to_vec()))
+    }
+
     #[test]
     fn build_interactive_assembles_config_from_scripted_answers() {
-        // Scripted answer stream (one line each, in prompt order):
+        // Scripted answer stream (one line per PROMPT, in prompt order). Select
+        // prompts accept the literal item label or the 1-based index; a bare line
+        // (\n) accepts the highlighted default. The advanced-feature step is now a
+        // SINGLE MultiSelect — `"1"` checks index 0-based 0? NO: the ScriptedPrompter
+        // multiselect takes 1-based indices, so `"1"` checks the FIRST row (saml).
         //   kratos = <Enter> → in-stack
         //   hydra  = byo, admin URL, public URL
         //   keto   = off
@@ -491,7 +461,7 @@ mod tests {
         //   polis  = <Enter> → in-stack
         //   postgres = <Enter> → in-stack
         //   observability = <Enter> → off (the locked default)
-        //   advanced: saml=y, organizations=<Enter>(n), event_streams=<Enter>(n)
+        //   advanced MultiSelect: "1" → check saml only (org/event_streams left OFF)
         let script = "\n\
             byo\n\
             http://hydra.ext/admin\n\
@@ -501,11 +471,9 @@ mod tests {
             \n\
             \n\
             \n\
-            y\n\
-            \n\
-            \n";
-        let mut reader = std::io::Cursor::new(script.as_bytes());
-        let cfg = build_interactive(&mut reader).expect("interactive build");
+            1\n";
+        let prompter = scripted(script);
+        let cfg = build_interactive(&prompter).expect("interactive build");
 
         assert_eq!(cfg.mode_of("kratos"), ServiceMode::InStack, "Enter → in-stack");
         assert_eq!(cfg.mode_of("hydra"), ServiceMode::Byo);
@@ -554,8 +522,8 @@ mod tests {
     #[test]
     fn build_interactive_byo_postgres_produces_byo_config() {
         // All five services in-stack (Enter x5), then postgres = byo with host /
-        // port / sslmode, then observability=off (Enter) + the 3 advanced features
-        // default OFF (Enter x3) → 4 trailing Enters.
+        // port / sslmode, then observability=off (Enter) + the advanced MultiSelect
+        // left at its defaults (bare Enter → all advanced OFF).
         let script = "\n\
             \n\
             \n\
@@ -566,11 +534,9 @@ mod tests {
             6543\n\
             require\n\
             \n\
-            \n\
-            \n\
             \n";
-        let mut reader = std::io::Cursor::new(script.as_bytes());
-        let cfg = build_interactive(&mut reader).expect("interactive build");
+        let prompter = scripted(script);
+        let cfg = build_interactive(&prompter).expect("interactive build");
 
         assert_eq!(cfg.postgres_mode(), PostgresMode::Byo, "byo postgres selected");
         let pg = cfg.postgres.as_ref().expect("postgres config set");
@@ -587,7 +553,8 @@ mod tests {
     #[test]
     fn build_interactive_byo_observability_collects_urls_and_feature_on() {
         // 5 services in-stack (Enter x5), postgres in-stack (Enter), observability =
-        // byo with the 3 URLs, then 3 advanced features default OFF (Enter x3).
+        // byo with the 3 URLs, then the advanced MultiSelect at its defaults (bare
+        // Enter → all advanced OFF).
         let script = "\n\
             \n\
             \n\
@@ -598,11 +565,9 @@ mod tests {
             https://prom.ext\n\
             https://loki.ext\n\
             https://grafana.ext\n\
-            \n\
-            \n\
             \n";
-        let mut reader = std::io::Cursor::new(script.as_bytes());
-        let cfg = build_interactive(&mut reader).expect("interactive build");
+        let prompter = scripted(script);
+        let cfg = build_interactive(&prompter).expect("interactive build");
 
         assert_eq!(cfg.observability_mode(), ObservabilityMode::Byo, "byo observability");
         let obs = cfg.observability.as_ref().expect("observability config set");
@@ -624,7 +589,7 @@ mod tests {
     #[test]
     fn build_interactive_in_stack_observability_adds_profile() {
         // 5 services + postgres all in-stack (Enter x6), observability = in-stack,
-        // 3 advanced default OFF (Enter x3).
+        // advanced MultiSelect at its defaults (bare Enter → all advanced OFF).
         let script = "\n\
             \n\
             \n\
@@ -632,11 +597,9 @@ mod tests {
             \n\
             \n\
             in-stack\n\
-            \n\
-            \n\
             \n";
-        let mut reader = std::io::Cursor::new(script.as_bytes());
-        let cfg = build_interactive(&mut reader).expect("interactive build");
+        let prompter = scripted(script);
+        let cfg = build_interactive(&prompter).expect("interactive build");
 
         assert_eq!(cfg.observability_mode(), ObservabilityMode::InStack);
         // in-stack → the observability profile is appended (after svc-postgres + svc-*).
