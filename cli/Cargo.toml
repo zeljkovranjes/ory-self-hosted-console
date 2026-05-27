@@ -36,6 +36,16 @@ console-core = { path = "../console-core" }
 # recorded in the Wave-2 SUMMARY (canonical owner, ~646M downloads).
 toml = "0.9"
 
+# CLI-builder Wave 3 (WIZARD): the CSPRNG used to GENERATE missing required
+# secrets (DB role passwords, HYDRA_SECRETS_SYSTEM, Polis keys) into the
+# gitignored `.env`. `getrandom` is the canonical, audited OS-RNG façade
+# (github.com/rust-random/getrandom — the foundation under `rand`); 0.3.4 is
+# ALREADY in the default CLI lockfile (transitively via reqwest's rustls
+# build-deps), so adding it as a direct dep introduces NO new crate and NO heavy
+# graph — `cargo tree` still shows no sqlx/argon2 (no-second-writer intact). We
+# use `getrandom::fill(&mut [u8])` directly (no `rand` distribution layer).
+getrandom = "0.3"
+
 # The Argon2id hasher + sqlx are pulled in ONLY when the operator opts into the
 # offline DB-direct admin path. Reuses the SAME pins/regime as the backend so the
 # password-hash format is byte-compatible with the console.

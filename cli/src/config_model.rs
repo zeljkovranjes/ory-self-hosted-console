@@ -139,6 +139,20 @@ impl Services {
             .map(|m| m.0)
             .unwrap_or(ServiceMode::InStack)
     }
+
+    /// Set one service's config by canonical name (used by the interactive wizard
+    /// to assemble a `ConsoleConfig` from the operator's per-service answers). An
+    /// unknown name is a no-op (the SERVICES list is the only caller).
+    pub fn set(&mut self, service: &str, cfg: ServiceConfig) {
+        match service {
+            "kratos" => self.kratos = Some(cfg),
+            "hydra" => self.hydra = Some(cfg),
+            "keto" => self.keto = Some(cfg),
+            "oathkeeper" => self.oathkeeper = Some(cfg),
+            "polis" => self.polis = Some(cfg),
+            _ => {}
+        }
+    }
 }
 
 /// The `[features]` table — feature key → enabled bool. Stored as a sorted map so
@@ -197,6 +211,38 @@ pub struct ConsoleConfig {
 }
 
 impl ConsoleConfig {
+    /// The LOCKED CONTEXT default (the `--defaults` fast path): every one of the
+    /// five Ory services `in-stack`, and the locked default feature set (10 ON /
+    /// 4 advanced OFF). Each service is written EXPLICITLY (`mode = "in-stack"`)
+    /// so the emitted `console.config.toml` is self-documenting + reproducible
+    /// (re-applying it is byte-identical), rather than relying on the absent →
+    /// in-stack fallback.
+    pub fn all_in_stack_default() -> Self {
+        let in_stack = || {
+            Some(ServiceConfig {
+                mode: Some(ServiceModeField(ServiceMode::InStack)),
+                ..Default::default()
+            })
+        };
+        ConsoleConfig {
+            services: Services {
+                kratos: in_stack(),
+                hydra: in_stack(),
+                keto: in_stack(),
+                oathkeeper: in_stack(),
+                polis: in_stack(),
+            },
+            features: Some(Features::with_defaults()),
+        }
+    }
+
+    /// The effective mode for one service (public accessor over the internal
+    /// `Services::mode_of`) — used by the wizard to interactively pre-fill the
+    /// current choice and by orchestration to decide in-stack vs byo handling.
+    pub fn mode_of(&self, service: &str) -> ServiceMode {
+        self.services.mode_of(service)
+    }
+
     /// The effective feature set: the operator's `[features]` merged onto the
     /// locked defaults, or the bare defaults when `[features]` is absent.
     pub fn effective_features(&self) -> Features {

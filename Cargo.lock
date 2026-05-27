@@ -2582,6 +2582,7 @@ dependencies = [
  "argon2",
  "clap",
  "console-core",
+ "getrandom 0.3.4",
  "mockito",
  "rand_core 0.6.4",
  "reqwest 0.13.4",
