@@ -83,6 +83,30 @@ fn entry(name: &'static str, version: Option<String>, health_ok: bool) -> Servic
     }
 }
 
+/// Build an entry for a service whose reachability is keyed off the LIVENESS probe
+/// (`/health/alive`) rather than the version probe.
+///
+/// Oathkeeper's API (`:4456`) returns **404** for `/version` in v26.2.0 (it does
+/// not expose a version endpoint there), so `get_version` always errors → `None`.
+/// Routing that through [`entry`] (which derives `reachable` from `version.is_some()`)
+/// would FALSE-flag a perfectly healthy Oathkeeper as `Unreachable`. Here `alive_ok`
+/// is the source of truth: alive → `Healthy` (reachable); not alive → `Unreachable`.
+/// The version is passed through verbatim (typically `None` for Oathkeeper, which is
+/// fine — the UI just shows a blank version).
+fn entry_liveness(name: &'static str, version: Option<String>, alive_ok: bool) -> ServiceOverview {
+    let (health, reachable) = if alive_ok {
+        ("Healthy", true)
+    } else {
+        ("Unreachable", false)
+    };
+    ServiceOverview {
+        name,
+        version,
+        health,
+        reachable,
+    }
+}
+
 async fn kratos_overview(clients: &OryClients) -> ServiceOverview {
     let version = kratos_meta::get_version(&clients.kratos)
         .await
@@ -140,7 +164,11 @@ async fn oathkeeper_overview(clients: &OryClients) -> ServiceOverview {
         .await
         .map(|r| r.status == "ok")
         .unwrap_or(false);
-    entry("oathkeeper", version, health_ok)
+    // Oathkeeper's API 404s on `/version` (no version endpoint on :4456), so
+    // `version` is always `None` here. Key reachability off the LIVENESS probe via
+    // `entry_liveness` — using the version-keyed `entry` would FALSE-flag a healthy
+    // Oathkeeper as `Unreachable` (the version-probe analogue of the ready-probe nuance above).
+    entry_liveness("oathkeeper", version, health_ok)
 }
 
 #[cfg(test)]
@@ -167,5 +195,23 @@ mod tests {
         let e = entry("keto", Some("v26.2.0".into()), false);
         assert!(e.reachable);
         assert_eq!(e.health, "Unhealthy");
+    }
+
+    #[test]
+    fn oathkeeper_alive_with_absent_version_is_healthy_not_unreachable() {
+        // Oathkeeper's API 404s on /version → version is None, but /health/alive
+        // is 200. entry_liveness must report Healthy+reachable (NOT Unreachable),
+        // even with no version — the regression this fixes.
+        let e = entry_liveness("oathkeeper", None, true);
+        assert!(e.reachable, "alive Oathkeeper must be reachable despite a 404 /version");
+        assert_eq!(e.health, "Healthy");
+        assert!(e.version.is_none(), "version stays blank (Oathkeeper has no /version)");
+    }
+
+    #[test]
+    fn oathkeeper_not_alive_is_unreachable() {
+        let e = entry_liveness("oathkeeper", None, false);
+        assert!(!e.reachable);
+        assert_eq!(e.health, "Unreachable");
     }
 }
