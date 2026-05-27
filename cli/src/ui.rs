@@ -264,6 +264,13 @@ pub trait Prompter {
 
     /// Multi-choice (`[x]`/`[ ]`) selection. `defaults` is the pre-check mask
     /// (indexed parallel to `items`). Returns the indices left checked.
+    ///
+    /// TOGGLE semantics (WR-04): the prompt starts from `defaults` and an
+    /// interaction FLIPS individual rows — both prompters share this model. Rich
+    /// (`dialoguer::MultiSelect`) flips a row on Space; the scripted/Plain path
+    /// flips each comma-separated index named in the answer. A bare Enter keeps the
+    /// defaults exactly (the no-op path). A scripted answer is therefore NOT a full
+    /// replacement set — it toggles, so it can both add to and reduce the defaults.
     fn multiselect(
         &self,
         prompt: &str,
@@ -425,16 +432,19 @@ impl Prompter for ScriptedPrompter {
             let mark = if checked { "[x]" } else { "[ ]" };
             eprintln!("  {} {mark} {item}", i + 1);
         }
-        eprintln!("  (comma-separated indices to CHECK, or Enter to keep the defaults)");
+        // WR-04: the scripted answer TOGGLES the named indices against the defaults
+        // — sharing the Rich `dialoguer::MultiSelect` mental model (Space flips an
+        // individual row from its default). A bare Enter keeps the defaults (the
+        // no-op path); naming index N flips row N (off→on or on→off).
+        eprintln!("  (comma-separated indices to TOGGLE against the defaults, or Enter to keep them)");
+        // Start from the pre-checked defaults; each named index flips that row.
+        let mut checked: Vec<bool> = (0..items.len())
+            .map(|i| defaults.get(i).copied().unwrap_or(false))
+            .collect();
         match self.read_answer()? {
             // Bare Enter → keep exactly the pre-checked defaults (the no-op path).
-            None => Ok(defaults
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &on)| if on { Some(i) } else { None })
-                .collect()),
+            None => {}
             Some(ans) => {
-                let mut chosen = Vec::new();
                 for tok in ans.split(',') {
                     let tok = tok.trim();
                     if tok.is_empty() {
@@ -449,13 +459,16 @@ impl Prompter for ScriptedPrompter {
                             items.len()
                         )));
                     }
-                    chosen.push(n - 1);
+                    // TOGGLE row n (1-based → 0-based).
+                    checked[n - 1] = !checked[n - 1];
                 }
-                chosen.sort_unstable();
-                chosen.dedup();
-                Ok(chosen)
             }
         }
+        Ok(checked
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &on)| if on { Some(i) } else { None })
+            .collect())
     }
 
     fn confirm(&self, prompt: &str, default: bool) -> Result<bool, CliError> {
@@ -650,10 +663,25 @@ mod tests {
     }
 
     #[test]
-    fn scripted_prompter_multiselect_explicit_indices() {
+    fn scripted_prompter_multiselect_explicit_indices_toggle() {
+        // WR-04: named indices TOGGLE against the defaults (matching the Rich
+        // widget's Space-flips-a-row model). Defaults [T,F,F]; toggle 2 and 3 →
+        // [T,T,T] → indices 0,1,2.
         let p = ScriptedPrompter::new(Cursor::new(b"2,3\n".to_vec()));
         let chosen = p
             .multiselect("feats", &["a", "b", "c"], &[true, false, false])
+            .unwrap();
+        assert_eq!(chosen, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn scripted_prompter_multiselect_toggle_can_turn_a_default_off() {
+        // WR-04: toggling a row that is ON by default turns it OFF — the scripted
+        // path can REDUCE the set, not only ADD to it. Defaults [T,F,T]; toggle 1
+        // (T→F) and 2 (F→T) → [F,T,T] → indices 1,2.
+        let p = ScriptedPrompter::new(Cursor::new(b"1,2\n".to_vec()));
+        let chosen = p
+            .multiselect("feats", &["a", "b", "c"], &[true, false, true])
             .unwrap();
         assert_eq!(chosen, vec![1, 2]);
     }
