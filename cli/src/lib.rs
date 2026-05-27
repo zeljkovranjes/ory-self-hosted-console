@@ -545,7 +545,9 @@ async fn home_menu_or_usage(
                     2 => CheckAction::Config { config: None },
                     _ => CheckAction::Features,
                 };
-                return check::run_check(action, api_url, api_key, ui).await;
+                check::run_check(action, api_url, api_key, ui).await?;
+                // Loop back to the home menu so the operator can do more (the
+                // explicit "Quit" item is the only way out — the menu is sticky).
             }
             // Edit → sub-Select of the edit actions.
             2 => {
@@ -556,7 +558,8 @@ async fn home_menu_or_usage(
                     1 => EditAction::Services { config: None },
                     _ => EditAction::Config { config: None },
                 };
-                return edit::run_edit(action, api_url, api_key, ui).await;
+                edit::run_edit(action, api_url, api_key, ui).await?;
+                // Sticky menu: fall through to the loop and re-present the choices.
             }
             // Day-2 → point the operator at the day-2 verbs (these take args, so we
             // surface the help rather than guess; an unguided list keeps it simple).
@@ -567,7 +570,7 @@ async fn home_menu_or_usage(
                      sso <add-saml|add-oidc> · org add · admin list · oauth github set · \
                      bootstrap <token|rotate-secrets>",
                 );
-                return Ok(());
+                // Sticky menu: re-present the choices rather than exiting.
             }
             // Quit.
             _ => return Ok(()),
