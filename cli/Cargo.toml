@@ -46,6 +46,17 @@ toml = "0.9"
 # use `getrandom::fill(&mut [u8])` directly (no `rand` distribution layer).
 getrandom = "0.3"
 
+# CLI-builder BYO-Postgres (IUX-BYO-PG-03): the REAL `SELECT 1` connection check.
+# NON-optional, in the DEFAULT feature set — the connection check ships in every
+# build (the explicit requirement). These are PURE-RUST (tokio-postgres protocol +
+# tokio-postgres-rustls bound to the SAME rustls 0.23 + aws-lc-rs provider reqwest
+# already uses) — NOT sqlx, NOT argon2, NOT openssl/native-tls. Package-legitimacy
+# + the no-sqlx/no-argon2 `cargo tree` gate are recorded in the workspace Cargo.toml
+# and the IUX SUMMARY.
+tokio-postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+
 # The Argon2id hasher + sqlx are pulled in ONLY when the operator opts into the
 # offline DB-direct admin path. Reuses the SAME pins/regime as the backend so the
 # password-hash format is byte-compatible with the console.

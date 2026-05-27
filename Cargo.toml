@@ -36,6 +36,23 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 
+# CLI-builder BYO-Postgres (IUX-BYO-PG-03): the REAL `SELECT 1` connection check.
+# Package legitimacy:
+#   * tokio-postgres — the canonical async Postgres client from the rust-postgres
+#     org (github.com/sfackler/rust-postgres, 46M+ downloads); the `postgres` crate
+#     and sqlx's postgres backend both build on it. PURE-RUST protocol impl (no C).
+#   * tokio-postgres-rustls — rustls TLS integration (github.com/jbg/tokio-postgres-rustls,
+#     8.6M+ downloads). Pinned to the `aws-lc-rs` + `webpki-roots` features so it
+#     REUSES the SAME rustls 0.23 + aws-lc-rs crypto provider reqwest already pulls
+#     (NO second crypto backend, NO ring, NO openssl/native-tls C deps, NO sqlx,
+#     NO argon2). The `cargo tree` gate proves the default cli graph stays clean.
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["aws-lc-rs", "webpki-roots"] }
+# rustls 0.23 with the aws-lc-rs provider — IDENTICAL to the version+backend
+# reqwest already resolves (one provider, no ring). Used only to install the
+# process-default crypto provider for the DB TLS check.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+
 # The release profile lives at the workspace ROOT: Cargo IGNORES a
 # `[profile.*]` block in a non-root workspace member and emits a warning, so the
 # backend's tuned release profile (opt-level "s", lto, codegen-units 1, strip)
