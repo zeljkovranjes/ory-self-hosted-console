@@ -362,13 +362,30 @@ mod offline {
             .map_err(|e| CliError::Io(format!("hashing password: {e}")))
     }
 
-    pub async fn create_admin(email: &str, password: &str) -> Result<(), CliError> {
+    /// WR-04: enforce the SAME min-password policy the backend applies on
+    /// `/setup` (via the shared `console_core` constant) so an offline-created
+    /// admin can never be weaker than a console-created one. Refuse BEFORE any DB
+    /// connection or hashing work; never echo the password.
+    fn enforce_password_policy(password: &str) -> Result<(), CliError> {
+        if !console_core::password_meets_policy(password) {
+            return Err(CliError::Io(format!(
+                "password must be at least {} characters",
+                console_core::MIN_PASSWORD_LEN
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn create_admin(email: &str, name: &str, password: &str) -> Result<(), CliError> {
+        // WR-04: policy check first (before DB / hashing), mirroring the backend.
+        enforce_password_policy(password)?;
         let pool = sqlx::PgPool::connect(&database_url()?)
             .await
             .map_err(|e| CliError::Io(format!("connecting to DB: {e}")))?;
         let hash = hash_password(password)?;
-        sqlx::query("INSERT INTO admins (email, password_hash) VALUES ($1, $2)")
+        sqlx::query("INSERT INTO admins (email, name, password_hash) VALUES ($1, $2, $3)")
             .bind(email)
+            .bind(name)
             .bind(&hash)
             .execute(&pool)
             .await
@@ -378,6 +395,8 @@ mod offline {
     }
 
     pub async fn reset_password(email: &str, password: &str) -> Result<(), CliError> {
+        // WR-04: same policy as create / the backend.
+        enforce_password_policy(password)?;
         let pool = sqlx::PgPool::connect(&database_url()?)
             .await
             .map_err(|e| CliError::Io(format!("connecting to DB: {e}")))?;

@@ -19,8 +19,10 @@ use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 
-/// Minimum local-admin password length (CONTEXT: policy >= 12).
-const MIN_PASSWORD_LEN: usize = 12;
+/// Minimum local-admin password length (CONTEXT: policy >= 12). Sourced from the
+/// shared `console_core` constant so the backend `/setup` policy and the CLI's
+/// offline DB-direct admin path (WR-04) can never drift.
+const MIN_PASSWORD_LEN: usize = console_core::MIN_PASSWORD_LEN;
 
 /// OWASP-baseline Argon2id configuration (m = 19 456 KiB, t = 2, p = 1).
 /// Centralized so hashing and verification always use identical parameters.

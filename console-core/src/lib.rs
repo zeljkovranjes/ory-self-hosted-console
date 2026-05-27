@@ -37,6 +37,25 @@ pub const API_KEY_HEADER: &str = "authorization";
 pub const API_KEY_SCHEME: &str = "Api-Key";
 
 // ---------------------------------------------------------------------------
+// Password policy (the SINGLE SOURCE OF TRUTH, WR-04).
+//
+// The backend enforces this minimum on `/setup` admin creation; the optional
+// CLI's offline DB-direct admin path (`admin create`/`reset-password` behind the
+// `offline-admin` feature) MUST enforce the SAME minimum so an offline-created
+// admin is never weaker than a console-created one. Defining the constant + the
+// check here means the two callers cannot drift.
+// ---------------------------------------------------------------------------
+
+/// Minimum local-admin password length (CONTEXT: policy >= 12).
+pub const MIN_PASSWORD_LEN: usize = 12;
+
+/// Whether `password` satisfies the minimum-length policy. Counts CHARACTERS
+/// (not bytes) to match the backend's `chars().count()` check exactly.
+pub fn password_meets_policy(password: &str) -> bool {
+    password.chars().count() >= MIN_PASSWORD_LEN
+}
+
+// ---------------------------------------------------------------------------
 // Feature-toggle DTOs (CLI-03).
 // ---------------------------------------------------------------------------
 
