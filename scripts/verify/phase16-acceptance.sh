@@ -548,8 +548,23 @@ echo "--- [OBS-04] emit a log line carrying ${OBS04_EMAIL} on a container's MAIN
 # Reuse the already-present postgres image (no pull). It shares the same Docker
 # engine + json-file driver, so Alloy's glob picks it up.
 docker rm -f "$OBS04_EMITTER" >/dev/null 2>&1 || true
+# WR-04: emit THREE distinct marker lines so the gate can drive ALL the closed
+# log intents the UI exposes (not just intent=all), turning WR-01/WR-02-style
+# dead-path regressions into hard FAILs (anti-false-green):
+#   (1) an info line carrying the PII email   -> intent=all (masking) + the
+#                                                 intent=errors NEGATIVE (must be
+#                                                 EXCLUDED, it is level=info).
+#   (2) a line naming the `backend` service   -> intent=service&service=backend
+#                                                 (WR-01: the by-service line filter
+#                                                 must return it).
+#   (3) an explicit level=error line          -> intent=errors (must be INCLUDED).
 docker run -d --name "$OBS04_EMITTER" postgres:17-alpine \
-  /bin/sh -c "for i in 1 2 3 4 5; do echo \"${OBS04_MARKER} login attempt for ${OBS04_EMAIL} level=info\"; sleep 2; done" \
+  /bin/sh -c "for i in 1 2 3 4 5; do \
+    echo \"${OBS04_MARKER} login attempt for ${OBS04_EMAIL} level=info\"; \
+    echo \"${OBS04_MARKER} backend service heartbeat ok\"; \
+    echo \"${OBS04_MARKER} backend level=error simulated failure for gate\"; \
+    sleep 2; \
+  done" \
   >/dev/null 2>&1 || true
 
 # Confirm the emitter is actually running before we wait for its line (otherwise a
@@ -623,6 +638,113 @@ case "$LABELS_VERDICT" in
   NOLABELS) _fail "[OBS-04] Loki returned no label list (cannot confirm low-cardinality — anti-false-green)" ;;
   *)      _fail "[OBS-04] could not read Loki labels (verdict='${LABELS_VERDICT}')" ;;
 esac
+
+# =============================================================================
+# WR-04 — drive the CLOSED log intents the UI actually exposes (service, errors),
+# not just intent=all. Before this, the gate only queried intent=all so the dead
+# `{service=...}` selector (WR-01) and the errors line filter were never exercised
+# — the green was hollow. Now a WR-01-style regression (by-service returns nothing)
+# is a hard FAIL. The emitter (above) emitted the lines into Loki; they persist
+# there independent of the now-removed emitter container.
+#
+# (a) intent=service&service=backend MUST return the marker line that names the
+#     `backend` service (WR-01: the by-service line filter returns real data).
+echo
+echo "--- [WR-04/OBS-04] intent=service&service=backend returns the service-named marker line (WR-01 regression guard) ---"
+OBS04_SVC_HIT=""
+for _try in $(seq 1 12); do
+  SVC_BODY="$(_auth_get_body "${LOGS_URL}?intent=service&service=backend&range=600&limit=1000")"
+  OBS04_SVC_VERDICT="$(printf '%s' "$SVC_BODY" | MARKER="$OBS04_MARKER" node -e '
+    const marker=process.env.MARKER;
+    let d; try { d = JSON.parse(require("fs").readFileSync(0,"utf8")); } catch(e){ process.stdout.write("BADJSON"); process.exit(0); }
+    if (d && d.state && d.state !== "running") { process.stdout.write("STATE:"+d.state); process.exit(0); }
+    const streams=((d&&d.result&&d.result.result))||[];
+    let found=false;
+    for (const s of streams) for (const v of (s.values||[])) {
+      const line=v[1]||"";
+      if (line.indexOf(marker)!==-1 && /backend/.test(line)) found=true;
+    }
+    process.stdout.write(found ? "HIT" : "NOTYET");
+  ' 2>/dev/null)"
+  if [ "$OBS04_SVC_VERDICT" = "HIT" ]; then OBS04_SVC_HIT="HIT"; break; fi
+  sleep 4
+done
+if [ "$OBS04_SVC_HIT" = "HIT" ]; then
+  _pass "[WR-04/OBS-04] intent=service&service=backend returned the backend-named marker line (by-service filter is LIVE — WR-01 fixed)"
+else
+  _fail "[WR-04/OBS-04] intent=service&service=backend returned NO backend-named marker line (last verdict='${OBS04_SVC_VERDICT}') — the by-service log path is DEAD (WR-01 regression)"
+fi
+
+# (b) intent=errors MUST INCLUDE the level=error marker line AND EXCLUDE the
+#     level=info marker line (the cheap negative the gate can prove).
+echo
+echo "--- [WR-04/OBS-04] intent=errors includes the level=error line and EXCLUDES the level=info line ---"
+ERR_BODY="$(_auth_get_body "${LOGS_URL}?intent=errors&range=600&limit=1000")"
+OBS04_ERR_VERDICT="$(printf '%s' "$ERR_BODY" | MARKER="$OBS04_MARKER" node -e '
+  const marker=process.env.MARKER;
+  let d; try { d = JSON.parse(require("fs").readFileSync(0,"utf8")); } catch(e){ process.stdout.write("BADJSON"); process.exit(0); }
+  if (d && d.state && d.state !== "running") { process.stdout.write("STATE:"+d.state); process.exit(0); }
+  const streams=((d&&d.result&&d.result.result))||[];
+  let sawError=false, sawInfo=false;
+  for (const s of streams) for (const v of (s.values||[])) {
+    const line=v[1]||"";
+    if (line.indexOf(marker)===-1) continue;
+    if (/level=error/.test(line)) sawError=true;
+    if (/level=info/.test(line))  sawInfo=true;
+  }
+  if (sawInfo) { process.stdout.write("LEAKEDINFO"); process.exit(0); }
+  process.stdout.write(sawError ? "OK" : "NOERROR");
+' 2>/dev/null)"
+case "$OBS04_ERR_VERDICT" in
+  OK)         _pass "[WR-04/OBS-04] intent=errors includes the level=error marker line and excludes the level=info one (errors line filter is LIVE + correct)" ;;
+  LEAKEDINFO) _fail "[WR-04/OBS-04] intent=errors returned a level=info marker line — the errors line filter is too broad (false-green)" ;;
+  NOERROR)    _fail "[WR-04/OBS-04] intent=errors returned NO level=error marker line — the errors intent path is dead/broken" ;;
+  STATE:*)    _fail "[WR-04/OBS-04] intent=errors profile state='${OBS04_ERR_VERDICT#STATE:}' (want running)" ;;
+  *)          _fail "[WR-04/OBS-04] intent=errors verdict='${OBS04_ERR_VERDICT}' (cannot confirm the errors path)" ;;
+esac
+
+# (c) WR-02: the login-latency Activity panel must return a metric-backed series
+#     (the http_request_duration_seconds histogram now exists + the latency_hoop
+#     records it on every request, so the p95 query resolves). Drive a few backend
+#     requests first to populate at least one bucket, then assert a result body.
+echo
+echo "--- [WR-04/OBS-03] login-latency Activity intent returns a metric-backed series (WR-02 regression guard) ---"
+# Generate traffic so the histogram has buckets (any backend request is timed by
+# the root latency_hoop). A handful of cheap state probes is enough.
+for _ping in 1 2 3 4 5 6 7 8; do curl -s -o /dev/null --max-time 5 "${BACKEND_BASE_URL}/api/console/state" >/dev/null 2>&1 || true; done
+OBS_LAT_HIT=""
+for _try in $(seq 1 12); do
+  LAT_BODY="$(_auth_get_body "${ACTIVITY_URL}?intent=login-latency")"
+  OBS_LAT_VERDICT="$(printf '%s' "$LAT_BODY" | node -e '
+    let d; try { d = JSON.parse(require("fs").readFileSync(0,"utf8")); } catch(e){ process.stdout.write("BADJSON"); process.exit(0); }
+    if (d && d.source && d.source !== "prometheus") { process.stdout.write("SRC:"+d.source); process.exit(0); }
+    if (d && d.state && d.state !== "running") { process.stdout.write("STATE:"+d.state); process.exit(0); }
+    const r=d&&d.result;
+    if (!r || !("resultType" in r)) { process.stdout.write("NORESULT"); process.exit(0); }
+    const arr=r.result;
+    // A populated p95 query yields at least one series with a numeric value (not
+    // NaN/empty). An EMPTY result array means the histogram is not being emitted
+    // (the WR-02 dead-panel regression).
+    let hasVal=false;
+    if (Array.isArray(arr)) for (const s of arr) {
+      const vals = s.values || (s.value ? [s.value] : []);
+      for (const pair of vals) {
+        const n = Number(pair && pair[1]);
+        if (Number.isFinite(n)) hasVal=true;
+      }
+    }
+    process.stdout.write(hasVal ? "HASDATA" : "EMPTY");
+  ' 2>/dev/null)"
+  if [ "$OBS_LAT_VERDICT" = "HASDATA" ]; then OBS_LAT_HIT="HASDATA"; break; fi
+  # keep generating a little traffic between polls so a fresh rate window fills
+  for _ping in 1 2 3 4; do curl -s -o /dev/null --max-time 5 "${BACKEND_BASE_URL}/api/console/state" >/dev/null 2>&1 || true; done
+  sleep 5
+done
+if [ "$OBS_LAT_HIT" = "HASDATA" ]; then
+  _pass "[WR-04/OBS-03] login-latency returned a metric-backed p95 value (http_request_duration_seconds histogram is LIVE — WR-02 fixed)"
+else
+  _fail "[WR-04/OBS-03] login-latency returned no metric-backed value (last verdict='${OBS_LAT_VERDICT}') — the latency histogram is not emitted (WR-02 regression)"
+fi
 
 # =============================================================================
 # OBS-05 — Grafana: host curl refused (already proven in Phase B), internal
