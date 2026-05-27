@@ -1547,6 +1547,125 @@ on backend/AX, BACK-01 no direct frontend→Ory, the saml/organizations guards).
 
 ---
 
+## Observability profile (opt-in) (Phase 16)
+
+The stack ships an **opt-in** observability profile — Prometheus, Grafana, Loki,
+and Grafana Alloy — that is **OFF by default**. A plain `docker compose up` does
+**not** start any of the four; they only start when you explicitly add the
+profile. This keeps the default footprint small and the default attack surface
+minimal.
+
+### How to enable
+
+```bash
+# 1. Set a strong Grafana admin password (the profile reads it from a secret file).
+cp secrets/grafana_admin_password.example secrets/grafana_admin_password
+#    Edit secrets/grafana_admin_password and replace the placeholder with a strong value.
+
+# 2. Bring the stack up WITH the observability profile.
+docker compose --profile observability up -d --wait
+
+# 3. Turn the `observability` feature flag ON in the console
+#    (Project -> Features). The dashboards/logs/Grafana surfaces are flag-gated.
+```
+
+Both the **profile** (the four containers must be running) **and** the
+`observability` **feature flag** (ON in the console) are required for the
+Activity/Logs/Grafana console surfaces to render. This is the **flag/profile
+handshake** — see below.
+
+### Security posture
+
+- **No host-published port on any of the four services (INFRA-05).** Prometheus
+  (`:9090`), Loki (`:3100`), Grafana (`:3000`-internal), and Alloy publish **no**
+  host port — a host `curl` to any of them is refused. They live on the
+  `internal` network and are reached container-to-container only. Enabling the
+  profile adds **zero** new host-published ports.
+- **Grafana is reachable ONLY through the authenticated backend reverse-proxy**
+  (`/api/console/grafana/...`). The browser never reaches Grafana directly. The
+  backend injects `X-WEBAUTH-USER: <operator admin_id>` from the authenticated
+  console session (never client input) and strips any client-supplied
+  `X-WEBAUTH-*` header (T-16-10); the `{**path}` is normalized + traversal-rejected
+  against the fixed Grafana origin (T-16-11).
+- **No default `admin/admin` Grafana credentials (T-16-03).** The Grafana admin
+  password comes from `secrets/grafana_admin_password` (a Docker secret file),
+  and Grafana's own login form is disabled (`GF_AUTH_DISABLE_LOGIN_FORM`) — an
+  `admin/admin` login is refused. The acceptance gate proves this live.
+- **Metrics carry no per-identity labels (T-16-04).** The backend `GET /metrics`
+  exporter is internal-only and emits aggregate counts/buckets only
+  (`console_login_attempts_total{result}`, `console_setup_completions_total`,
+  request-duration histograms) — never an email/identity/session label.
+- **Loki logs are PII-masked at ingestion (T-16-05).** Alloy scrubs emails →
+  `***REDACTED-EMAIL***`, `bearer`/`token=`/`password=`/`api-key=`/`secret=`
+  values, and credentialed connection-URI userinfo **before** the line reaches
+  Loki — masking at the shipper, never at query time (once a secret lands in Loki
+  it is queryable). Stream labels are **low-cardinality and static only** (`job`,
+  `stream`) — never an identity/session/email value. The acceptance gate emits a
+  line carrying a known email and asserts it is stored redacted with no
+  per-identity label.
+
+### The flag/profile handshake (FLAG-04)
+
+The console surfaces compose **two** gates: the `observability` **feature flag**
+(seeded OFF; `requires_runtime`) and the **runtime profile** (the four
+containers). When the flag is **ON** but the profile is **DOWN**, the backend
+observability routes (`/api/console/metrics/activity`, `/api/console/logs`,
+`/api/console/grafana/...`) return a structured `{ state: "profile_not_running" }`
+**`200`** — **never** a raw `502`/`500`. The console renders a calm "enable the
+profile" affordance carrying the exact command
+(`docker compose --profile observability up`), not an error page. When the flag
+is **OFF**, those routes `404` (the `FeatureFlagHoop` beats a valid session +
+CSRF). The acceptance gate proves all three states (flag-OFF `404`, flag-ON +
+profile-down `profile_not_running`, flag-ON + profile-up metric-backed data).
+
+### Alloy log source — file-tail, not the Docker socket (documented residual)
+
+Alloy ships container logs to Loki by **file-tailing the Docker json-file log
+directory** (`/var/lib/docker/containers/*/*-json.log`), mounted **read-only**. It
+deliberately does **not** use `loki.source.docker` / the Docker socket: BACK-05
+mandates the **restart-broker** be the **sole** Docker-socket holder, and Alloy
+must not become a second one. File-tail keeps that invariant intact (and avoids
+the `grafana/alloy#4246` WaitGroup panic when routing Alloy through a
+socket-proxy). The acceptance gate re-asserts that **neither the backend nor
+Alloy** holds the Docker socket.
+
+> **Residual risk (file-tail requires the `json-file` driver).** The file-tail
+> finds logs only if the host uses Docker's default `json-file` logging driver
+> (the line files are `/var/lib/docker/containers/<id>/<id>-json.log`). If your
+> host uses a different driver (e.g. `journald`, `local`), the file-tail finds
+> nothing — the documented fallback is a **`:ro` Docker-socket mount on Alloy
+> only**, which re-introduces a second (read-only) socket holder. That residual
+> is recorded here in the same spirit as the Hydra `--dev` and restart-broker
+> residuals: prefer the file-tail; reach for the `:ro` socket only if your log
+> driver leaves no choice, and document it in your deployment's threat model.
+
+### Verifying Phase 16 — Observability (`OBS-01..05` / `FLAG-04`)
+
+```bash
+# Full BOTH-paths lifecycle (base up -> profile up -> drive -> stop profile ->
+# regression -> down -v). Git Bash on Windows: prefix MSYS_NO_PATHCONV=1.
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase16-acceptance.sh
+# (the gate runs `docker compose --profile observability down -v` itself on exit;
+#  pass KEEP_STACK=1 to keep the stack up, SKIP_EGRESS=1 to skip the bundle build)
+```
+
+It proves end to end, anti-false-green: **OBS-01** (a plain `up` does NOT start
+the four; the profile-up adds NO new host port and a host `curl` to
+grafana/prometheus/loki is refused), **OBS-02** (Prometheus scrapes all five
+internal targets `up`; backend `/metrics` is label-safe), **OBS-03** (the
+Activity route returns Prometheus-derived series, not the retired derived stub; an
+unknown intent `422`s), **OBS-04** (a known email pushed through a container is
+stored `***REDACTED***` in Loki with low-cardinality labels only), **OBS-05**
+(`admin/admin` Grafana login fails; the backend authed proxy reaches Grafana with
+the flag ON; the proxy `404`s with the flag OFF), the **FLAG-04** handshake
+(flag-ON + profile-down → `profile_not_running`, never a `502`), **and** the v1 +
+Phase-13/14/15 invariant regression (INFRA-05 admin/observability ports refused +
+internal-only; BACK-05 restart-broker-only + no socket on backend/Alloy; BACK-01
+no direct frontend→Ory + no observability host literal in the console bundle; the
+saml/organizations/observability guards).
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
