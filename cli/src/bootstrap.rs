@@ -213,13 +213,32 @@ fn rotate_secret(
     env_file: &str,
 ) -> Result<(), CliError> {
     // Map the logical secret name to its `.env` key + matching env var.
+    //
+    // WR-02: `session-secret` was previously mapped to `CONSOLE_SESSION_SECRET`,
+    // but the backend (`backend/src/config.rs`) NEVER reads such a key — console
+    // sessions are opaque random tokens whose SHA-256 hash lives in the `sessions`
+    // table, so there is NO session-signing secret to rotate. Rotating it was a
+    // silent no-op that gave false confidence. We DROP the option and tell the
+    // operator the real invalidation lever (clear the `sessions` table). Only
+    // `db-password` (POSTGRES_PASSWORD) and `github-secret`
+    // (GITHUB_OAUTH_CLIENT_SECRET) are real backend/compose vars.
     let (env_key, src_env) = match which {
-        "session-secret" => ("CONSOLE_SESSION_SECRET", "CONSOLE_SESSION_SECRET_NEW"),
         "db-password" => ("POSTGRES_PASSWORD", "POSTGRES_PASSWORD_NEW"),
         "github-secret" => ("GITHUB_OAUTH_CLIENT_SECRET", "GITHUB_OAUTH_CLIENT_SECRET_NEW"),
+        "session-secret" => {
+            return Err(CliError::Unsupported(
+                "there is no session-signing secret to rotate: console sessions are opaque \
+                 random tokens hashed in the `sessions` table, not signed with an env secret. \
+                 To invalidate all sessions (force re-login), clear the `sessions` table \
+                 (e.g. `docker compose exec postgres psql -U $POSTGRES_USER -d console -c \
+                 'TRUNCATE sessions;'`) — no `.env` rotation applies."
+                    .into(),
+            ))
+        }
         other => {
             return Err(CliError::Unsupported(format!(
-                "unknown secret `{other}` (expected: session-secret | db-password | github-secret)"
+                "unknown secret `{other}` (expected: db-password | github-secret). \
+                 `session-secret` is not rotatable — clear the `sessions` table instead."
             )))
         }
     };

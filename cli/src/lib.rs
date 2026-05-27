@@ -277,7 +277,10 @@ pub enum BootstrapAction {
     /// secret) as `.env` upserts. Values via env/`--*-file`/prompt — NEVER argv.
     /// A service restart is the operator's documented follow-up.
     RotateSecrets {
-        /// Which secret to rotate (`session-secret`, `db-password`, `github-secret`).
+        /// Which secret to rotate (`db-password` or `github-secret`). NOTE:
+        /// `session-secret` is NOT rotatable — console sessions are opaque tokens
+        /// hashed in the DB, not signed with an env secret; to invalidate sessions
+        /// clear the `sessions` table instead.
         #[arg(long)]
         which: String,
         /// Path to a file holding the new secret value (alternative to the
