@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1
+#
+# OPTIONAL Kafka/NATS event-sink build target (Phase 17 — EVT-01).
+#
+# This is a SEPARATE Dockerfile, NOT an edit to `backend/Dockerfile`. It exists
+# ONLY to produce the `events-kafka` image, which links `rdkafka` (the librdkafka
+# C binding). `rdkafka` statically compiles bundled librdkafka from C sources and
+# therefore requires a C toolchain (gcc + make + cmake + libcurl-dev) plus
+# libssl-dev/libsasl2-dev for the `ssl`/`sasl` features (the crate is pinned with
+# features = ["cmake-build", "ssl", "sasl"] in backend/Cargo.toml). Pitfall 1:
+# this toolchain MUST NOT enter the default/production image — so it is installed
+# HERE and ONLY here. The default `backend/Dockerfile` stays byte-for-byte
+# zero-apt (assert: `git diff --quiet backend/Dockerfile`).
+#
+# An operator who wants Kafka builds this image explicitly and points the stack at
+# their own broker (never bundled):
+#     docker build -f backend/Dockerfile.kafka -t ory-console-backend:kafka backend
+#
+# NATS (`events-nats`) is pure-Rust (rustls/ring) and needs NO C toolchain — it can
+# be built either by the default Dockerfile with `--features events-nats` added, or
+# (alongside Kafka) by this image (it also enables events-nats below). The webhook
+# sink is the default and needs neither feature nor this image.
+
+# ---- Stage 1: builder ----
+FROM rust:1.95-slim-bookworm AS builder
+
+WORKDIR /app
+
+ARG TEST_PROBE=
+
+ENV SQLX_OFFLINE=true
+
+# THE ONLY apt layer in any backend build. rdkafka's bundled librdkafka build needs
+# the GNU toolchain + make, cmake (the cmake-build feature), libcurl-dev, and
+# (for the ssl/sasl features) libssl-dev + libsasl2-dev. NOTE: the rdkafka-sys
+# CMake build requires a C++ compiler (`c++`/`g++`) in addition to the C compiler —
+# `gcc` alone is not enough (CMake's `project()` probes CMAKE_CXX_COMPILER). This
+# layer NEVER appears in the default `backend/Dockerfile` (Pitfall 1 — keep the
+# production image pure-Rust + rustls, zero apt).
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        gcc \
+        g++ \
+        make \
+        cmake \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libsasl2-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-cache dependencies (with the Kafka/NATS features ON so the dependency layer
+# matches the real build). --locked resolves EXACTLY the versions in Cargo.lock.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src \
+    && echo '// dependency cache build' > src/lib.rs \
+    && echo 'fn main() { println!("dependency cache build"); }' > src/main.rs \
+    && cargo build --release --locked --features events-kafka,events-nats \
+    && rm -rf src
+
+# Committed sqlx offline metadata + migrations (no DB at build time).
+COPY .sqlx ./.sqlx
+COPY migrations ./migrations
+
+# Real sources + the embedded config schemas (include_str! at compile time).
+COPY src ./src
+COPY config ./config
+
+# Build the real binary WITH the Kafka (+ NATS) sink adapters compiled in.
+# ${TEST_PROBE:+--features test-probe} is preserved for parity with the default
+# build (the acceptance image can still set it), composed with the event features.
+RUN touch src/lib.rs src/main.rs \
+    && cargo build --release --locked --features events-kafka,events-nats ${TEST_PROBE:+--features test-probe}
+
+# ---- curl stage ----
+# Identical to the default Dockerfile: a statically-linked curl for the distroless
+# runtime self-healthcheck + the acceptance harness internal probes.
+FROM ghcr.io/tarampampam/curl:8.11.1@sha256:8f09f048304280e0e50cc82a1f4ead45971e6e0f260011ab143576e7bf982493 AS curlbin
+
+# ---- Stage 2: runtime ----
+# IDENTICAL distroless runtime to the default Dockerfile — no shell, no package
+# manager, non-root. The C toolchain lives ONLY in the builder stage above; the
+# statically-linked librdkafka is baked into the binary, so the runtime image
+# carries no extra C libraries.
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+WORKDIR /app
+
+COPY --from=curlbin /bin/curl /usr/local/bin/curl
+
+COPY --from=builder /app/target/release/ory-console-backend /usr/local/bin/ory-console-backend
+
+ENV BACKEND_BIND_ADDR=0.0.0.0:8080
+EXPOSE 8080
+
+USER nonroot
+
+ENTRYPOINT ["/usr/local/bin/ory-console-backend"]

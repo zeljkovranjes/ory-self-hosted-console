@@ -1666,6 +1666,76 @@ saml/organizations/observability guards).
 
 ---
 
+## Event streams — external sinks (Phase 17)
+
+The console can stream its own audit events to external sinks. This is the
+console's own dispatcher (extending the Phase-11 webhook engine) — **not** an Ory
+hook. It is gated behind the `event_streams` feature flag (Project → Features);
+when the flag is OFF every `/api/event-sinks*` route returns `404` even with a
+valid session + matching CSRF.
+
+Manage sinks under **Project → Event streams**: create/edit a sink, pick its
+events, view the delivery log, and redeliver. Three sink **kinds** are pluggable:
+
+| Kind | Build requirement | Notes |
+|------|-------------------|-------|
+| **`webhook`** (default) | none — pure-Rust, in the default image | Signed HTTP POST. The console mints an HMAC secret and signs every delivery with `X-Console-Signature`. The default `docker compose` image ships this and only this. |
+| **`nats`** | `--features events-nats` — pure-Rust (rustls/ring), **no C toolchain** | Add the feature to the default `backend/Dockerfile` build, or use the Kafka image (it enables NATS too). Operator supplies the broker. |
+| **`kafka`** | the separate `backend/Dockerfile.kafka` (C toolchain) | `rdkafka` links librdkafka from C sources, so it needs a C toolchain at build time. Built explicitly by an operator who wants Kafka. The broker is never bundled. |
+
+**Why a separate Dockerfile for Kafka.** The default `backend/Dockerfile` installs
+**zero** apt packages — the whole backend is pure-Rust + rustls. `rdkafka`
+statically compiles bundled librdkafka and therefore requires `gcc make cmake
+libcurl4-openssl-dev libssl-dev libsasl2-dev`. To keep the default/production image
+lean (and verifiably toolchain-free), that apt layer lives **only** in
+`backend/Dockerfile.kafka`. The acceptance gate asserts the default `Dockerfile` is
+byte-for-byte unchanged and that `async-nats`/`rdkafka` are absent from the default
+cargo graph.
+
+```bash
+# Default image — webhook sink only, no C toolchain (this is what `docker compose` builds):
+docker build -f backend/Dockerfile backend
+
+# Optional Kafka (+ NATS) image — carries the C toolchain, builds --features events-kafka,events-nats:
+docker build -f backend/Dockerfile.kafka -t ory-console-backend:kafka backend
+```
+
+**Delivery semantics & hardening.**
+
+- **At-least-once + idempotency.** Every event carries a UUID `id` (the source
+  audit-row id). Deliveries are retried with exponential backoff up to
+  `max_attempts`, then moved to a terminal `dead` state (DLQ). Consumers
+  **dedupe on the event `id`** — the same event may be delivered more than once.
+- **Write-only credentials (T-17-01).** A webhook secret is minted server-side
+  and revealed **once** on create/rotate; broker credentials (NATS creds/token,
+  Kafka SASL password) are write-only. The list/detail and every API response
+  show only a **Set / Not set** badge — the stored value is never returned.
+- **SSRF guard (T-17-08).** Webhook targets are resolve-validated at **create**
+  (fast `422`) and re-validated at **delivery** (DNS-rebind defense): private,
+  loopback, link-local, and cloud-metadata addresses are rejected; broker
+  host:port targets are checked the same way before connecting.
+- **PII redaction (EVT-03).** Outbound payloads are redacted **before** they hit
+  the durable queue — actor emails are reduced to a domain, and
+  secret/connection-URI/bearer-shaped values are masked. The delivery log shows
+  the redacted payload.
+
+```bash
+# Live acceptance gate (Git Bash on Windows: prefix MSYS_NO_PATHCONV=1):
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase17-acceptance.sh
+# (the gate does the full build -> up --wait -> drive -> down -v itself;
+#  pass KEEP_STACK=1 to keep the stack up, SKIP_EGRESS=1 to skip the bundle build)
+```
+
+It proves end to end, anti-false-green: the **default image is rdkafka-free** and
+delivers via the webhook sink only (HMAC verified); an SSRF target is rejected at
+**create** AND at **delivery** (no payload escapes); sink credentials are masked on
+`GET`/list; an outbound payload is **PII-redacted** while carrying the idempotency
+id; a failing target exhausts retries to the `dead` DLQ state; `event_streams` OFF
+→ `404` (with a valid session + CSRF); **and** the v1 + Phase-13..16 invariant
+regression (INFRA-05 / BACK-05 / BACK-01 + the flag-gated route guards).
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
