@@ -21,8 +21,19 @@
 
 use std::sync::{Once, OnceLock};
 
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use salvo::prelude::*;
+
+/// Explicit bucket bounds (seconds) for the `http_request_duration_seconds`
+/// histogram (WR-02). Without per-metric bucket bounds the Prometheus exporter
+/// renders a `metrics`-crate histogram as a SUMMARY (`{quantile}`), NOT the
+/// `_bucket{le}` family the `histogram_quantile(...)` Activity query reads — so the
+/// p95 panel would still be empty. These bounds make it a TRUE Prometheus
+/// histogram. The set is small + fixed (low storage cost) and spans typical
+/// console request latencies from 5ms to 10s.
+const HTTP_LATENCY_BUCKETS_SECS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Process-global render handle. Set ONCE by [`install_recorder`]; read by the
 /// [`metrics_text`] handler to render the current text-format snapshot. A
@@ -58,7 +69,21 @@ pub fn install_recorder() {
         // WITHOUT the exporter's optional HTTP listener / push task (we render
         // through the Salvo handler instead), so no `default-features` runtime is
         // needed.
-        let recorder = PrometheusBuilder::new().build_recorder();
+        // WR-02: pin explicit bucket bounds for the request-duration histogram so
+        // the exporter renders it as a TRUE Prometheus histogram
+        // (`http_request_duration_seconds_bucket{le}` / `_sum` / `_count`) rather
+        // than the default summary — the `histogram_quantile(...)` Activity query
+        // reads the `_bucket{le}` family. `set_buckets_for_metric` only fails on an
+        // empty bucket slice (ours is a non-empty constant), so the `unwrap_or_else`
+        // can never trip; it degrades to the un-bucketed builder rather than
+        // panicking at boot if a future edit empties the slice.
+        let builder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Full("http_request_duration_seconds".to_string()),
+                HTTP_LATENCY_BUCKETS_SECS,
+            )
+            .unwrap_or_else(|_| PrometheusBuilder::new());
+        let recorder = builder.build_recorder();
         let handle = recorder.handle();
 
         // Set the process-global recorder. In a normal process this is the FIRST
