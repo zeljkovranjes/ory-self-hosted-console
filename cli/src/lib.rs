@@ -545,7 +545,14 @@ async fn home_menu_or_usage(
                     2 => CheckAction::Config { config: None },
                     _ => CheckAction::Features,
                 };
-                check::run_check(action, api_url, api_key, ui).await?;
+                // WR-03: do NOT use `?` here — the menu is STICKY. A `CheckFailed`
+                // verdict (the COMMON case: something unhealthy) or a transient
+                // error must NOT tear down the menu, and must NOT set the process
+                // exit code (the scriptable exit code is for the non-interactive
+                // `check` subcommand only). Render the error and loop back.
+                if let Err(e) = check::run_check(action, api_url, api_key, ui).await {
+                    ui.status_err(&e.to_string());
+                }
                 // Loop back to the home menu so the operator can do more (the
                 // explicit "Quit" item is the only way out — the menu is sticky).
             }
@@ -558,7 +565,12 @@ async fn home_menu_or_usage(
                     1 => EditAction::Services { config: None },
                     _ => EditAction::Config { config: None },
                 };
-                edit::run_edit(action, api_url, api_key, ui).await?;
+                // WR-03: same sticky-menu discipline — a transient `edit` failure
+                // (e.g. backend briefly unreachable for `edit features`) renders an
+                // error and re-presents the menu rather than exiting the shell.
+                if let Err(e) = edit::run_edit(action, api_url, api_key, ui).await {
+                    ui.status_err(&e.to_string());
+                }
                 // Sticky menu: fall through to the loop and re-present the choices.
             }
             // Day-2 → point the operator at the day-2 verbs (these take args, so we
