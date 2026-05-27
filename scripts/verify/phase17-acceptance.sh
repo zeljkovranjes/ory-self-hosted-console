@@ -610,46 +610,90 @@ else
   _pass "[EVT-03] the sink list response does NOT contain the raw secret value"
 fi
 
-# PII redaction: seed an audit row with a known email, let the fan-out worker emit
-# a delivery, and assert the delivered payload masks the email (domain-only) while
-# carrying the idempotency id. The fan-out reads console_audit_log; a new sink's
-# cursor starts at now(), so we create the sink, THEN write the audit row.
+# PII redaction (CR-01): seed a REAL console_audit_log row using the ACTUAL
+# schema columns (target_type/target_id — NOT a non-existent `target` column), with
+# a known actor email AND a benign-key token + email buried in `metadata`. Let the
+# fan-out worker read it, redact(), and enqueue a delivery, then assert the
+# delivered payload (a) carries the event idempotency UUID, (b) does NOT contain
+# the raw actor email, the benign-key token, or the benign-key email. The INSERT
+# MUST succeed — a failed seed is a HARD FAIL (anti-false-green: redaction is only
+# proven if redact() actually ran end-to-end). The fan-out reads console_audit_log;
+# a new sink's cursor starts at now(), so we create the sink, THEN write the row.
 echo
-echo "--- [EVT-03] a known actor email is PII-redacted in the delivered payload (domain-only) ---"
+echo "--- [EVT-03/CR-01] redact() runs end-to-end: actor email + benign-key token/email are ABSENT from the delivered payload, UUID present ---"
 REDACT_SECRET="$(node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))')"
 REDACT_EMAIL="redact-probe-$$@secret-domain.example"
+# A benign-key (non-secret-named) token + email inside metadata. Under the OLD
+# denylist these leaked; under the CR-01 ALLOWLIST the keys are not allowlisted,
+# so the values must be dropped. Markers are unique per-run.
+REDACT_TOKEN="benignkeytoken-$$-eyJhbGciOiJIUzI1NiJ9.payload.s1g"
+REDACT_META_EMAIL="buried-$$@leak-domain.example"
 REDACT_SINK_ID="$(_psql1 "INSERT INTO event_sinks (name, kind, target, events, secret, enabled)
   VALUES ('phase17-redact', 'webhook', '${ECHO_URL}', ARRAY['identity.created'], '${REDACT_SECRET}', true)
   RETURNING id")"
-# Seed an audit row AFTER the sink (so it is past the sink's now()-seeded cursor).
-sleep 1
-REDACT_AUDIT_ID="$(_psql1 "INSERT INTO console_audit_log (actor_email, action, outcome, target, metadata)
-  VALUES ('${REDACT_EMAIL}', 'identity.created', 'success', 'identity:redact', '{}'::jsonb)
-  RETURNING id" 2>/dev/null)"
-if [ -z "$REDACT_AUDIT_ID" ]; then
-  # Schema variance fallback: some audit shapes use different columns. Probe redaction
-  # via a directly-enqueued delivery whose payload was passed through the same redact
-  # policy is NOT possible from psql; so if the audit insert shape differs, mark the
-  # redaction proof as needing the fan-out and continue (the unit-tested redact() is
-  # the authoritative policy proof — backend/src/events/redact.rs).
-  echo "    (could not seed console_audit_log directly — column shape differs; relying on the fan-out over the real audit stream)"
+if [ -z "$REDACT_SINK_ID" ]; then
+  _fail "[EVT-03/CR-01] could not seed the redaction-probe sink via psql (cannot exercise redact())"
 fi
-# Poll the redact sink's deliveries for the redacted email.
-REDACT_FOUND_RAW=0; REDACT_FOUND_DOMAIN=0
+# Seed an audit row AFTER the sink (so it is past the sink's now()-seeded cursor),
+# using the REAL columns (target_type/target_id) and a metadata blob whose
+# benign-key values MUST be redacted. The INSERT RETURNING id is the proof the
+# row landed — NO `2>/dev/null` swallow, NO silent fallback (anti-false-green).
+sleep 1
+REDACT_META="$(METAT="$REDACT_TOKEN" METAE="$REDACT_META_EMAIL" node -e '
+  const o = { value: process.env.METAT, assertion: process.env.METAT,
+              jwt: process.env.METAT, data: process.env.METAT,
+              param: process.env.METAE, email: process.env.METAE };
+  process.stdout.write(JSON.stringify(o));')"
+REDACT_AUDIT_ID="$(_psql1 "INSERT INTO console_audit_log
+  (actor_email, action, outcome, target_type, target_id, metadata)
+  VALUES ('${REDACT_EMAIL}', 'identity.created', 'success', 'identity', 'redact-$$',
+          '$(printf '%s' "$REDACT_META" | sed "s/'/''/g")'::jsonb)
+  RETURNING id")"
+if [ -z "$REDACT_AUDIT_ID" ]; then
+  _fail "[EVT-03/CR-01] could not seed console_audit_log (real target_type/target_id columns) — redact() is NOT exercised; this is a HARD FAIL, never a silent pass"
+else
+  _pass "[EVT-03/CR-01] seeded a real console_audit_log row (id=$REDACT_AUDIT_ID) with benign-key token/email in metadata — fan-out will redact() it"
+fi
+# Poll the redact sink's deliveries until a row exists, then assert on it.
+REDACT_FOUND_RAW=0; REDACT_FOUND_TOKEN=0; REDACT_FOUND_META_EMAIL=0
+REDACT_HAS_ROW=0; REDACT_HAS_UUID=0; rd_list=""
 for _ in $(seq 1 30); do
   rd_list="$(_body_of "$(_auth_get "${DELIVERIES_URL}?sink_id=${REDACT_SINK_ID}")")"
   if printf '%s' "$rd_list" | grep -qF "$REDACT_EMAIL"; then REDACT_FOUND_RAW=1; fi
-  if printf '%s' "$rd_list" | grep -qF "secret-domain.example" && ! printf '%s' "$rd_list" | grep -qF "$REDACT_EMAIL"; then
-    REDACT_FOUND_DOMAIN=1
-  fi
-  # Stop once we have at least one delivery row for this sink.
-  if printf '%s' "$rd_list" | grep -qE '"id"'; then break; fi
+  if printf '%s' "$rd_list" | grep -qF "$REDACT_TOKEN"; then REDACT_FOUND_TOKEN=1; fi
+  if printf '%s' "$rd_list" | grep -qF "$REDACT_META_EMAIL"; then REDACT_FOUND_META_EMAIL=1; fi
+  # Stop once we have at least one delivery row for this sink (redact() ran).
+  if printf '%s' "$rd_list" | grep -qE '"id"'; then REDACT_HAS_ROW=1; break; fi
   sleep 2
 done
+# A delivery row MUST exist — otherwise redact() never ran (false-green guard).
+if [ "$REDACT_HAS_ROW" = "1" ]; then
+  _pass "[EVT-03/CR-01] the fan-out produced a delivery for the redaction-probe sink (redact() executed end-to-end)"
+else
+  _fail "[EVT-03/CR-01] NO delivery was produced for the redaction-probe sink — redact() was NOT exercised (false-green guard tripped)"
+fi
+# The delivered payload MUST carry the event idempotency UUID (= the audit row id).
+if printf '%s' "$rd_list" | grep -qF "$REDACT_AUDIT_ID"; then
+  _pass "[EVT-03/CR-01] the delivered payload carries the event UUID (= the audit row id; idempotency preserved)"
+else
+  _fail "[EVT-03/CR-01] the delivered payload does NOT carry the audit-row UUID (envelope id missing; body: $(printf '%s' "$rd_list" | head -c 300))"
+fi
+# CR-01: the raw actor email, the benign-key token, and the benign-key email MUST
+# ALL be absent from the delivered payload (allowlist drops non-allowlisted keys).
 if [ "$REDACT_FOUND_RAW" = "1" ]; then
   _fail "[EVT-03] the RAW actor email leaked into a delivered payload (redaction failed!)"
 else
-  _pass "[EVT-03] the raw actor email does NOT appear verbatim in any delivered payload (redacted before enqueue)"
+  _pass "[EVT-03] the raw actor email is ABSENT from the delivered payload (masked before enqueue)"
+fi
+if [ "$REDACT_FOUND_TOKEN" = "1" ]; then
+  _fail "[CR-01] a benign-key token in metadata LEAKED into the delivered payload (denylist regression — allowlist not enforced!)"
+else
+  _pass "[CR-01] the benign-key token in metadata is ABSENT from the delivered payload (allowlist dropped the non-allowlisted key)"
+fi
+if [ "$REDACT_FOUND_META_EMAIL" = "1" ]; then
+  _fail "[CR-01] a benign-key email in metadata LEAKED into the delivered payload (allowlist not enforced!)"
+else
+  _pass "[CR-01] the benign-key email in metadata is ABSENT from the delivered payload (allowlist enforced)"
 fi
 
 echo
