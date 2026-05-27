@@ -220,6 +220,14 @@ pub async fn sso_hint(req: &mut Request, depot: &mut Depot) -> Result<Json<super
     // A known domain with NO linked SSO connection is indistinguishable from an
     // unknown domain (both 404) — no "this org exists but is not SSO-enabled"
     // signal leaks (T-15-16). Only a real provider tenant produces a 200 hint.
-    let provider = found.sso_connection_tenant.ok_or(AppError::NotFound)?;
+    let tenant = found.sso_connection_tenant.ok_or(AppError::NotFound)?;
+    // Surface the KRATOS provider id (`saml-<tenant>`), not the bare connection
+    // tenant. The AX `SsoRouting` affordance keys `providerInitiateUrls` on the
+    // login flow's `oidc` node value, which Kratos stamps as `saml-<tenant>` (the
+    // stable `crate::sso::provider_id`). Returning the bare tenant here would never
+    // match a flow node, so the "Continue with <provider> SSO" link could not
+    // resolve and the user fell through to the dead-end "contact your administrator"
+    // notice — the org-domain→SSO routing was wired but unreachable end-to-end.
+    let provider = crate::sso::provider_id(&tenant);
     Ok(Json(super::SsoHintView { provider }))
 }

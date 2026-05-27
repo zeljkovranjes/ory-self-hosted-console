@@ -71,6 +71,11 @@ pub struct SsoLookupView {
 /// minimum.
 #[derive(Debug, Clone, Serialize)]
 pub struct SsoHintView {
-    /// The SSO connection tenant to route the end-user to (the only field).
+    /// The KRATOS OIDC provider id to route the end-user to (the only field):
+    /// `saml-<tenant>` (the stable `crate::sso::provider_id`), NOT the bare
+    /// connection tenant. The AX `SsoRouting` affordance keys its
+    /// `providerInitiateUrls` map on the login flow's `oidc` node value, which
+    /// Kratos stamps as `saml-<tenant>` — so the hint must speak the same id for
+    /// the "Continue with <provider> SSO" link to resolve end-to-end.
     pub provider: String,
 }
