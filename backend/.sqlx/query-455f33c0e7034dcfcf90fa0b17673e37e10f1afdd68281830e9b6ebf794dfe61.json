@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE event_deliveries\n        SET status = 'failed', updated_at = now()\n        WHERE status = 'delivering' AND updated_at < $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "455f33c0e7034dcfcf90fa0b17673e37e10f1afdd68281830e9b6ebf794dfe61"
+}

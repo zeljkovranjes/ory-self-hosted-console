@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM event_deliveries\n        WHERE status IN ('delivered', 'dead') AND updated_at < $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9580b65bb3666bf035a5695c0a70f29a185fa929e2a566d71ffcdb43cbb6137a"
+}

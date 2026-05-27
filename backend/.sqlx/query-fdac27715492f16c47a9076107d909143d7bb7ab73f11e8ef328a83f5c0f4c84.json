@@ -1,0 +1,191 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE event_sinks\n        SET name = $2, target = $3, subject = $4, events = $5,\n            sasl_username = $6, tls = $7, enabled = $8, updated_at = now()\n        WHERE id = $1\n        RETURNING id, name, kind, target, subject, events, secret, sasl_username,\n                  tls, enabled, last_event_id, last_event_cursor_at,\n                  created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "target",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "target"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "subject",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "events",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "events"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "secret",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "secret"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "sasl_username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "sasl_username"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "tls",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "tls"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "last_event_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "last_event_id"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "last_event_cursor_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "last_event_cursor_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "event_sinks",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "TextArray",
+        "Text",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "fdac27715492f16c47a9076107d909143d7bb7ab73f11e8ef328a83f5c0f4c84"
+}
