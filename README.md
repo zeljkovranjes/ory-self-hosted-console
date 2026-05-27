@@ -1736,6 +1736,92 @@ regression (INFRA-05 / BACK-05 / BACK-01 + the flag-gated route guards).
 
 ---
 
+## Operator CLI (Phase 19) — OPTIONAL
+
+The console ships an **optional** operator CLI, `ory-console` (Docker service
+`cli`). **The stack and every feature work fully without it** — you configure
+everything through `/setup` + the web console + `.env`. The CLI is a convenience
+for scripting/automation, not a requirement.
+
+It is a separate, tiny image (`cli/Dockerfile`, the `console-cli` crate) so the
+backend runtime image stays lean (no CLI code ships in the backend). It joins the
+**internal network only** and publishes **no host port**; it reaches the backend
+at `backend:8080`. It is **profiled** (`profiles: ["cli"]`), so a plain
+`docker compose up` never starts it — you run it one-shot:
+
+```bash
+# Set CONSOLE_API_KEY in your environment / .env first (see below). Git Bash on
+# Windows: prefix MSYS_NO_PATHCONV=1 so leading-slash paths are not mangled.
+
+# ONLINE commands — authenticated HTTP clients of the EXISTING backend routes
+# (Authorization: Api-Key). The CLI is NEVER a second writer: it drives the same
+# routes the console UI does, so it never touches the DB or YAML directly.
+docker compose run --rm cli feature list
+docker compose run --rm cli feature enable saml
+docker compose run --rm cli feature disable saml
+docker compose run --rm cli observability on
+docker compose run --rm cli org add --label "Acme" --domain acme.test
+docker compose run --rm cli sso add-saml --tenant acme --metadata-xml-file /work/meta.xml \
+    --default-redirect-url https://acme.test/cb --redirect-url https://acme.test/cb
+docker compose run --rm cli admin list
+
+# BOOTSTRAP commands — pre-boot writes of gitignored .env/secret files ONLY. Run
+# with the repo root bind-mounted at /work so the CLI can write ./.env. The secret
+# VALUE comes from an env var / a --*-file / an interactive prompt — NEVER argv.
+GITHUB_OAUTH_CLIENT_SECRET=… \
+  docker compose run --rm -e GITHUB_OAUTH_CLIENT_SECRET \
+    -v "$PWD:/work" cli oauth github set --client-id <id> --env-file /work/.env
+docker compose run --rm -v "$PWD:/work" cli rotate secrets session-secret --env-file /work/.env
+```
+
+**Authentication (api-key).** ONLINE commands authenticate with an
+`Authorization: Api-Key <raw>` header — set `CONSOLE_API_KEY` in the environment
+or `.env` to a key issued from the console **API keys** page. The backend handles
+this via a single combined `api_key_or_session` hoop that reuses the hardened
+`verify_api_key` (constant-time compare, revocation enforced): an api-key request
+is **CSRF-exempt** (no browser, no cookie) yet still **audited** (the key owner is
+the actor). The session/cookie path is unchanged — sessions still require a CSRF
+token. A revoked or unknown key is rejected `401` (fail-closed).
+
+**Secret-input rule (hard).** No CLI subcommand ever takes a secret as an argv
+value. Secrets (the api key, GitHub OAuth secret, rotated secrets, the setup
+token) come from an **env var**, a **`--*-file`** path, or an **interactive
+prompt** only — never `--password`/`--secret` on the command line (enforced by a
+clap-introspection test). Bootstrap writes target only **gitignored** paths
+(`.env`, `.env.*`, `secrets/*`); a non-gitignored target is refused.
+
+**Host-binary alternative.** Operators with a Rust toolchain can build the CLI
+natively instead of using the Docker service:
+
+```bash
+cargo build -p ory-console-cli --release   # binary: target/release/ory-console
+CONSOLE_API_URL=http://localhost:8080 CONSOLE_API_KEY=… target/release/ory-console feature list
+```
+
+The optional offline DB-direct admin path (`admin create` / `reset-password`
+without `--via-setup`) is **not** in the default image — rebuild with
+`--features offline-admin` only if you need it (the default build carries no DB
+writer, by design).
+
+**Live acceptance gate** (Git Bash on Windows: prefix `MSYS_NO_PATHCONV=1`):
+
+```bash
+MSYS_NO_PATHCONV=1 bash scripts/verify/phase19-acceptance.sh
+# (the gate does the full build -> up --wait -> drive -> down -v itself;
+#  pass KEEP_STACK=1 to keep the stack up, SKIP_EGRESS=1 to skip the bundle build)
+```
+
+It proves end to end, anti-false-green: the **full feature set works with NO cli
+started** (a prior feature-toggle gate re-runs with no cli present); api-key auth
+(**valid `200` / revoked+invalid `401` / csrf-exempt / audited / session
+unchanged**); a CLI online op **flips a flag through the backend route** (never a
+second writer; default build carries no sqlx); **no argv secret**; a bootstrap
+write lands **only on a gitignored path** (`git check-ignore` matches, secret not
+echoed); plus the INFRA-05 / BACK-05 / BACK-01 + Phase-13..18 invariant
+regression with the cli image present.
+
+---
+
 ## Architecture (Phase 1)
 
 Two Docker networks isolate the stack:
