@@ -153,6 +153,39 @@ describe("useLiveOplValidate (PERM-04)", () => {
     });
   });
 
+  it("maps Keto's CAPITAL `Line` key (live v26.2.0 wire shape) to the marker line", async () => {
+    // The backend passes Keto's :4469 response through verbatim; live Keto
+    // serializes the source position line as `Line` (capital) + `column`
+    // (lowercase). A lowercase-only read would clamp every marker to line 1 —
+    // this locks the real-line mapping (regression caught by the live gate).
+    apiMock.mockResolvedValue({
+      errors: [
+        {
+          message: "expected 'permits' or 'related', got \"this\"",
+          start: { Line: 7, column: 36 },
+          end: { Line: 7, column: 40 },
+        },
+      ],
+    });
+    const { handle, calls } = makeHandle();
+
+    renderHook(() =>
+      useLiveOplValidate({ source: "x", handle, enabled: true }),
+    );
+    await act(async () => {
+      vi.advanceTimersByTime(400);
+      await Promise.resolve();
+    });
+
+    const m = calls()
+      .filter((c) => c.markers.length > 0)
+      .at(-1)?.markers[0] as Record<string, unknown>;
+    expect(m.startLineNumber).toBe(7);
+    expect(m.startColumn).toBe(36);
+    expect(m.endLineNumber).toBe(7);
+    expect(m.endColumn).toBe(40);
+  });
+
   it("clamps missing/<1 positions to 1 and spans end to start+1 when end is missing", async () => {
     apiMock.mockResolvedValue({
       errors: [{ message: "bad", start: { line: 0, column: 0 } }],

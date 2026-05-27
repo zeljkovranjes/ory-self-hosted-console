@@ -30,13 +30,33 @@ import type { editor as MonacoEditorNS } from "monaco-editor";
 
 import { api, ApiError } from "@/lib/api";
 
-// The Keto CheckOplSyntaxResult shape (mirrors the page's PERM-01 types).
-type SourcePosition = { line?: number; column?: number };
+// The Keto CheckOplSyntaxResult shape. The backend passes Keto's :4469 response
+// through VERBATIM (ory/keto.rs validate_opl -> json_of(raw)), and live Keto
+// v26.2.0 serializes the source position's line as a CAPITAL `Line` while the
+// column is lowercase `column` (verified against the running engine in the
+// phase18 acceptance gate). We accept BOTH casings defensively so the marker
+// always lands on the real line (a lowercase-only read clamped every marker to
+// line 1). `column`/`Column` is likewise tolerated.
+type SourcePosition = {
+  Line?: number;
+  line?: number;
+  Column?: number;
+  column?: number;
+};
 type ParseError = {
   message?: string;
   start?: SourcePosition;
   end?: SourcePosition;
 };
+
+/** Read a 1-based line from a SourcePosition tolerating Keto's capital `Line`. */
+function posLine(p: SourcePosition | undefined): number | undefined {
+  return p?.Line ?? p?.line;
+}
+/** Read a 1-based column tolerating either casing. */
+function posColumn(p: SourcePosition | undefined): number | undefined {
+  return p?.Column ?? p?.column;
+}
 type CheckOplSyntaxResult = { errors?: ParseError[] | null };
 
 // A stable, hook-owned marker owner string (distinct from any other diagnostics
@@ -95,13 +115,13 @@ function toMarker(
   err: ParseError,
   errorSeverity: number,
 ): MonacoEditorNS.IMarkerData {
-  const startLineNumber = clampPos(err.start?.line);
-  const startColumn = clampPos(err.start?.column);
-  const endLineNumber = clampPos(err.end?.line ?? err.start?.line);
+  const startLineNumber = clampPos(posLine(err.start));
+  const startColumn = clampPos(posColumn(err.start));
+  const endLineNumber = clampPos(posLine(err.end) ?? posLine(err.start));
   // If end column is missing, span one column past the start so the squiggle is
   // visible (a zero-width marker would not render).
-  const endColumn =
-    err.end?.column != null ? clampPos(err.end.column) : startColumn + 1;
+  const endColRaw = posColumn(err.end);
+  const endColumn = endColRaw != null ? clampPos(endColRaw) : startColumn + 1;
   return {
     startLineNumber,
     startColumn,

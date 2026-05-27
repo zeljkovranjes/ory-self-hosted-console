@@ -351,20 +351,24 @@ if [ "$val_inv_code" = "200" ] && [ -n "$INV_ERRS" ] && [ "$INV_ERRS" != "0" ]; 
 else
   _fail "[PERM-04] POST /opl/validate (invalid) -> code='$val_inv_code' errors='$INV_ERRS' (want 200 + errors; body: $val_inv_body)"
 fi
-# The marker mapping REQUIRES a start position (line/column). Assert at least one
-# error carries a numeric start.line — without it the live hook has nothing to
-# place a squiggle at (anti-false-green: errors with no positions wouldn't prove
-# the marker contract).
+# The marker mapping REQUIRES a start position line (the line the squiggle lands
+# on). Assert at least one error carries a numeric start line — tolerating Keto
+# v26.2.0's CAPITAL `Line` key (verified live: the backend passes the :4469 body
+# through verbatim as {"start":{"Line":N,"column":M}}). The live hook reads both
+# casings; this assertion mirrors that so it can't false-fail on the real shape
+# nor false-pass on a position-less body (anti-false-green).
 HAS_POS="$(_json_field "$val_inv_body" '
   (function(){
     const es = (data.errors)||[];
-    return es.some(e => e && e.start && (typeof e.start.line === "number"))
+    const lineOf = p => p && (typeof p.Line === "number" ? p.Line
+                          : (typeof p.line === "number" ? p.line : undefined));
+    return es.some(e => e && e.start && typeof lineOf(e.start) === "number")
       ? "YES" : "NO";
   })()')"
 if [ "$HAS_POS" = "YES" ]; then
-  _pass "[PERM-04] at least one error carries a numeric start.line (the live marker source data)"
+  _pass "[PERM-04] at least one error carries a numeric start line (Keto 'Line'/'line') — the live marker source data"
 else
-  _fail "[PERM-04] errors[] carry NO start.line position -> the live hook would have no marker location (body: $val_inv_body)"
+  _fail "[PERM-04] errors[] carry NO start line position -> the live hook would have no marker location (body: $val_inv_body)"
 fi
 
 echo
