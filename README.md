@@ -102,6 +102,22 @@ Secrets are always read from an env var / `--*-file` / prompt — never an argv 
 - **Secrets** come from `.env` / secret files and are never logged or sent to the browser.
 - Interoperates with the official `ory` CLI (identity schemas, OAuth2 clients, Keto tuples).
 
+### Database migrations
+
+Migrations run **automatically** — there's no manual step for the normal flow:
+
+- On `docker compose up`, the `kratos-migrate` / `hydra-migrate` / `keto-migrate` one-shot containers apply each Ory service's schema *before* that service starts.
+- The backend applies its own `console`-database migrations (`backend/migrations/`) at boot, before serving — idempotent, so re-running `up` is a no-op.
+
+To start **completely fresh** (wipes all data and re-runs every migration from scratch):
+
+```bash
+docker compose down -v && docker compose up -d --wait
+```
+
+> [!NOTE]
+> **Bring-your-own Postgres:** create the per-service databases and roles on your external instance first (`kratos`, `hydra`, `keto`, `console`, `polis`) — the migrate steps above then apply their schemas to it on the next `up`.
+
 ### Email & SMS
 
 Recovery, verification, and one-time-code sign-in are wired end-to-end. For local development, an opt-in profile ships mail/SMS catchers so the flows work with no external accounts:
