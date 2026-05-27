@@ -69,6 +69,17 @@ default = []
 # OFF by default — pulls in sqlx + argon2 for the offline DB-direct admin
 # create/reset-password path. The default CLI build carries neither (no-second-writer).
 offline-admin = ["dep:sqlx", "dep:argon2", "dep:rand_core"]
+# Phase-20 Wave-0 test-contract gates (NO production dependency — they pull no
+# code; they only un-gate the forward-referenced assertion bodies in
+# `cli/tests/cli_ux.rs`). The bodies reference LOCKED future symbols
+# (`console_cli::ui::*` for Wave 1, `console_cli::check::overall_exit_code` for
+# Wave 3) that do not exist on today's surface, so the assertions are compiled OUT
+# by default and the file builds against today's surface. Once a wave implements
+# its symbols it flips the gate ON (e.g. `cargo test -p ory-console-cli
+# --features wave1 -- --ignored multiselect_defaults_match_current`) to RUN the
+# pre-written contract. Both stay OFF in the default + release builds.
+wave1 = []
+wave3 = []
 
 [dev-dependencies]
 mockito = "1"
