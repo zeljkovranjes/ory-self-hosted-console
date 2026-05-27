@@ -14,6 +14,7 @@ pub mod config;
 pub mod config_edit;
 pub mod db;
 pub mod error;
+pub mod events;
 pub mod features;
 pub mod members;
 pub mod metrics;
