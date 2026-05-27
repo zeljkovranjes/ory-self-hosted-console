@@ -36,6 +36,18 @@ selfservice:
   # `logout.ui_url` — the v26.2.0 schema gives logout no `ui_url` and is
   # additionalProperties:false, so adding it would brick every full-config save.
   # A logout redirect, if ever wanted, uses logout.after.default_browser_return_url.
+  # Self-service METHODS. `password` is on by default; `code` is what drives
+  # account recovery + address verification (and could later power passwordless
+  # login). Enabling it is required for the recovery/verification flows below to
+  # be allowed — without it Kratos answers "recovery is not allowed because it was
+  # disabled" and the AX shows an error page.
+  methods:
+    password:
+      enabled: true
+    code:
+      enabled: true
+      config:
+        lifespan: 15m
   flows:
     login:
       ui_url: http://localhost:3001/auth/login
@@ -45,10 +57,32 @@ selfservice:
       ui_url: http://localhost:3001/settings
     error:
       ui_url: http://localhost:3001/auth/error
+    # Account recovery (password reset): user submits email -> Kratos emails a
+    # one-time code -> user enters it -> sets a new password. `use: code` selects
+    # the code strategy (vs magic link). Requires courier SMTP (below) to deliver.
     recovery:
+      enabled: true
+      use: code
       ui_url: http://localhost:3001/auth/recovery
+    # Address verification: emails a code to confirm ownership of the address
+    # (triggered after registration and from the settings flow).
     verification:
+      enabled: true
+      use: code
       ui_url: http://localhost:3001/auth/verification
+
+# Courier: how Kratos delivers recovery/verification email. Points at the Mailpit
+# DEV catcher (docker-compose `mailpit` service) over plain SMTP on the internal
+# network — `disable_starttls=true` because the catcher does not offer STARTTLS.
+# Captured mail is viewable at http://localhost:8025. For PRODUCTION, replace this
+# with a real SMTP server via the console Email/SMTP page (it rewrites this block
+# and restarts Kratos). Kratos must run with `--watch-courier` (see docker-compose)
+# for queued messages to actually send.
+courier:
+  smtp:
+    connection_uri: smtp://mailpit:1025/?disable_starttls=true
+    from_address: no-reply@ory-console.local
+    from_name: Ory Self-Hosted Console
 
 secrets:
   # PLACEHOLDER 32-char values — Plan 04 overrides via env/.env. Do NOT use in production.

@@ -203,7 +203,11 @@ services:
   kratos:
     image: *kratos-image
     container_name: ory-kratos
-    command: ["serve", "--config", "/etc/config/kratos/kratos.yml"]
+    # --watch-courier: run the mail courier IN-PROCESS so recovery/verification
+    # (and any other) emails queued by Kratos are actually dispatched to SMTP
+    # (the Mailpit catcher below in dev; a real SMTP server in prod). Without it,
+    # messages persist to the courier queue but are never sent.
+    command: ["serve", "--config", "/etc/config/kratos/kratos.yml", "--watch-courier"]
     environment:
       DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@postgres:5432/kratos?sslmode=disable
     volumes:
@@ -223,6 +227,40 @@ services:
     # ax-public: the Account Experience reaches Kratos PUBLIC :4433 here WITHOUT
     # being on `internal` (Phase 15, INFRA-05 / T-15-01 — see networks: ax-public).
     networks: [internal, ax-public]
+
+  # ===========================================================================
+  # Mailpit — DEV mail catcher (SMTP sink + web UI).
+  #
+  # Captures every email Kratos's courier sends (recovery, verification, etc.) so
+  # the self-hosted console works end-to-end out of the box WITHOUT a real mail
+  # provider. SMTP :1025 stays on the internal network (Kratos reaches it as
+  # `mailpit:1025`); the web UI :8025 is host-published so the operator can read
+  # the captured messages (recovery codes/links) at http://localhost:8025.
+  #
+  # NOT a production mail server: it neither encrypts nor forwards. For real
+  # delivery the operator points Kratos at an external SMTP server via the console
+  # Email/SMTP page (it rewrites courier.smtp in kratos.yml + restarts Kratos).
+  # MP_SMTP_AUTH_ACCEPT_ANY + _ALLOW_INSECURE let Kratos send over plain SMTP with
+  # no credentials (matching `smtp://mailpit:1025/?disable_starttls=true`).
+  mailpit:
+    image: axllent/mailpit:v1.21.8
+    container_name: mailpit
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    # internal: Kratos (also on internal) reaches SMTP :1025 here.
+    # edge: carries the host-published web UI :8025 (internal:true has no host
+    # gateway, so the UI port must ride the bridge network).
+    networks: [internal, edge]
 
   # NOTE on Hydra/Keto/Oathkeeper healthchecks (Pitfall 1 — distroless has no
   # shell/curl, and only Kratos ships an in-image `remote status`): each of these
