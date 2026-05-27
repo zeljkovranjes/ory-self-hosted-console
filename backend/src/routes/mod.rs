@@ -29,7 +29,7 @@ use sqlx::PgPool;
 
 use crate::auth::github;
 use crate::auth::login;
-use crate::auth::middleware::{auth_guard, csrf_guard};
+use crate::auth::middleware::{api_key_or_session, csrf_guard};
 use crate::auth::setup;
 use crate::config::Config;
 
@@ -175,6 +175,35 @@ fn pre_auth_limiter() -> impl Handler {
         // the fallback sentinel when unavailable. We never read X-Forwarded-For.
         |req: &mut Request, _: &Depot| Some(req.remote_addr().ip().unwrap_or(FALLBACK_IP)),
         BasicQuota::per_minute(RATE_PER_MINUTE),
+    )
+}
+
+/// Per-connection-IP rate quota for the PROTECTED subtree (Phase 19 / CLI-02,
+/// RESEARCH Pattern 4 / A6). The CLI is a LOW-VOLUME operator tool, so the cap is
+/// generous (120/min) — high enough that a legitimate session-driven console UI
+/// or scripted operator run never trips it, but bounded enough to throttle a
+/// brute-force api-key-guessing loop. Per-connection-IP keying is sufficient
+/// (A6); we deliberately do NOT trust `X-Forwarded-For` (matches the WR-01
+/// pre-auth posture — a forgeable header would let an attacker mint unlimited
+/// buckets and defeat the limit).
+const PROTECTED_RATE_PER_MINUTE: usize = 120;
+
+/// Rate limiter for the PROTECTED subtree entry (Phase 19 / CLI-02). Mirrors
+/// `pre_auth_limiter`'s construction (MokaStore + FixedGuard + direct-connection-
+/// IP closure issuer, XFF NOT trusted) but with a generous quota. It sits on the
+/// WHOLE protected subtree, so it caps BOTH the api-key and the session/browser
+/// path per connection IP — the quota is set high enough that the existing
+/// browser posture is unaffected in practice while a key-guessing flood is
+/// throttled. The same WR-01 known limitation applies (behind Docker NAT the
+/// observed peer can collapse toward one shared bucket — a volume cap, not a
+/// per-attacker isolate; documented in the README threat model).
+fn protected_limiter() -> impl Handler {
+    let store: MokaStore<IpAddr, FixedGuard> = MokaStore::default();
+    RateLimiter::new(
+        FixedGuard::default(),
+        store,
+        |req: &mut Request, _: &Depot| Some(req.remote_addr().ip().unwrap_or(FALLBACK_IP)),
+        BasicQuota::per_minute(PROTECTED_RATE_PER_MINUTE),
     )
 }
 
@@ -355,9 +384,19 @@ pub fn build(
     // failure the session IS present (auth_guard ran first inside call_next), so the
     // probing actor is captured. GET/HEAD/OPTIONS are still not audited. The insert
     // is best-effort and never blocks or fails the user-facing response.
+    // Phase 19 (CLI-02): `api_key_or_session` REPLACES `auth_guard` as the single
+    // combined authenticator (Api-Key OR session). Hoop ORDER is preserved:
+    // `audit_hoop` stays OUTERMOST (response-phase, wraps everything below so a
+    // rejected api-key 401 is still audited with a NULL actor), then the protected
+    // rate limiter (brute-force throttle on the api-key path; per-connection-IP,
+    // generous quota — see `protected_limiter`), then the authenticator, then
+    // `csrf_guard` (no-op for an injected ApiKeyPrincipal, full enforcement for a
+    // session). `FeatureFlagHoop` still runs AFTER on gated routes, so an api-key
+    // request to a flag-OFF route 404s exactly like a session request (Pitfall 6).
     let protected = Router::new()
         .hoop(crate::audit::audit_hoop)
-        .hoop(auth_guard)
+        .hoop(protected_limiter())
+        .hoop(api_key_or_session)
         .hoop(csrf_guard)
         .push(Router::with_path("logout").post(login::logout))
         .push(Router::with_path("api/console/me").get(state::me))
