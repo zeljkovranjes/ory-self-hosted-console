@@ -28,6 +28,14 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 console-core = { path = "../console-core" }
 
+# CLI-builder Wave 2 (CONFIG-TOML): the declarative `console.config.toml` parser.
+# `toml` is the de-facto Rust TOML crate (github.com/toml-rs/toml — the same family
+# cargo itself uses for Cargo.toml). It is PURE-SERDE: no native/build code, no C
+# deps, so it does NOT pull sqlx or any heavy graph into the default CLI build
+# (the no-second-writer `cargo tree` check stays clean). Package-legitimacy note
+# recorded in the Wave-2 SUMMARY (canonical owner, ~646M downloads).
+toml = "0.9"
+
 # The Argon2id hasher + sqlx are pulled in ONLY when the operator opts into the
 # offline DB-direct admin path. Reuses the SAME pins/regime as the backend so the
 # password-hash format is byte-compatible with the console.

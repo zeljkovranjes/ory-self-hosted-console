@@ -26,6 +26,7 @@
 
 pub mod bootstrap;
 pub mod client;
+pub mod config_model;
 pub mod online;
 
 use clap::{Parser, Subcommand};
