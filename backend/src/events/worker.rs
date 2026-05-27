@@ -140,7 +140,10 @@ pub async fn delivery_tick(pool: &PgPool) -> Result<(), AppError> {
 /// error becomes a recorded failure/dead row, never a propagated error (so one bad
 /// delivery cannot abort the batch). Mirrors `webhooks::worker::deliver_one`.
 async fn deliver_one(pool: &PgPool, d: queries::ClaimedEventDelivery, allow_private: bool) {
-    let next_attempt = d.attempt + 1;
+    // WR-01: clamp the recorded attempt so it can never exceed max_attempts (the
+    // DB claim guard `attempt < max_attempts` is now authoritative; this keeps the
+    // stored counter coherent with that cap even if a row was hand-seeded high).
+    let next_attempt = (d.attempt + 1).min(d.max_attempts);
     let is_last = next_attempt >= d.max_attempts;
 
     // Fetch the owning sink (need its kind + credential to build the adapter). A

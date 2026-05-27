@@ -352,6 +352,10 @@ pub async fn claim_due_deliveries(
         WHERE id IN (
             SELECT id FROM event_deliveries
             WHERE status IN ('pending', 'failed') AND next_attempt_at <= now()
+              -- WR-01: authoritative DB-level retry cap. An exhausted row can
+              -- NEVER be re-claimed regardless of the Rust is_last arithmetic, so
+              -- a hand-seeded `attempt >= max_attempts` row cannot retry forever.
+              AND attempt < max_attempts
             ORDER BY next_attempt_at
             FOR UPDATE SKIP LOCKED
             LIMIT $1
@@ -510,6 +514,53 @@ mod tests {
         // A 'dead' row is terminal — not re-claimed.
         let claimed = claim_due_deliveries(&pool, 10).await.unwrap();
         assert!(!claimed.iter().any(|c| c.id == id), "dead row was re-claimed");
+    }
+
+    /// WR-01: a 'failed' row whose attempt has reached max_attempts is NEVER
+    /// re-claimed, even when it is due — the DB-level `attempt < max_attempts`
+    /// guard in claim_due_deliveries is authoritative (independent of the Rust
+    /// is_last arithmetic). A hand-seeded over-cap row cannot retry forever.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn claim_never_reclaims_an_exhausted_failed_row(pool: PgPool) {
+        let sink = make_sink(&pool).await;
+        let id = insert_delivery(&pool, sink, "identity.created", &serde_json::json!({}))
+            .await
+            .unwrap();
+        // Force the row to a DUE 'failed' state at exactly max_attempts (exhausted).
+        sqlx::query!(
+            "UPDATE event_deliveries
+             SET status = 'failed', attempt = max_attempts, next_attempt_at = now()
+             WHERE id = $1",
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let claimed = claim_due_deliveries(&pool, 10).await.unwrap();
+        assert!(
+            !claimed.iter().any(|c| c.id == id),
+            "an exhausted (attempt = max_attempts) failed row must never be re-claimed"
+        );
+
+        // And one still UNDER the cap IS claimable when due.
+        let under = insert_delivery(&pool, sink, "identity.created", &serde_json::json!({}))
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE event_deliveries
+             SET status = 'failed', attempt = max_attempts - 1, next_attempt_at = now()
+             WHERE id = $1",
+            under
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let claimed2 = claim_due_deliveries(&pool, 10).await.unwrap();
+        assert!(
+            claimed2.iter().any(|c| c.id == under),
+            "a due row still under the attempt cap must be claimable"
+        );
     }
 
     /// EVT-02: prune removes a terminal row older than the cutoff, keeps a fresh one.

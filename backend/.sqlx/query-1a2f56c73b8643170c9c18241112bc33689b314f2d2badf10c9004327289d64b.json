@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE event_deliveries\n        SET status = 'delivering', updated_at = now()\n        WHERE id IN (\n            SELECT id FROM event_deliveries\n            WHERE status IN ('pending', 'failed') AND next_attempt_at <= now()\n            ORDER BY next_attempt_at\n            FOR UPDATE SKIP LOCKED\n            LIMIT $1\n        )\n        RETURNING id, sink_id, event, payload, attempt, max_attempts\n        ",
+  "query": "\n        UPDATE event_deliveries\n        SET status = 'delivering', updated_at = now()\n        WHERE id IN (\n            SELECT id FROM event_deliveries\n            WHERE status IN ('pending', 'failed') AND next_attempt_at <= now()\n              -- WR-01: authoritative DB-level retry cap. An exhausted row can\n              -- NEVER be re-claimed regardless of the Rust is_last arithmetic, so\n              -- a hand-seeded `attempt >= max_attempts` row cannot retry forever.\n              AND attempt < max_attempts\n            ORDER BY next_attempt_at\n            FOR UPDATE SKIP LOCKED\n            LIMIT $1\n        )\n        RETURNING id, sink_id, event, payload, attempt, max_attempts\n        ",
   "describe": {
     "columns": [
       {
@@ -84,5 +84,5 @@
       false
     ]
   },
-  "hash": "bc5c470f9088dca6fa7b423520a372a9f8d08ca5b011260449e566b104f5c0f4"
+  "hash": "1a2f56c73b8643170c9c18241112bc33689b314f2d2badf10c9004327289d64b"
 }
