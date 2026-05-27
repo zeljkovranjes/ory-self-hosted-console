@@ -135,6 +135,78 @@ sslmode = "require"
     assert!(!prof.contains("svc-postgres"), "byo postgres drops svc-postgres: {prof}");
 }
 
+/// A BYO-observability SAMPLE flows parse → round-trip → emit and yields the
+/// PROMETHEUS_URL/LOKI_URL/GRAFANA_URL overrides + the observability FEATURE ON,
+/// with NO `observability` compose profile (external backends) and no secret key.
+/// Mirrors the BYO-Postgres pipeline test (quick-260527-k0j).
+#[test]
+fn byo_observability_config_round_trips_emits_urls_no_profile_feature_on() {
+    use console_cli::config_model::ObservabilityMode;
+
+    const BYO_OBS: &str = r#"
+[services.kratos]
+mode = "in-stack"
+
+[observability]
+mode = "byo"
+prometheus_url = "https://prometheus.ext.example"
+loki_url = "https://loki.ext.example"
+grafana_url = "https://grafana.ext.example"
+"#;
+    let cfg = parse_config(BYO_OBS).expect("byo-observability sample parses");
+    assert_eq!(cfg.observability_mode(), ObservabilityMode::Byo);
+
+    // Round-trip lossless + no secret.
+    let serialized = to_toml_string(&cfg).unwrap();
+    assert_eq!(cfg, parse_config(&serialized).unwrap(), "round-trip equal");
+    let lower = serialized.to_ascii_lowercase();
+    assert!(!lower.contains("secret"), "no secret in serialized config: {serialized}");
+    assert!(!lower.contains("password"), "no password: {serialized}");
+
+    // Emit a real .env and assert the 3 URL overrides + no observability profile.
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join(".env");
+    emit_env_from_config(&cfg, &env_path.to_string_lossy()).unwrap();
+    let env = std::fs::read_to_string(&env_path).unwrap();
+
+    for line in [
+        "PROMETHEUS_URL=https://prometheus.ext.example",
+        "LOKI_URL=https://loki.ext.example",
+        "GRAFANA_URL=https://grafana.ext.example",
+    ] {
+        assert!(env.contains(line), "missing `{line}` in:\n{env}");
+    }
+    let prof = env
+        .lines()
+        .find(|l| l.starts_with("COMPOSE_PROFILES="))
+        .expect("a COMPOSE_PROFILES line");
+    assert!(!prof.contains("observability"), "byo → no observability profile: {prof}");
+    // The observability FEATURE is ON (console surfaces work against the externals).
+    assert_eq!(cfg.effective_features().0.get("observability"), Some(&true));
+}
+
+/// The DEFAULT (observability off / absent) emits NO observability artifacts —
+/// byte-identical to today. The guard that the new feature is invisible by default.
+#[test]
+fn default_observability_off_emits_no_urls_or_profile() {
+    let cfg = parse_config(
+        r#"
+[services.kratos]
+mode = "in-stack"
+"#,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join(".env");
+    emit_env_from_config(&cfg, &env_path.to_string_lossy()).unwrap();
+    let env = std::fs::read_to_string(&env_path).unwrap();
+    assert!(!env.contains("PROMETHEUS_URL"), "default → no PROMETHEUS_URL: {env}");
+    assert!(!env.contains("LOKI_URL"), "default → no LOKI_URL: {env}");
+    assert!(!env.contains("GRAFANA_URL"), "default → no GRAFANA_URL: {env}");
+    let prof = env.lines().find(|l| l.starts_with("COMPOSE_PROFILES=")).unwrap();
+    assert!(!prof.contains("observability"), "default → no observability profile: {prof}");
+}
+
 /// A live probe that PASSES (mock 200) does not block; flipping to 503 blocks
 /// unless --skip-checks. Drives the real probe + policy path end-to-end.
 #[tokio::test]
