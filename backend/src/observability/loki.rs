@@ -47,23 +47,38 @@ fn logql_for_intent(intent: &str, service: Option<&str>) -> Option<String> {
         "all" => Some(r#"{job="docker"}"#.to_string()),
         // Error-level lines only (a fixed case-insensitive line filter).
         "errors" => Some(r#"{job="docker"} |~ "(?i)level=error|\"level\":\"error\"""#.to_string()),
-        // Logs for ONE known service — the service token MUST be in the closed
-        // allowlist (no free-form label injection). Built from a constant template
-        // with an allowlisted literal.
+        // Logs for ONE known service. WR-01: Alloy ships container logs by
+        // FILE-TAILING the Docker json-file dir (BACK-05 forbids a second
+        // docker-socket holder), and a json-file line carries ONLY
+        // `{log,stream,time}` — there is NO container name in the line and only the
+        // opaque container ID in the path, so Alloy CANNOT emit a per-service
+        // STREAM label without the socket. A `{service="<svc>"}` selector therefore
+        // matched zero streams (a permanently-dead "By service" tab). Instead we
+        // keep the working `{job="docker"}` stream selector and add a LINE FILTER on
+        // the service-name token. The `svc` value MUST be in the closed allowlist,
+        // so the interpolated value is one of a FIXED set of `[a-z]+`-shaped
+        // literals (never a free-form client substring) — no LogQL operator, quote,
+        // or pipe can appear, preserving the injection-safety the closed allowlist
+        // guarantees. The match is case-insensitive + word-boundary-anchored so a
+        // line that names the service (the common case for the stack's structured
+        // logs) is returned. The acceptance gate drives this path end-to-end
+        // (phase16-acceptance.sh OBS-04 service assertion) so a regression FAILS.
         "service" => {
             let svc = service?;
             if !is_allowed_service(svc) {
                 return None;
             }
-            Some(format!(r#"{{service="{svc}"}}"#))
+            Some(format!(r#"{{job="docker"}} |~ "(?i)\b{svc}\b""#))
         }
         _ => None,
     }
 }
 
-/// CLOSED allowlist of known stack service label values (the only values Alloy
-/// applies as the low-cardinality `service` label). A `service` intent for any
-/// other value is rejected — this is what makes the selector injection-safe.
+/// CLOSED allowlist of known stack service label values. The `service` intent
+/// interpolates the value into a LINE FILTER on `{job="docker"}` (WR-01: Alloy's
+/// file-tail emits no per-service stream label), so only these fixed `[a-z]+`
+/// literals can ever appear in the LogQL — any other value is rejected, which is
+/// what makes the line filter injection-safe.
 fn is_allowed_service(svc: &str) -> bool {
     matches!(
         svc,
@@ -247,14 +262,33 @@ mod tests {
         assert!(logql_for_intent("service", None).is_none());
     }
 
-    /// The allowlisted-service selector is the EXACT constant template with the
-    /// allowlisted literal — no surrounding operator text.
+    /// WR-01: the allowlisted-service query keeps the WORKING `{job="docker"}`
+    /// stream selector (Alloy emits no per-service stream label under file-tail)
+    /// and adds a word-boundary line filter on the allowlisted literal — the only
+    /// client-influenced text is one of the closed `[a-z]+` allowlist values, so no
+    /// LogQL operator/quote/pipe can be injected.
     #[test]
     fn service_selector_is_exact_template() {
         assert_eq!(
             logql_for_intent("service", Some("backend")).unwrap(),
-            r#"{service="backend"}"#
+            "{job=\"docker\"} |~ \"(?i)\\bbackend\\b\""
         );
+    }
+
+    /// WR-01: a `service` value that is NOT in the closed allowlist (e.g. a LogQL
+    /// injection attempt) is rejected before it can reach the line filter, so the
+    /// `{svc}` interpolation can only ever be one of the fixed `[a-z]+` literals.
+    #[test]
+    fn service_line_filter_only_admits_allowlisted_literals() {
+        // Allowlisted -> a `{job="docker"}` stream selector + a line filter (never
+        // a `{service=...}` stream label, which Alloy cannot emit under file-tail).
+        let q = logql_for_intent("service", Some("kratos")).unwrap();
+        assert!(q.starts_with(r#"{job="docker"}"#), "got {q}");
+        assert!(q.contains("|~"), "got {q}");
+        assert!(q.contains("kratos"), "got {q}");
+        // Injection / non-allowlisted values are rejected (None) before interpolation.
+        assert!(logql_for_intent("service", Some(r#"x" |= "secret"#)).is_none());
+        assert!(logql_for_intent("service", Some("backend\" }")).is_none());
     }
 
     #[test]
