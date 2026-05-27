@@ -51,10 +51,12 @@ pub fn read_secret(
         if trimmed.is_empty() {
             return Err(CliError::Io(format!("{label} file {path} is empty")));
         }
+        reject_control_chars(&trimmed, label)?;
         return Ok(trimmed);
     }
     if let Ok(v) = std::env::var(env_var) {
         if !v.is_empty() {
+            reject_control_chars(&v, label)?;
             return Ok(v);
         }
     }
@@ -74,11 +76,27 @@ pub fn read_secret(
         if trimmed.is_empty() {
             return Err(CliError::Io(format!("no {label} provided")));
         }
+        reject_control_chars(&trimmed, label)?;
         return Ok(trimmed);
     }
     Err(CliError::Io(format!(
         "no {label} provided — set {env_var} or pass the matching --*-file path (never an argv value)"
     )))
+}
+
+/// WR-01: reject any value carrying an embedded newline / carriage-return / NUL.
+/// `upsert_env` writes `KEY=value` lines verbatim, so a value with an internal
+/// `\n` (a CRLF-corrupted file, a multi-line paste) would otherwise inject
+/// arbitrary additional `.env` keys (e.g. clobber `POSTGRES_PASSWORD`). We refuse
+/// LOUDLY rather than silently mangle the file. (Trailing `\r`/`\n` is already
+/// stripped by the trims above; this catches the INTERNAL ones.)
+fn reject_control_chars(value: &str, label: &str) -> Result<(), CliError> {
+    if value.contains(['\n', '\r', '\0']) {
+        return Err(CliError::Io(format!(
+            "{label} must not contain newlines or NUL bytes (would corrupt the .env / inject other keys)"
+        )));
+    }
+    Ok(())
 }
 
 /// Upsert a set of `KEY=value` pairs into a `.env`-style file, preserving every
@@ -89,6 +107,24 @@ fn upsert_env(env_file: &str, pairs: &[(&str, &str)]) -> Result<(), CliError> {
         return Err(CliError::Io(format!(
             "refusing to write {env_file}: not a gitignored .env/secret path"
         )));
+    }
+
+    // WR-01 (defense-in-depth): every pair value is written as a verbatim
+    // `KEY=value` line, so a value (or key) carrying a newline / NUL would inject
+    // unrelated env keys. Reject before touching the file — `read_secret` already
+    // guards the secret-bearing values, this also covers non-secret keys/values
+    // (e.g. a client id) routed straight to `upsert_env`.
+    for (k, v) in pairs {
+        if k.contains(['\n', '\r', '\0', '=']) {
+            return Err(CliError::Io(format!(
+                "refusing to write {env_file}: env key contains a newline, NUL, or '='"
+            )));
+        }
+        if v.contains(['\n', '\r', '\0']) {
+            return Err(CliError::Io(format!(
+                "refusing to write {env_file}: value for {k} contains a newline or NUL (would inject other env keys)"
+            )));
+        }
     }
 
     // Read the existing file (absent = start empty).
