@@ -1,8 +1,20 @@
-//! PLACEHOLDER for the optional Ory Console operator CLI.
+//! `ory-console` — the optional Ory Self-Hosted Console operator CLI binary.
 //!
-//! Phase 19 Plan 03 replaces this with the real clap command tree (online HTTP
-//! client of the backend routes + the bootstrap `.env`/secret writer). It exists
-//! now only so the 3-crate workspace resolves and `cargo build --workspace` is
-//! honest while Plans 02/03 are in flight. It depends on NOTHING — adding clap
-//! here is Plan 03's job, which keeps the default backend image lean today.
-fn main() {}
+//! A thin entry point: parse the clap [`Cli`] tree, dispatch via [`console_cli::run`]
+//! (ONLINE HTTP client of the backend routes OR BOOTSTRAP `.env`/secret writer),
+//! and print an operator-safe error to stderr on failure. All real logic lives in
+//! the `console_cli` library crate so the integration tests drive the exact same
+//! dispatch without spawning a process.
+
+use clap::Parser;
+use console_cli::{run, Cli};
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    if let Err(e) = run(cli).await {
+        // The error Display is operator-safe and NEVER contains a secret value.
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
