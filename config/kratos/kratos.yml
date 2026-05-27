@@ -19,7 +19,7 @@ selfservice:
       config:
         lifespan: 15m
     profile:
-      enabled: false
+      enabled: true
   flows:
     login:
       ui_url: http://localhost:3001/auth/login
