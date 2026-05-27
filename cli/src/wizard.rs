@@ -312,7 +312,7 @@ fn opt(s: String) -> Option<String> {
 /// a NON-secret artifact (the model has no secret fields — asserted by the Wave-2
 /// round-trip test), so it is written wherever the operator points `--config-out`
 /// (typically the repo root, tracked or not — it carries no secret to leak).
-fn write_config_out(path: &str, contents: &str) -> Result<(), CliError> {
+pub(crate) fn write_config_out(path: &str, contents: &str) -> Result<(), CliError> {
     std::fs::write(path, contents)
         .map_err(|e| CliError::Io(format!("writing {path}: {e}")))
 }
@@ -326,7 +326,7 @@ fn write_config_out(path: &str, contents: &str) -> Result<(), CliError> {
 /// A secret already present in `.env` is LEFT UNTOUCHED (idempotent re-runs never
 /// rotate a live credential). Generated values use the OS CSPRNG and are NEVER
 /// echoed — only the KEY names that were filled are reported.
-fn generate_missing_secrets(config: &ConsoleConfig, env_file: &str) -> Result<(), CliError> {
+pub(crate) fn generate_missing_secrets(config: &ConsoleConfig, env_file: &str) -> Result<(), CliError> {
     // The required-always + per-service-in-stack secret keys.
     let mut required: Vec<&str> = vec!["POSTGRES_PASSWORD"];
     if config.mode_of("hydra") == ServiceMode::InStack {
