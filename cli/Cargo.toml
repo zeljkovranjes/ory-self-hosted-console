@@ -57,6 +57,26 @@ tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 rustls = { workspace = true }
 
+# Phase 20 (CLI-07 / CLI Operator Experience Redesign): the console-rs terminal-UX
+# stack, routed THROUGH the single `ui` module. The two `default-features = false`
+# trims are LOAD-BEARING for the lean build:
+#   - dialoguer's default `editor` feature → tempfile (+ getrandom/rand_core); we
+#     never launch $EDITOR, so it is dropped. Keeping ONLY `password` gives the
+#     masked Password widget (and pulls `zeroize`, which is DESIRABLE for secret
+#     buffers).
+#   - comfy-table's default `tty` feature → crossterm (+ crossterm_winapi/winapi/
+#     parking_lot); we resolve width via `ui`/`console`, so it is dropped.
+# With those trims all four crates share ONE console-rs terminal backend (no
+# crossterm mix) and the lean gate stays green — `cargo tree -p ory-console-cli`
+# (default features) shows NO sqlx / argon2 / crossterm / openssl / native-tls.
+# All four are HIGH-confidence-legitimate per 20-RESEARCH's Package Legitimacy
+# Audit (canonical console-rs/nukesor repos, ~14–60M downloads, and a real
+# resolve + compile in THIS workspace).
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
+console = "0.16"
+indicatif = "0.18"
+comfy-table = { version = "7", default-features = false }
+
 # The Argon2id hasher + sqlx are pulled in ONLY when the operator opts into the
 # offline DB-direct admin path. Reuses the SAME pins/regime as the backend so the
 # password-hash format is byte-compatible with the console.
