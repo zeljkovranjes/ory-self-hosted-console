@@ -12,9 +12,10 @@
 //! the OFF-by-default `offline-admin` feature so the default CLI is provably never
 //! a second writer of the console DB (T-19-11 / Pitfall 4).
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::Path;
 
+use crate::ui::Prompter;
 use crate::{AdminAction, BootstrapAction, CliError, GithubAction, OauthAction};
 
 /// Filename fragments the bootstrap writer is allowed to target. Every write
@@ -60,19 +61,20 @@ pub fn read_secret(
             return Ok(v);
         }
     }
-    // Interactive fallback. We do NOT echo the prompt'd value back. (A true
-    // no-echo TTY read would need `rpassword`; the RESEARCH gates that crate
-    // behind a checkpoint, so the zero-new-dep default reads a line from stdin
-    // when attached to a terminal and otherwise errors — the secret still never
-    // crosses argv.)
-    let mut stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        eprint!("{label} (input hidden is NOT guaranteed without a TTY tool; paste value): ");
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        std::io::Read::read_to_string(&mut stdin, &mut line)
-            .map_err(|e| CliError::Io(format!("reading {label} from stdin: {e}")))?;
-        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+    // Interactive fallback (Phase 20 / CLI-07 + T-20-SECRET-ECHO): on an attended
+    // terminal we now use the `ui` masked Password widget, so the typed value is
+    // NOT echoed. We gate on BOTH stdout+stderr being attended (the same predicate
+    // `ui::resolve_mode` uses for Rich) so a piped/non-TTY caller can NEVER block on
+    // the widget — it falls through to the clear "set {env}/--*-file" error below.
+    // The file → env → prompt PRECEDENCE above is UNCHANGED; only the prompt UI of
+    // this final branch changed (no new argv flag, no env/file behavior change).
+    let attended = std::io::stdin().is_terminal()
+        && console::user_attended()
+        && console::user_attended_stderr();
+    if attended {
+        let prompter = crate::ui::DialoguerPrompter;
+        let value = prompter.password(&format!("{label} (hidden)"))?;
+        let trimmed = value.trim_end_matches(['\r', '\n']).to_string();
         if trimmed.is_empty() {
             return Err(CliError::Io(format!("no {label} provided")));
         }
