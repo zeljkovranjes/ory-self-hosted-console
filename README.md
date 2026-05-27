@@ -83,20 +83,34 @@ docker compose --profile observability up -d --wait
 
 Then enable the **Observability** feature toggle (Project → Features). Grafana is reachable only through the authenticated backend proxy — never published to the host.
 
+**Local dev — email/SMS capture** (optional, default off):
+
+```bash
+docker compose --profile dev-mail up -d --wait
+```
+
+Brings up the bundled Mailpit + sms-sink catchers so recovery/verification mail and SMS one-time codes are captured locally (read them at http://localhost:8025 and http://localhost:8026). A plain `docker compose up` does **not** start them; in production you point Kratos at a real SMTP server / SMS gateway via the console pages instead (see [Email & SMS delivery](#email--sms-delivery)).
+
 ## Configuration
 
 - Service config (Kratos/Hydra/Keto/Oathkeeper/Polis) is edited **in the console** — it writes the mounted config, validates, and restarts only that service via the broker.
 - Secrets (DB passwords, GitHub OAuth, SMTP/SMS, Polis keys) come from `.env` / secret files and are never logged or sent to the frontend.
 - Ory CLI compatibility: identity schemas, OAuth2 client shapes, and Keto relation tuples interoperate with the official `ory` CLI.
 
-### Email & SMS delivery (works out of the box)
+### Email & SMS delivery
 
-Account recovery (password reset), address verification, and one-time-code sign-in are wired end-to-end with **dev catchers** so the stack works immediately with no external accounts:
+Account recovery (password reset), address verification, and one-time-code sign-in are wired end-to-end. For **local development** the stack ships two **dev catchers** so these flows work immediately with no external accounts — but they run **only under the opt-in `dev-mail` compose profile (default OFF)**:
 
-- **Email → Mailpit.** Kratos's courier sends recovery/verification mail to a bundled [Mailpit](https://mailpit.axllent.org/) catcher. Read the captured messages (and their codes) at **http://localhost:8025**.
-- **SMS → sms-sink.** Kratos POSTs one-time SMS login codes to a tiny bundled HTTP catcher. View captured texts at **http://localhost:8026**. (Sign-in by SMS uses the optional `phone` trait on the identity schema; email keeps password sign-in.)
+```bash
+docker compose --profile dev-mail up -d --wait
+```
 
-**For production**, point Kratos at a real SMTP server and SMS gateway via the console's **Email/SMTP** and **SMS** pages (they rewrite the Kratos `courier` config and restart the service). The dev catchers are not encrypted and do not forward mail/SMS — don't rely on them in production.
+- **Email → Mailpit.** Kratos's courier sends recovery/verification mail to a bundled [Mailpit](https://mailpit.axllent.org/) catcher. While the `dev-mail` profile is up, read the captured messages (and their codes) at **http://localhost:8025**.
+- **SMS → sms-sink.** Kratos POSTs one-time SMS login codes to a tiny bundled HTTP catcher. While the profile is up, view captured texts at **http://localhost:8026**. (Sign-in by SMS uses the optional `phone` trait on the identity schema; email keeps password sign-in.)
+
+Those URLs resolve **only while `--profile dev-mail` is up**. The committed `config/kratos/kratos.yml` courier block points at `mailpit:1025` / `sms-sink:8080` as the dev default, so the catchers light up as soon as you enable the profile.
+
+**Production posture.** A plain `docker compose up` does **NOT** start the catchers — they are unencrypted and do not forward mail/SMS, so they must never run in production. Instead, leave the `dev-mail` profile off and point Kratos at a real SMTP server and SMS gateway via the console's **Email/SMTP** and **SMS** pages (they rewrite the Kratos `courier` config and restart the service). Until you configure a real provider, Kratos's courier has no backend: recovery/verification mail queues but is not delivered, and SMS POSTs fail — that is the expected, documented production posture.
 
 ## Operator CLI (optional)
 
