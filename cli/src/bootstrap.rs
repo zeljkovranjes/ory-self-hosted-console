@@ -63,14 +63,22 @@ pub fn read_secret(
     }
     // Interactive fallback (Phase 20 / CLI-07 + T-20-SECRET-ECHO): on an attended
     // terminal we now use the `ui` masked Password widget, so the typed value is
-    // NOT echoed. We gate on BOTH stdout+stderr being attended (the same predicate
-    // `ui::resolve_mode` uses for Rich) so a piped/non-TTY caller can NEVER block on
-    // the widget — it falls through to the clear "set {env}/--*-file" error below.
+    // NOT echoed.
+    //
+    // CR-01: gate the masked `dialoguer::Password` construction on the resolved
+    // `OutputMode` (== Rich), IDENTICAL to every other widget — so a half-piped
+    // invocation that the process-wide `resolve_mode` already classified as Plain
+    // (e.g. a CI runner with a pty on stdin but a piped stdout, reaching the
+    // orchestrate DB-check path) can NEVER reach a blocking widget here. It falls
+    // through to the clear "set {env}/--*-file" error below. We use
+    // `ui::current_mode()` (the SIDE-EFFECT-FREE mode-only helper, IN-02) so this
+    // gate never re-triggers the global color mutation the single startup
+    // `resolve_mode` call already performed. We also keep the explicit stdin-TTY
+    // check as belt-and-suspenders (a widget needs an attended stdin to read).
     // The file → env → prompt PRECEDENCE above is UNCHANGED; only the prompt UI of
     // this final branch changed (no new argv flag, no env/file behavior change).
-    let attended = std::io::stdin().is_terminal()
-        && console::user_attended()
-        && console::user_attended_stderr();
+    let attended =
+        crate::ui::current_mode() == crate::ui::OutputMode::Rich && std::io::stdin().is_terminal();
     if attended {
         let prompter = crate::ui::DialoguerPrompter;
         let value = prompter.password(&format!("{label} (hidden)"))?;
@@ -515,5 +523,31 @@ mod tests {
         assert!(!is_gitignored_secret_path(".env.example"));
         assert!(!is_gitignored_secret_path("config/kratos/kratos.yml"));
         assert!(!is_gitignored_secret_path("settings.txt"));
+    }
+
+    /// CR-01: on a non-Rich (Plain / piped) path with no `--*-file` and no env var,
+    /// `read_secret` MUST return the clear "set {env}/--*-file" error promptly — it
+    /// must NEVER construct the masked `dialoguer::Password` widget (which would
+    /// block forever waiting on input). The test harness runs with a piped (non-TTY)
+    /// stdout/stderr, so `ui::current_mode()` resolves to Plain here and the gate at
+    /// line ~83 routes to the error branch instead of the widget. (This is the
+    /// orchestrate `read_secret(None, "POSTGRES_PASSWORD", …)` path the
+    /// `non_tty_never_hangs` contract did not previously cover.)
+    #[test]
+    fn read_secret_plain_path_errors_without_constructing_widget() {
+        // Ensure the env var is unset so the prompt branch would otherwise run.
+        std::env::remove_var("POSTGRES_PASSWORD");
+        // Forced-Plain (the test process is non-TTY): no file, no env → the
+        // attended gate is false → the clear error is returned, NOT a hung widget.
+        assert_eq!(crate::ui::current_mode(), crate::ui::OutputMode::Plain);
+        let err = read_secret(None, "POSTGRES_PASSWORD", "POSTGRES_PASSWORD")
+            .expect_err("a Plain/non-TTY read_secret with no file/env must error, not prompt");
+        match err {
+            CliError::Io(msg) => assert!(
+                msg.contains("POSTGRES_PASSWORD") && msg.contains("--*-file"),
+                "the error guides the operator to env/--*-file: {msg}"
+            ),
+            other => panic!("expected CliError::Io, got {other:?}"),
+        }
     }
 }

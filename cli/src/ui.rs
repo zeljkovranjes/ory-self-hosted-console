@@ -65,6 +65,24 @@ pub fn resolve_mode(text_flag: bool) -> OutputMode {
     }
 }
 
+/// Re-derive the [`OutputMode`] WITHOUT the global color side effect of
+/// [`resolve_mode`] (IN-02). Pure: it only reads `console`'s TTY detectors +
+/// `NO_COLOR` and returns the mode, never mutating process-global color state.
+///
+/// Used on hot/secondary paths (e.g. `bootstrap::read_secret`'s interactive
+/// gate, CR-01) that must reproduce `resolve_mode`'s Rich-vs-Plain decision but
+/// MUST NOT churn the global color flags the single startup `resolve_mode` call
+/// already set. The startup call (`Ui::from_flag`) remains the ONE place that
+/// disables colors; this helper only mirrors its classification.
+pub fn current_mode() -> OutputMode {
+    let interactive = console::user_attended() && console::user_attended_stderr();
+    if !interactive || std::env::var_os("NO_COLOR").is_some() {
+        OutputMode::Plain
+    } else {
+        OutputMode::Rich
+    }
+}
+
 /// A tiny holder for the resolved [`OutputMode`] that exposes the rendering
 /// helpers. Construct once (`Ui::new(resolve_mode(text_flag))`) and pass by
 /// reference to the command handlers.
