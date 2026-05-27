@@ -38,6 +38,15 @@
 /secrets/grafana_admin_password
 !/secrets/grafana_admin_password.example
 
+# --- Operator-CLI bootstrap secret files (Phase 19, CLI-04/06) ---
+# The optional `ory-console` CLI BOOTSTRAP mode writes secret files into
+# `/secrets/*` (and `.env`, already ignored above). Ignore the whole runtime
+# secrets dir so no CLI-minted secret can ever be committed; keep the tracked
+# `.example` templates (the operator copies an .example to the real path). The
+# CLI's `is_gitignored_secret_path` guard refuses any target NOT matched here.
+/secrets/*
+!/secrets/*.example
+
 # --- Loki / Alloy runtime data (if a bind mount is ever used) ---
 /config/loki/data/
 
