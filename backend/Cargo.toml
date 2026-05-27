@@ -50,7 +50,7 @@ name = "ory-console-backend"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned per CLAUDE.md (authoritative). Salvo is the operator-mandated web
+# Pinned per the project guide (authoritative). Salvo is the operator-mandated web
 # framework (override of Axum/Actix) — do NOT switch.
 # Feature set (RESEARCH "Installation", corrected against salvo 0.93 feature list):
 # cookie (=> __Host- session cookies), rate-limiter (=> per-IP rate limit on

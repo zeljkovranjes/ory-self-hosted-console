@@ -253,7 +253,7 @@ _auth_mut() {
 _code_of() { printf '%s' "$1" | tail -n1; }
 _body_of() { printf '%s' "$1" | sed '$d'; }
 
-# Pull a JSON field from a body via node (the toolchain is present per CLAUDE.md).
+# Pull a JSON field from a body via node (the toolchain is present per the project guide).
 # Usage: _json_field "<body>" '<js-expr-over-data>'  (prints the result or empty)
 _json_field() {
   printf '%s' "$1" | EXPR="$2" node -e '

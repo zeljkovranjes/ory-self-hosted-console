@@ -25,7 +25,7 @@ members = ["console-core", "backend", "cli"]
 
 # Shared dependency pins hoisted so console-core + backend + cli resolve IDENTICAL
 # versions of the common crates (no drift across the wire boundary). These mirror
-# the backend's existing pins verbatim (CLAUDE.md authoritative). `clap` is the
+# the backend's existing pins verbatim (the project guide authoritative). `clap` is the
 # lone net-new crate (RESEARCH Package Legitimacy Audit — clap 4.6.1, canonical
 # Rust CLI parser, github.com/clap-rs/clap); it is referenced ONLY by the cli
 # member, never by the backend, so the production backend image stays lean.

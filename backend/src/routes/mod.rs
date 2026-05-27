@@ -12,7 +12,7 @@
 //! Pitfall 7: the rate-limit hoop is ONLY on the pre-auth endpoints; the
 //! auth+csrf hoops are ONLY on the protected subtree.
 //!
-//! Rate limit quota: **10 requests/min per connection IP** (Claude's discretion,
+//! Rate limit quota: **10 requests/min per connection IP** (the implementer's discretion,
 //! CONTEXT 5-10/min) keyed off the DIRECT connection IP. `X-Forwarded-For` is
 //! deliberately NOT trusted (threat T-02-23 / Pitfall 7) — a future reverse
 //! proxy phase must revisit this.

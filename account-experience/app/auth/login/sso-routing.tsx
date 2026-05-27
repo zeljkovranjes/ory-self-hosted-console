@@ -6,7 +6,7 @@ import { lookupSsoHint } from "@/lib/sso-lookup"
 // =============================================================================
 // AX login org-domain->SSO routing affordance (AX-01 / SSO-06 surfacing).
 //
-// CLIENT component layered ABOVE the Elements <Login> flow. UX (Claude's
+// CLIENT component layered ABOVE the Elements <Login> flow. UX (the implementer's
 // discretion per the plan — inline-on-blur detection): the operator's end-user
 // types their email; on blur (debounced) we ask the AX server route for a domain
 // ->SSO provider hint. If the domain maps to an org's linked SSO connection, we

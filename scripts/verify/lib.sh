@@ -14,7 +14,7 @@
 # on the explicit failure/403 outcome, never on absence of output).
 #
 # Helpers parse `docker compose ... --format json` with `node` (Node toolchain
-# is confirmed present per CLAUDE.md) and fall back to `jq` if node is absent.
+# is confirmed present per the project guide) and fall back to `jq` if node is absent.
 # No secrets are echoed; POSTGRES_USER is read from env with a sensible default.
 # -----------------------------------------------------------------------------
 
@@ -707,7 +707,7 @@ wait_container_healthy() {
 
 # --- _file_digest <path> -----------------------------------------------------
 # sha256 of a file's bytes (empty if absent). Prefers sha256sum, then openssl,
-# then node (always present per CLAUDE.md).
+# then node (always present per the project guide).
 _file_digest() {
   local path="$1"
   if [ ! -f "$path" ]; then printf ''; return 0; fi
