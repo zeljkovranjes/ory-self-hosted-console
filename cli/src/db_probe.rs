@@ -285,6 +285,50 @@ mod tests {
         assert!(!uses_tls(&t.sslmode), "in-stack default → NoTls");
     }
 
+    /// LIVE back-to-back check (IUX-BYO-PG verification). Gated on env so it only
+    /// runs inside the compose internal network where `postgres:5432` resolves;
+    /// it issues `SELECT 1` ONLY (non-destructive — no writes, no schema changes).
+    ///   IUX_LIVE_PG_HOST / _PORT / _USER / _PASSWORD / _DB describe the reachable
+    ///   target. PASS = SELECT 1 ok; FAIL = a bad password yields ok=false with a
+    ///   secret-free detail; SKIP semantics are exercised by the orchestrate policy
+    ///   tests (should_block + --skip-checks) above.
+    #[tokio::test]
+    async fn live_select_1_pass_and_fail_against_reachable_postgres() {
+        let host = match std::env::var("IUX_LIVE_PG_HOST") {
+            Ok(h) if !h.is_empty() => h,
+            _ => {
+                eprintln!("SKIP live DB check: IUX_LIVE_PG_HOST unset");
+                return;
+            }
+        };
+        let port: u16 = std::env::var("IUX_LIVE_PG_PORT").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(5432);
+        let user = std::env::var("IUX_LIVE_PG_USER").unwrap_or_else(|_| "kratos".into());
+        let db = std::env::var("IUX_LIVE_PG_DB").unwrap_or_else(|_| "kratos".into());
+        let password = std::env::var("IUX_LIVE_PG_PASSWORD").unwrap_or_default();
+        let sslmode = std::env::var("IUX_LIVE_PG_SSLMODE").unwrap_or_else(|_| "disable".into());
+
+        // (a) PASS — correct credentials → SELECT 1 ok.
+        let ok_target = DbCheckTarget {
+            host: host.clone(), port, db: db.clone(), user: user.clone(),
+            sslmode: sslmode.clone(), password: password.clone(),
+        };
+        let ok = check(&ok_target, DEFAULT_DB_TIMEOUT).await;
+        println!("LIVE PASS: ok={} detail={}", ok.ok, ok.detail);
+        assert!(ok.ok, "SELECT 1 must succeed against the reachable postgres: {}", ok.detail);
+
+        // (b) FAIL — wrong password → ok=false, secret-free diagnostic.
+        let bad_target = DbCheckTarget {
+            host, port, db, user,
+            sslmode, password: "DEFINITELY_WRONG_PW_zzz".into(),
+        };
+        let bad = check(&bad_target, DEFAULT_DB_TIMEOUT).await;
+        println!("LIVE FAIL: ok={} detail={}", bad.ok, bad.detail);
+        assert!(!bad.ok, "a wrong password must fail");
+        assert!(!bad.detail.contains("DEFINITELY_WRONG_PW_zzz"), "detail must be secret-free: {}", bad.detail);
+        assert!(!bad.target_display.contains("DEFINITELY_WRONG_PW_zzz"));
+    }
+
     #[test]
     fn target_from_config_byo_uses_overrides() {
         let cfg = crate::config_model::parse_config(
