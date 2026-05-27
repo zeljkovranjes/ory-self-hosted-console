@@ -22,6 +22,7 @@
 
 pub mod queries;
 pub mod routes;
+pub mod service_seed;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -39,8 +40,16 @@ pub struct FeatureMeta {
 }
 
 /// The canonical known-flag set: key → label + `requires_runtime`. Kept in
-/// lockstep with the `0007` migration seed. Only `observability` requires a
-/// runtime profile in this milestone.
+/// lockstep with the migration seeds (`0007` v2 features + `0010` the four
+/// service-domain flags). Only `observability` requires a runtime profile in
+/// this milestone.
+///
+/// CLI-builder (SVC-SELECT): the four service-domain flags (`identities`,
+/// `oauth2`, `permissions`, `access_rules`) gate the v1 Ory routes so a service
+/// set `off` cascades into a server-side 404 + nav-hide. They are seeded ON
+/// (migration `0010`) — `saml` (Polis) already exists in the `0007` set and is
+/// the Polis cascade target. `requires_runtime: false`: turning one ON does not
+/// itself require a compose profile here (the cascade-OFF is the runtime link).
 pub const FEATURE_META: &[(&str, FeatureMeta)] = &[
     ("saml", FeatureMeta { label: "SAML Sign-In", requires_runtime: false }),
     ("organizations", FeatureMeta { label: "Organizations", requires_runtime: false }),
@@ -48,6 +57,11 @@ pub const FEATURE_META: &[(&str, FeatureMeta)] = &[
     ("observability", FeatureMeta { label: "Observability", requires_runtime: true }),
     ("event_streams", FeatureMeta { label: "Event Streams", requires_runtime: false }),
     ("opl_live_validation", FeatureMeta { label: "Live OPL Validation", requires_runtime: false }),
+    // CLI-builder service-domain flags (seeded ON, migration 0010).
+    ("identities", FeatureMeta { label: "Identities & Sessions", requires_runtime: false }),
+    ("oauth2", FeatureMeta { label: "OAuth2 Clients", requires_runtime: false }),
+    ("permissions", FeatureMeta { label: "Permissions", requires_runtime: false }),
+    ("access_rules", FeatureMeta { label: "Access Rules", requires_runtime: false }),
 ];
 
 /// Look up the static metadata for a flag key, if it is a known feature.
@@ -245,5 +259,24 @@ mod tests {
         assert_eq!(meta_for("saml").unwrap().requires_runtime, false);
         assert_eq!(meta_for("opl_live_validation").unwrap().label, "Live OPL Validation");
         assert!(meta_for("nonexistent").is_none());
+    }
+
+    /// CLI-builder (SVC-SELECT): the four service-domain flags are KNOWN to
+    /// `meta_for` (so the toggle PUT accepts them + the GET /features contract
+    /// includes them for the nav requiresFlag), each with `requires_runtime:
+    /// false` and the expected label. Kept in lockstep with the `0010` seed.
+    #[test]
+    fn service_domain_flags_are_in_feature_meta() {
+        let cases = [
+            ("identities", "Identities & Sessions"),
+            ("oauth2", "OAuth2 Clients"),
+            ("permissions", "Permissions"),
+            ("access_rules", "Access Rules"),
+        ];
+        for (key, label) in cases {
+            let m = meta_for(key).unwrap_or_else(|| panic!("{key} must be a known flag"));
+            assert_eq!(m.label, label, "{key} label");
+            assert!(!m.requires_runtime, "{key} requires_runtime must be false");
+        }
     }
 }

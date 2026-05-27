@@ -79,6 +79,17 @@ async fn main() -> Result<(), AppError> {
     let flags = ory_console_backend::features::FeatureFlags::load(&pool).await?;
     tracing::info!("feature-flag cache loaded");
 
+    // CLI-builder (SVC-SELECT / CASCADE): env-driven boot reconcile of the
+    // service-domain flags. Runs AFTER the flag cache load and BEFORE serve so
+    // the cascade-off is enforced from the very first request (fail-closed boot).
+    // For each Ory service set `off` via CONSOLE_SERVICE_* it forces the
+    // dependent flag OFF in both the persisted table (survives a restart) and the
+    // in-process cache; `in-stack`/`byo` leave the flag untouched (BYO keeps the
+    // feature ON, pointing the admin URL at the external instance). It ONLY ever
+    // forces a flag OFF — never widens access (T-CB-A02).
+    ory_console_backend::features::service_seed::reconcile_service_flags(&pool, &flags).await?;
+    tracing::info!("service-domain feature flags reconciled from CONSOLE_SERVICE_* env");
+
     // Phase 16 (OBS-02): install the process-global Prometheus recorder ONCE,
     // AFTER the flag cache load and BEFORE serve, so the `GET /metrics` handler
     // (mounted internal-only in `routes::build`) has a live render handle the
