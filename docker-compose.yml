@@ -571,6 +571,18 @@ services:
       BACKEND_BIND_ADDR: 0.0.0.0:8080
       # Single Ory base URL + admin credential bootstrap contract (INFRA-06).
       ORY_BASE_URL: ${ORY_BASE_URL:-http://oathkeeper:4455}
+      # CLI-builder (SVC-SELECT / CASCADE): the per-service selection mode the
+      # backend reads at boot (features::service_seed::reconcile_service_flags).
+      # Each defaults to `in-stack` (feature ON). Set one to `off` (and drop its
+      # svc-* profile from COMPOSE_PROFILES) to cascade-disable that service's
+      # console feature SERVER-SIDE (route 404 + nav hidden); `byo` keeps the
+      # feature ON and points the matching *_ADMIN_URL at an external instance.
+      # The wizard rewrites these in .env; only `off` ever forces a flag off.
+      CONSOLE_SERVICE_KRATOS: ${CONSOLE_SERVICE_KRATOS:-in-stack}
+      CONSOLE_SERVICE_HYDRA: ${CONSOLE_SERVICE_HYDRA:-in-stack}
+      CONSOLE_SERVICE_KETO: ${CONSOLE_SERVICE_KETO:-in-stack}
+      CONSOLE_SERVICE_OATHKEEPER: ${CONSOLE_SERVICE_OATHKEEPER:-in-stack}
+      CONSOLE_SERVICE_POLIS: ${CONSOLE_SERVICE_POLIS:-in-stack}
       # Phase 3 (BACK-02 / INFRA-05): per-service Ory ADMIN base URLs. Internal
       # service-name DNS on the `internal` network ONLY — these admin ports are
       # never host-published (no `ports:` entry on the Ory services). They carry
