@@ -27,14 +27,18 @@ pub fn build_test_router(pool: PgPool) -> Router {
 }
 
 /// Build a [`FeatureFlags`](ory_console_backend::features::FeatureFlags) cache
-/// matching the `0007` migration seed (Phase 12 FLAG-01/04). The `#[sqlx::test]`
-/// harness applies `0007` to the temp DB, so the seeded enabled state is known
-/// statically: external-setup features OFF, `opl_live_validation` ON. Building the
-/// cache from this canonical seed (instead of an async DB read) keeps
-/// `build_test_router` synchronous — and stays consistent with the binary because
-/// toggles in the tests go through the PUT route, which refreshes THIS same cache
-/// instance held by the router. The keystone probe is gated by `saml` (OFF here),
-/// so a flag-OFF request 404s and a PUT-toggle ON makes it 200.
+/// matching the `0007` + `0010` migration seeds (Phase 12 FLAG-01/04 +
+/// CLI-builder SVC-SELECT). The `#[sqlx::test]` harness applies both seeds to the
+/// temp DB, so the seeded enabled state is known statically: external-setup
+/// features OFF, `opl_live_validation` ON, and the four service-domain flags
+/// (identities/oauth2/permissions/access_rules) seeded ON (services on by
+/// default). Building the cache from this canonical seed (instead of an async DB
+/// read) keeps `build_test_router` synchronous — and stays consistent with the
+/// binary because toggles in the tests go through the PUT route, which refreshes
+/// THIS same cache instance held by the router. The keystone probe is gated by
+/// `saml` (OFF here), so a flag-OFF request 404s and a PUT-toggle ON makes it 200;
+/// the v1 Ory routes are gated by the service-domain flags (ON here, so they
+/// reach their handler; a PUT-toggle OFF makes them 404 — the cascade).
 pub fn seeded_test_flags() -> ory_console_backend::features::FeatureFlags {
     use std::collections::HashMap;
     let mut map = HashMap::new();
@@ -44,6 +48,11 @@ pub fn seeded_test_flags() -> ory_console_backend::features::FeatureFlags {
     map.insert("observability".to_string(), false);
     map.insert("event_streams".to_string(), false);
     map.insert("opl_live_validation".to_string(), true);
+    // CLI-builder service-domain flags (seeded ON, migration 0010).
+    map.insert("identities".to_string(), true);
+    map.insert("oauth2".to_string(), true);
+    map.insert("permissions".to_string(), true);
+    map.insert("access_rules".to_string(), true);
     ory_console_backend::features::FeatureFlags::from_map(map)
 }
 

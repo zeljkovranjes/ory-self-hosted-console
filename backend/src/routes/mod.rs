@@ -498,17 +498,26 @@ pub fn build(
         // echoes it, no new wiring). List replaces the Phase-3 first-page proof
         // with the Link-header keyset cursor; import is the CLI-compatible
         // bulk-import endpoint (bare-array -> batch wrapper, 1000/200 limits).
+        // CLI-builder (SVC-SELECT / CASCADE): every v1 Kratos route subtree is now
+        // gated by `FeatureFlagHoop::new("identities")` (seeded ON; forced OFF by
+        // the boot reconcile when CONSOLE_SERVICE_KRATOS=off). Mounted INSIDE the
+        // protected subtree AFTER auth/csrf, so a Kratos-off request 404s even with
+        // a valid session + matching CSRF token (FLAG-01 keystone / T-CB-A01),
+        // matching the saml/organizations/observability precedent.
         .push(
             Router::with_path("api/kratos/identities")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::ory::kratos::list_identities) // IDENT-01 list (cursor)
                 .post(crate::ory::kratos::create_identity), // IDENT-02 create
         )
         .push(
             Router::with_path("api/kratos/identities/import")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .post(crate::ory::kratos::batch_import), // IDENT-04 bulk import
         )
         .push(
             Router::with_path("api/kratos/identities/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::ory::kratos::get_identity) // IDENT-01 detail
                 .put(crate::ory::kratos::update_identity) // IDENT-02 update (state required)
                 .delete(crate::ory::kratos::delete_identity), // IDENT-02 delete
@@ -522,19 +531,23 @@ pub fn build(
         // all-sessions delete (Pitfall 4). Courier is read-only — list + get only.
         .push(
             Router::with_path("api/kratos/sessions")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::ory::kratos::list_sessions), // ACT-01 list (active filter + cursor)
         )
         .push(
             Router::with_path("api/kratos/sessions/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::ory::kratos::get_session) // ACT-01 detail (identity + devices)
                 .delete(crate::ory::kratos::disable_session), // ACT-01 revoke (CSRF-guarded)
         )
         .push(
             Router::with_path("api/kratos/courier/messages")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::ory::kratos::list_courier_messages), // ACT-02 list (status/recipient)
         )
         .push(
             Router::with_path("api/kratos/courier/messages/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::ory::kratos::get_courier_message), // ACT-02 detail (read-only)
         )
         // Phase 10 (BRAND-03) console-OWNED branding asset store. This is a
@@ -566,13 +579,19 @@ pub fn build(
         // with the Hydra Link-header cursor; update PUTs the full object with
         // `client_secret=None` so an edit can never blank the stored secret
         // (#2869 / T-08-SECRET); GET/list strip the secret (T-08-LEAK).
+        // CLI-builder (SVC-SELECT / CASCADE): the v1 Hydra route subtrees are gated
+        // by `FeatureFlagHoop::new("oauth2")` (forced OFF when CONSOLE_SERVICE_HYDRA
+        // =off). Mounted AFTER auth/csrf — a Hydra-off request 404s past a valid
+        // session + CSRF (FLAG-01 / T-CB-A01).
         .push(
             Router::with_path("api/hydra/clients")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .get(crate::ory::hydra::list_clients) // OAUTH2-01 list (cursor)
                 .post(crate::ory::hydra::create_client), // OAUTH2-01 create (one-time secret)
         )
         .push(
             Router::with_path("api/hydra/clients/{id}")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .get(crate::ory::hydra::get_client) // OAUTH2-01 detail (secret masked)
                 .put(crate::ory::hydra::update_client) // OAUTH2-01 update (#2869 preserve)
                 .delete(crate::ory::hydra::delete_client), // OAUTH2-01 delete
@@ -588,22 +607,27 @@ pub fn build(
         // `map_hydra_err` (no 500/leak, T-08-ERRLEAK).
         .push(
             Router::with_path("api/hydra/oauth2/introspect")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .post(crate::ory::hydra::introspect_token), // OAUTH2-02 introspect
         )
         .push(
             Router::with_path("api/hydra/oauth2/revoke")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .post(crate::ory::hydra::revoke_token), // OAUTH2-02 revoke (CSRF-guarded)
         )
         .push(
             Router::with_path("api/hydra/oauth2/login")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .get(crate::ory::hydra::get_login_request), // OAUTH2-02 flow lookup (read-only)
         )
         .push(
             Router::with_path("api/hydra/oauth2/consent")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .get(crate::ory::hydra::get_consent_request), // OAUTH2-02 flow lookup (read-only)
         )
         .push(
             Router::with_path("api/hydra/oauth2/logout")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .get(crate::ory::hydra::get_logout_request), // OAUTH2-02 flow lookup (read-only)
         )
         // Phase 9 (PERM-02 / PERM-03) Keto relation-tuple data path. All inherit
@@ -612,8 +636,13 @@ pub fn build(
         // (T-9-csrf — `lib/api.ts` echoes it, no new wiring). Replaces the Phase-3
         // first-page proof slice with cursor + server-side filters. Create/delete
         // route to keto_write (:4467); list routes to keto_read (:4466).
+        // CLI-builder (SVC-SELECT / CASCADE): the v1 Keto route subtrees are gated
+        // by `FeatureFlagHoop::new("permissions")` (forced OFF when
+        // CONSOLE_SERVICE_KETO=off). Mounted AFTER auth/csrf — a Keto-off request
+        // 404s past a valid session + CSRF (FLAG-01 / T-CB-A01).
         .push(
             Router::with_path("api/keto/relationships")
+                .hoop(crate::features::FeatureFlagHoop::new("permissions"))
                 .get(crate::ory::keto::list_relationships) // PERM-02/03 list+query (READ :4466)
                 .post(crate::ory::keto::create_relationship) // PERM-02 create (WRITE :4467)
                 .delete(crate::ory::keto::delete_relationship), // PERM-02 delete (WRITE :4467)
@@ -621,12 +650,24 @@ pub fn build(
         // PERM-03 check + expand — READ path (keto_read :4466), GET (csrf-exempt,
         // read-only). check uses check_permission (200+{allowed}, never the
         // deny-as-error variant — T-9-deny-vs-error).
-        .push(Router::with_path("api/keto/check").get(crate::ory::keto::check_permission))
-        .push(Router::with_path("api/keto/expand").get(crate::ory::keto::expand_permission))
+        .push(
+            Router::with_path("api/keto/check")
+                .hoop(crate::features::FeatureFlagHoop::new("permissions"))
+                .get(crate::ory::keto::check_permission),
+        )
+        .push(
+            Router::with_path("api/keto/expand")
+                .hoop(crate::features::FeatureFlagHoop::new("permissions"))
+                .get(crate::ory::keto::expand_permission),
+        )
         // PERM-01 OPL syntax-validate passthrough — OPL path (keto_opl :4469),
         // POST (csrf-guarded). Validate ONLY; never writes a file. The 09-02
         // Permission-Model editor calls this before the gated file write.
-        .push(Router::with_path("api/keto/opl/validate").post(crate::ory::keto::validate_opl))
+        .push(
+            Router::with_path("api/keto/opl/validate")
+                .hoop(crate::features::FeatureFlagHoop::new("permissions"))
+                .post(crate::ory::keto::validate_opl),
+        )
         // Phase 9 (PERM-01): the Permission-Model (OPL/namespaces) editor. A
         // DEDICATED route (NOT the {service}/{section} allowlist) so it can only
         // read/write the OPL FILE (config/keto/namespaces.ts), never an arbitrary
@@ -639,6 +680,7 @@ pub fn build(
         // `auth_guard` (401 unauth).
         .push(
             Router::with_path("api/keto/permission-model")
+                .hoop(crate::features::FeatureFlagHoop::new("permissions"))
                 .get(crate::config_edit::routes::get_permission_model)
                 .put(crate::config_edit::routes::put_permission_model),
         )
@@ -653,8 +695,15 @@ pub fn build(
         // read-only `api/oathkeeper/rules` list below (that lists via the api_api;
         // this edits the file). PUT is state-changing so `csrf_guard` enforces
         // `X-CSRF-Token` (403 — T-9-csrf-file); both inherit `auth_guard` (401).
+        // CLI-builder (SVC-SELECT / CASCADE): the dedicated Oathkeeper rules-file
+        // editor is gated by `FeatureFlagHoop::new("access_rules")` (forced OFF when
+        // CONSOLE_SERVICE_OATHKEEPER=off). Mounted AFTER auth/csrf — an Oathkeeper-
+        // off request 404s past a valid session + CSRF (FLAG-01 / T-CB-A01). This is
+        // a DEDICATED route (not the shared {service}/{section} engine), so the hoop
+        // is safe to attach directly.
         .push(
             Router::with_path("api/config/oathkeeper/rules")
+                .hoop(crate::features::FeatureFlagHoop::new("access_rules"))
                 .get(crate::config_edit::routes::get_oathkeeper_rules)
                 .put(crate::config_edit::routes::put_oathkeeper_rules),
         )
@@ -662,7 +711,11 @@ pub fn build(
         // api_api (:4456) — exercises the 4th crate end-to-end and is RETAINED for
         // the 09-04 post-restart list confirmation. Distinct from the file editor
         // above (`api/config/oathkeeper/rules`), which writes the rules FILE.
-        .push(Router::with_path("api/oathkeeper/rules").get(crate::ory::oathkeeper::list_rules))
+        .push(
+            Router::with_path("api/oathkeeper/rules")
+                .hoop(crate::features::FeatureFlagHoop::new("access_rules"))
+                .get(crate::ory::oathkeeper::list_rules),
+        )
         // Phase 4 (BACK-04 / BACK-06): the config-edit API. GET reads current
         // allowlisted values; PUT runs the full transactional flow. Both inherit
         // `auth_guard` (401) by sitting here; PUT is state-changing so `csrf_guard`
@@ -683,6 +736,7 @@ pub fn build(
         // (403); both inherit `auth_guard` (401 unauth).
         .push(
             Router::with_path("api/config/hydra/pairwise-salt")
+                .hoop(crate::features::FeatureFlagHoop::new("oauth2"))
                 .get(crate::config_edit::routes::get_pairwise_salt)
                 .put(crate::config_edit::routes::put_pairwise_salt),
         )
@@ -843,6 +897,7 @@ pub fn build(
         // inherit `auth_guard` (401 unauth, T-06-13).
         .push(
             Router::with_path("api/kratos/identity-schema")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::ory::kratos::get_active_schema)
                 .put(crate::config_edit::routes::put_identity_schema),
         )
@@ -857,6 +912,7 @@ pub fn build(
         // enforces `X-CSRF-Token` (403); both inherit `auth_guard` (401 unauth).
         .push(
             Router::with_path("api/kratos/smtp-connection")
+                .hoop(crate::features::FeatureFlagHoop::new("identities"))
                 .get(crate::config_edit::routes::get_smtp_connection)
                 .put(crate::config_edit::routes::put_smtp_connection),
         )

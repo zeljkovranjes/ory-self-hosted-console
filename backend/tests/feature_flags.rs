@@ -105,6 +105,65 @@ async fn flag_on_serves_route(pool: PgPool) {
     assert!(body.contains("probe"), "the probe handler ran: {body}");
 }
 
+// --- CLI-builder cascade: v1 Ory routes are FeatureFlagHoop-gated ---------------
+
+/// SVC-SELECT / CASCADE (T-CB-A01/A03): a representative v1 route for each of the
+/// four service domains is now FeatureFlagHoop-gated. Seeded ON, an authenticated
+/// GET reaches the handler (so it does NOT 404 at the gate — it may 502 because no
+/// live Ory service backs the test router, but that proves the gate FELL THROUGH).
+/// After toggling the service-domain flag OFF via the management PUT, the SAME
+/// authenticated GET returns 404 — the cascade closed the route server-side past a
+/// valid session. This is the per-service analog of the FLAG-01 keystone.
+#[sqlx::test(migrations = "./migrations")]
+async fn v1_ory_routes_cascade_404_when_service_flag_off(pool: PgPool) {
+    common::seed_admin(&pool, "owner@example.com", "a-very-long-password").await;
+    let service = Service::new(common::build_test_router(pool.clone()));
+    let (raw, csrf) = login_and_get_session(&service, &pool).await;
+
+    // (route, flag-key) — one representative GET per service domain.
+    let cases = [
+        ("api/kratos/identities", "identities"),
+        ("api/hydra/clients", "oauth2"),
+        ("api/keto/relationships", "permissions"),
+        ("api/oathkeeper/rules", "access_rules"),
+    ];
+
+    for (route, flag) in cases {
+        // Seeded ON: the authenticated GET passes the gate and reaches the handler.
+        // A live Ory service is absent in the test router, so the handler surfaces a
+        // 502 (Upstream) — the point is it is NOT the gate's 404.
+        let on = TestClient::get(format!("http://127.0.0.1:8080/{route}"))
+            .add_header("Cookie", format!("console_session={raw}"), true)
+            .send(&service)
+            .await;
+        assert_ne!(
+            on.status_code,
+            Some(StatusCode::NOT_FOUND),
+            "{route}: with {flag} ON the route must NOT 404 at the gate (got past it)"
+        );
+
+        // Toggle the service-domain flag OFF (refreshes the router-held cache).
+        let put = TestClient::put(format!("http://127.0.0.1:8080/api/console/features/{flag}"))
+            .add_header("Cookie", format!("console_session={raw}"), true)
+            .add_header("X-CSRF-Token", csrf.clone(), true)
+            .json(&serde_json::json!({ "enabled": false }))
+            .send(&service)
+            .await;
+        assert_eq!(put.status_code, Some(StatusCode::OK), "toggle {flag} OFF");
+
+        // Now the SAME authenticated GET 404s — the cascade closed the route.
+        let off = TestClient::get(format!("http://127.0.0.1:8080/{route}"))
+            .add_header("Cookie", format!("console_session={raw}"), true)
+            .send(&service)
+            .await;
+        assert_eq!(
+            off.status_code,
+            Some(StatusCode::NOT_FOUND),
+            "{route}: with {flag} OFF the route must 404 past a valid session (cascade)"
+        );
+    }
+}
+
 // --- FLAG-02: GET /api/console/features ----------------------------------------
 
 /// The read route returns the full seeded set with enabled + label, and
@@ -123,7 +182,8 @@ async fn get_features_returns_seeded_set(pool: PgPool) {
     let json: serde_json::Value = resp.take_json().await.expect("features json");
     let features = &json["features"];
 
-    // All six seeded keys present with enabled + label.
+    // All ten seeded keys present with enabled + label (the 0007 v2-feature set
+    // plus the 0010 CLI-builder service-domain flags).
     for key in [
         "saml",
         "organizations",
@@ -131,9 +191,24 @@ async fn get_features_returns_seeded_set(pool: PgPool) {
         "observability",
         "event_streams",
         "opl_live_validation",
+        "identities",
+        "oauth2",
+        "permissions",
+        "access_rules",
     ] {
         assert!(features.get(key).is_some(), "key {key} present");
         assert!(features[key]["label"].is_string(), "{key} has a label");
+    }
+
+    // CLI-builder: the four service-domain flags are seeded ON (services on by
+    // default) so the GET /features contract advertises them ON for the nav
+    // requiresFlag filter.
+    for key in ["identities", "oauth2", "permissions", "access_rules"] {
+        assert_eq!(
+            features[key]["enabled"],
+            serde_json::json!(true),
+            "{key} seeded ON by 0010"
+        );
     }
 
     // Seeded states: external-setup OFF, opl_live_validation ON.
@@ -169,7 +244,12 @@ async fn seed_defaults_idempotent(pool: PgPool) {
         Some(&true),
         "opl_live_validation seeded ON"
     );
-    assert_eq!(first.len(), 6, "exactly six seeded flags");
+    // CLI-builder service-domain flags seeded ON (0010).
+    assert_eq!(first.get("identities"), Some(&true), "identities seeded ON");
+    assert_eq!(first.get("oauth2"), Some(&true), "oauth2 seeded ON");
+    assert_eq!(first.get("permissions"), Some(&true), "permissions seeded ON");
+    assert_eq!(first.get("access_rules"), Some(&true), "access_rules seeded ON");
+    assert_eq!(first.len(), 10, "exactly ten seeded flags (6 v2 + 4 service-domain)");
 
     // Re-run migrations — must not error and must not change the seed.
     common::run_migrations(&pool)
@@ -233,7 +313,7 @@ async fn put_toggles_and_audits(pool: PgPool) {
         "an unknown flag key returns 404"
     );
     let after = queries::load_all(&pool).await.expect("reload after unknown");
-    assert_eq!(after.len(), 6, "no row was created for the unknown key");
+    assert_eq!(after.len(), 10, "no row was created for the unknown key");
 }
 
 // --- FLAG-04 / T-12-07: requires_runtime never 502 -----------------------------

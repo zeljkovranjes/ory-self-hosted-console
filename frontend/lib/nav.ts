@@ -82,6 +82,9 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/activity/sessions",
         icon: MonitorSmartphone,
         built: true,
+        // CLI-builder cascade: Kratos sessions are part of the `identities`
+        // service domain — hidden when CONSOLE_SERVICE_KRATOS=off (route 404s too).
+        requiresFlag: "identities",
       },
       {
         slug: "activity-courier",
@@ -89,6 +92,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/activity/courier",
         icon: Inbox,
         built: true,
+        requiresFlag: "identities",
       },
     ],
   },
@@ -104,6 +108,9 @@ export const NAV_GROUPS: NavGroup[] = [
         // schema editor, bulk import), so /users routes to the feature, not the
         // "coming in a later phase" placeholder.
         built: true,
+        // CLI-builder cascade: Identities are the core `identities` (Kratos)
+        // domain — hidden + 404 when CONSOLE_SERVICE_KRATOS=off.
+        requiresFlag: "identities",
       },
     ],
   },
@@ -115,12 +122,18 @@ export const NAV_GROUPS: NavGroup[] = [
     // wave). Routes live under `/authentication/<slug>`.
     label: "Authentication",
     items: [
+      // CLI-builder cascade: every Authentication item below is a KRATOS config
+      // page, so each carries `requiresFlag: "identities"` — hidden + 404 when
+      // CONSOLE_SERVICE_KRATOS=off. The console-OWNED "Actions & Webhooks" item is
+      // the ONE exception (it is the backend's own dispatcher, not a Kratos
+      // surface) and stays UNGATED.
       {
         slug: "methods",
         label: "General / Methods",
         href: "/authentication/methods",
         icon: ToggleLeft,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "passwordless",
@@ -128,6 +141,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/passwordless",
         icon: Fingerprint,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "mfa",
@@ -135,6 +149,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/mfa",
         icon: ShieldCheck,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "social",
@@ -142,6 +157,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/social",
         icon: KeyRound,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "sessions",
@@ -149,6 +165,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/sessions",
         icon: RefreshCw,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "recovery",
@@ -156,6 +173,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/recovery",
         icon: RotateCcw,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "verification",
@@ -163,6 +181,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/verification",
         icon: ShieldQuestion,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "smtp",
@@ -170,6 +189,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/smtp",
         icon: Mail,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "sms",
@@ -177,6 +197,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/authentication/sms",
         icon: Smartphone,
         built: true,
+        requiresFlag: "identities",
       },
       {
         slug: "webhooks",
@@ -194,12 +215,15 @@ export const NAV_GROUPS: NavGroup[] = [
     // at them now so the section shell is complete. All `built: true`.
     label: "OAuth2",
     items: [
+      // CLI-builder cascade: the entire OAuth2 group is the `oauth2` (Hydra)
+      // service domain — every item hidden + 404 when CONSOLE_SERVICE_HYDRA=off.
       {
         slug: "oauth2",
         label: "Clients",
         href: "/oauth2/clients",
         icon: KeyRound,
         built: true,
+        requiresFlag: "oauth2",
       },
       {
         slug: "oauth2-inspector",
@@ -207,6 +231,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/oauth2/inspector",
         icon: ScanSearch,
         built: true,
+        requiresFlag: "oauth2",
       },
       {
         slug: "oauth2-general",
@@ -214,6 +239,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/oauth2/general",
         icon: Settings,
         built: true,
+        requiresFlag: "oauth2",
       },
       {
         slug: "oauth2-oidc",
@@ -221,6 +247,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/oauth2/oidc",
         icon: ShieldCheck,
         built: true,
+        requiresFlag: "oauth2",
       },
       {
         slug: "oauth2-urls",
@@ -228,6 +255,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/oauth2/urls",
         icon: Link2,
         built: true,
+        requiresFlag: "oauth2",
       },
       {
         slug: "oauth2-lifespans",
@@ -235,6 +263,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/oauth2/lifespans",
         icon: Timer,
         built: true,
+        requiresFlag: "oauth2",
       },
       {
         slug: "oauth2-strategies",
@@ -242,6 +271,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/oauth2/strategies",
         icon: Sliders,
         built: true,
+        requiresFlag: "oauth2",
       },
       {
         slug: "oauth2-cookies",
@@ -249,6 +279,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/oauth2/cookies",
         icon: Cookie,
         built: true,
+        requiresFlag: "oauth2",
       },
     ],
   },
@@ -259,12 +290,16 @@ export const NAV_GROUPS: NavGroup[] = [
     // Access Rules is the Oathkeeper rules Monaco editor. All `built: true`.
     label: "Permissions",
     items: [
+      // CLI-builder cascade: Relationships / Check & Expand / Permission Model are
+      // the `permissions` (Keto) domain; Access Rules is the `access_rules`
+      // (Oathkeeper) domain — each hidden + 404 when its service is off.
       {
         slug: "permissions",
         label: "Relationships",
         href: "/permissions/relationships",
         icon: ShieldCheck,
         built: true,
+        requiresFlag: "permissions",
       },
       {
         slug: "permissions-check",
@@ -272,6 +307,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/permissions/check",
         icon: ScanSearch,
         built: true,
+        requiresFlag: "permissions",
       },
       {
         slug: "permissions-model",
@@ -279,6 +315,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/permissions/model",
         icon: FileCode2,
         built: true,
+        requiresFlag: "permissions",
       },
       {
         slug: "permissions-access-rules",
@@ -286,6 +323,7 @@ export const NAV_GROUPS: NavGroup[] = [
         href: "/permissions/access-rules",
         icon: Route,
         built: true,
+        requiresFlag: "access_rules",
       },
     ],
   },
