@@ -1,0 +1,19 @@
+[package]
+name = "console-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared pure-serde request/response DTOs the Ory Console backend and the optional operator CLI agree on, so the HTTP wire shapes cannot drift."
+license = "Apache-2.0"
+
+[lib]
+name = "console_core"
+path = "src/lib.rs"
+
+# PURE-SERDE ONLY. No salvo, no sqlx, no reqwest — this crate is just data types
+# (Architectural Responsibility Map). The backend pulls these in as DTOs; the CLI
+# constructs them. Keeping the dep surface to serde/serde_json is what guarantees
+# adding console-core to the backend cannot bloat its dependency graph.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

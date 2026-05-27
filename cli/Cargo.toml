@@ -1,0 +1,17 @@
+[package]
+name = "ory-console-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "PLACEHOLDER — the optional Ory Console operator CLI. Filled in by Phase 19 Plan 03 (clap command tree + reqwest HTTP client + bootstrap .env writer). Declared as a workspace member now so cargo build --workspace --locked resolves and wave-1 builds stay honest."
+license = "Apache-2.0"
+
+[[bin]]
+name = "ory-console-cli"
+path = "src/main.rs"
+
+# Intentionally NO dependencies yet. clap / reqwest / console-core are wired in
+# by Plan 03. Keeping this empty means the wave-1 workspace build pulls in NOTHING
+# extra (clap does NOT enter the lockfile graph until Plan 03 adds it here), so the
+# leanness assertion on the backend graph is unaffected by this placeholder.
+[dependencies]

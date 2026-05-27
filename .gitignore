@@ -43,6 +43,11 @@
 
 # --- Rust (backend) ---
 /backend/target/
+# Phase 19: the repo root is now a Cargo WORKSPACE, so `cargo build --workspace`
+# emits a single shared target dir at the repo root. Ignore it (the per-crate
+# /backend/target/ above predates the workspace and is kept for any standalone
+# `cargo build` run inside backend/).
+/target/
 # Linux build cache used by the documented ORY_LIVE_TESTS container run
 # (phase acceptance) when invoking cargo test inside the internal Docker network.
 /backend/.cargo-linux-target/

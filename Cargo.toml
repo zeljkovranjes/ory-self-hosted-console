@@ -1,0 +1,47 @@
+# Workspace root for the Ory Self-Hosted Console.
+#
+# Phase 19 (Operator CLI) converts the formerly single-crate backend into a
+# 3-crate Cargo workspace so the optional `clap` CLI and the backend agree on
+# their HTTP wire shapes BY CONSTRUCTION:
+#
+#   * console-core — a pure-serde DTO library (NO salvo, NO sqlx, NO reqwest).
+#       The single source of truth for the request/response bodies the CLI
+#       constructs and the backend deserializes, plus the api-key auth header
+#       convention constants. Both the backend and the CLI depend on it so the
+#       wire shapes cannot drift.
+#   * backend      — the EXISTING `ory-console-backend` bin/lib (now a member);
+#       depends on console-core. Its default Docker image stays lean (no clap).
+#   * cli          — the optional operator CLI (filled in by Plan 03). A minimal
+#       placeholder today so `cargo build --workspace --locked` resolves now and
+#       wave-1 builds stay honest.
+#
+# resolver = "2" is required for per-crate feature resolution (the backend's
+# OFF-by-default `events-nats`/`events-kafka`/`test-probe` features must NOT
+# unify into the lean default graph, and the CLI's clap must NEVER leak into the
+# backend image — see the backend Dockerfile's explicit `-p ory-console-backend`).
+[workspace]
+resolver = "2"
+members = ["console-core", "backend", "cli"]
+
+# Shared dependency pins hoisted so console-core + backend + cli resolve IDENTICAL
+# versions of the common crates (no drift across the wire boundary). These mirror
+# the backend's existing pins verbatim (CLAUDE.md authoritative). `clap` is the
+# lone net-new crate (RESEARCH Package Legitimacy Audit — clap 4.6.1, canonical
+# Rust CLI parser, github.com/clap-rs/clap); it is referenced ONLY by the cli
+# member, never by the backend, so the production backend image stays lean.
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
+
+# The release profile lives at the workspace ROOT: Cargo IGNORES a
+# `[profile.*]` block in a non-root workspace member and emits a warning, so the
+# backend's tuned release profile (opt-level "s", lto, codegen-units 1, strip)
+# is hoisted here to keep the lean release image identical to pre-workspace.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
