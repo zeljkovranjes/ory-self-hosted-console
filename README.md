@@ -112,23 +112,55 @@ Those URLs resolve **only while `--profile dev-mail` is up**. The committed `con
 
 **Production posture.** A plain `docker compose up` does **NOT** start the catchers — they are unencrypted and do not forward mail/SMS, so they must never run in production. Instead, leave the `dev-mail` profile off and point Kratos at a real SMTP server and SMS gateway via the console's **Email/SMTP** and **SMS** pages (they rewrite the Kratos `courier` config and restart the service). Until you configure a real provider, Kratos's courier has no backend: recovery/verification mail queues but is not delivered, and SMS POSTs fail — that is the expected, documented production posture.
 
-## Operator CLI (optional)
+## Operator CLI / Builder (optional)
 
-The console works fully without the CLI (via `/setup` + env). The CLI is a convenience that smooths first-run setup and day-2 ops. It is a separate, lean binary run through Compose:
+The console works fully without the CLI (via `/setup` + env). The `ory-console` CLI adds a **guided builder** for first-run setup plus day-2 ops. Secrets are always read from an env var / `--*-file` / interactive prompt — **never** an argv flag.
+
+### `ory-console init` — guided builder
+
+The builder stands up a console tailored to you: pick which Ory services to run, optionally point at your own externally-hosted instances, choose console features, and — in host mode — bring the stack up and health-check it end-to-end.
 
 ```bash
-# First-run BOOTSTRAP — writes only gitignored .env / secret files; never echoes secrets,
-# never accepts a secret as an argv flag (env var / --*-file / interactive prompt only):
-docker compose run --rm cli oauth github set      # configure GitHub login OAuth (prompts for the secret)
-docker compose run --rm cli admin create --via-setup --name "Admin" --email you@example.com
+# Interactive wizard. In HOST mode (Docker available) it writes config, runs
+# `docker compose up` with the chosen services, health-checks them, applies the
+# feature set, and creates the first-run admin:
+ory-console init
 
-# ONLINE ops — authenticated to the backend HTTP API with a console API key
-# (`Authorization: Api-Key`), driving the SAME validated routes; the CLI is never a second writer of config:
+# Accept the recommended defaults, no prompts — all 5 Ory services in-stack;
+# advanced features (SAML, Organizations, Observability, Event Streams) OFF;
+# everything else ON:
+ory-console init --defaults
+
+# Re-apply a saved build byte-for-byte (existing .env secrets are NOT rotated):
+ory-console init --config console.config.toml
+
+# Config-only (no Docker socket): writes .env + console.config.toml, validates any
+# bring-your-own connections, then prints the remaining day-1/day-2 steps:
+ory-console init --no-docker
+```
+
+What the wizard configures:
+
+- **Selective services** — Kratos, Hydra, Keto, Oathkeeper, and Polis are each `in-stack | bring-your-own | off`. Turning a service **off** also disables its console features **server-side** (the routes 404 and the nav entries hide), not just visually. Postgres + backend + frontend are always required.
+- **Bring-your-own** — point the console at an Ory service you already host (its admin URL); the wizard **health-checks** the connection and **blocks** on failure with a clear diagnostic (override with `--skip-checks`).
+- **Reproducible** — writes a declarative `console.config.toml` (service modes, BYO URLs, feature set) you can commit and re-apply with `--config`. Secrets stay in `.env`/secret files — never in the toml.
+- **Full first-run** — generates secrets into `.env`, seeds the feature set, creates the first-run admin (`/setup`), and optionally configures SMTP / SMS / GitHub login.
+
+> The builder selects services via per-service Compose profiles (`svc-kratos`, `svc-hydra`, …) in `COMPOSE_PROFILES`; a plain `docker compose up` with none set still starts the full default stack.
+
+### Day-2 ops (in-container)
+
+The ONLINE/BOOTSTRAP commands run through Compose for ongoing operations — authenticated to the backend HTTP API (`Authorization: Api-Key`), driving the SAME validated routes (the CLI is never a second writer of config):
+
+```bash
 docker compose run --rm cli feature enable saml
 docker compose run --rm cli feature list
 docker compose run --rm cli observability on
-docker compose run --rm cli sso add-saml --tenant <org> --metadata ./idp-metadata.xml
+docker compose run --rm cli sso add-saml --tenant <org> --metadata-xml-file ./idp-metadata.xml \
+  --default-redirect-url https://console.example.com/ --redirect-url https://console.example.com/
 docker compose run --rm cli org add --label "Acme" --domain acme.com
+docker compose run --rm cli oauth github set                  # GitHub login OAuth (prompts for the secret)
+docker compose run --rm cli admin create --via-setup --name "Admin" --email you@example.com
 ```
 
 ## Security
