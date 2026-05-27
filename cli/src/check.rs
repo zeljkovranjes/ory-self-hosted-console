@@ -402,8 +402,21 @@ fn render_features_table(body: &str, ui: Ui) {
     let rows: Vec<Vec<String>> = keys
         .iter()
         .map(|k| {
-            let enabled = obj.get(*k).and_then(|x| x.as_bool()).unwrap_or(false);
-            let mark = if enabled { "✓" } else { "✗" };
+            // WR-05: distinguish a non-bool value from `false`. A key the backend
+            // returned with a non-bool shape renders as `?` (unknown) — never a
+            // misleading `✗` — and the coercion is logged. Only a genuine JSON
+            // bool drives the ✓/✗ glyph.
+            let mark = match obj.get(*k).and_then(|x| x.as_bool()) {
+                Some(true) => "✓",
+                Some(false) => "✗",
+                None => {
+                    eprintln!(
+                        "warning: feature `{k}` has a non-bool value — shown as `?` \
+                         (not coerced to disabled)"
+                    );
+                    "?"
+                }
+            };
             vec![(*k).clone(), mark.to_string()]
         })
         .collect();

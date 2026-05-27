@@ -149,6 +149,13 @@ async fn apply_feature_changes(
 /// Parse a `GET /api/console/features` body into a sorted `(key, enabled)` list.
 /// Tolerates either a `{"features": {k: bool}}` envelope or a bare `{k: bool}` map.
 /// Unparseable / non-object bodies yield an empty list (the caller BLOCKS).
+///
+/// WR-05: a key whose VALUE is not a JSON bool (e.g. a nested object or a string)
+/// is SKIPPED from the editable set with a warning to stderr — it is NOT coerced
+/// to `false`. Coercing it would record `false` in the `before_mask`, so a bare
+/// Enter then toggle could compute a diff that DISABLES a flag the operator never
+/// touched (and which the backend may consider ON). Skipping keeps the no-op
+/// invariant correct: only keys with a known bool truth are editable.
 fn parse_feature_flags(body: &str) -> Vec<(String, bool)> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
@@ -157,10 +164,21 @@ fn parse_feature_flags(body: &str) -> Vec<(String, bool)> {
     let Some(obj) = map.as_object() else {
         return Vec::new();
     };
-    let mut pairs: Vec<(String, bool)> = obj
-        .iter()
-        .map(|(k, val)| (k.clone(), val.as_bool().unwrap_or(false)))
-        .collect();
+    let mut pairs: Vec<(String, bool)> = Vec::new();
+    for (k, val) in obj {
+        match val.as_bool() {
+            Some(enabled) => pairs.push((k.clone(), enabled)),
+            None => {
+                // Do NOT coerce to false — skip with a clear warning so the before
+                // mask never records a wrong truth (and the diff never spuriously
+                // DISABLES it).
+                eprintln!(
+                    "warning: feature `{k}` has a non-bool value — skipping it from the \
+                     editable set (its state is left untouched)"
+                );
+            }
+        }
+    }
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
 }
@@ -458,6 +476,22 @@ mod tests {
         let bare = parse_feature_flags(r#"{"b":false,"a":true}"#);
         assert_eq!(bare, vec![("a".into(), true), ("b".into(), false)]);
         assert!(parse_feature_flags("not json").is_empty());
+    }
+
+    /// WR-05: a non-bool feature value is SKIPPED (not coerced to `false`), so it
+    /// never becomes a spurious DISABLE diff. Only the bool-valued keys remain
+    /// editable; the nested-object / string keys are dropped from the set.
+    #[test]
+    fn parse_feature_flags_skips_non_bool_values() {
+        let parsed = parse_feature_flags(
+            r#"{"saml":true,"weird":{"enabled":true,"source":"env"},"strval":"on","identities":false}"#,
+        );
+        // Only the genuine bools survive — sorted; the non-bool keys are skipped.
+        assert_eq!(
+            parsed,
+            vec![("identities".into(), false), ("saml".into(), true)],
+            "non-bool keys (`weird`, `strval`) must be skipped, not coerced to false"
+        );
     }
 
     /// A toggled key issues EXACTLY one PUT with the right body to the right path —

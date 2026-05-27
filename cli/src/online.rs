@@ -149,9 +149,21 @@ fn render_feature_table(body: &str, ui: Ui) {
     let rows: Vec<Vec<String>> = keys
         .iter()
         .map(|k| {
-            let enabled = obj.get(*k).and_then(|x| x.as_bool()).unwrap_or(false);
-            // Semantic glyph in the cell; comfy-table colors nothing in Plain.
-            let mark = if enabled { "✓" } else { "✗" };
+            // WR-05: distinguish a non-bool value from `false`. A non-bool shape
+            // renders as `?` (unknown) — never a misleading `✗` — and the coercion
+            // is logged. Semantic glyph in the cell; comfy-table colors nothing in
+            // Plain.
+            let mark = match obj.get(*k).and_then(|x| x.as_bool()) {
+                Some(true) => "✓",
+                Some(false) => "✗",
+                None => {
+                    eprintln!(
+                        "warning: feature `{k}` has a non-bool value — shown as `?` \
+                         (not coerced to disabled)"
+                    );
+                    "?"
+                }
+            };
             vec![(*k).clone(), mark.to_string()]
         })
         .collect();
