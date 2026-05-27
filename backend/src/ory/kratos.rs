@@ -29,7 +29,7 @@
 //! - **T-06-06 (no secret logging):** cleartext `password` / `hashed_password`
 //!   are NEVER written to logs (BACK-07).
 
-use ory_kratos_client::apis::{courier_api, identity_api};
+use ory_kratos_client::apis::identity_api;
 use ory_kratos_client::models::{
     CourierMessageStatus, CreateIdentityBody, IdentityPatch, PatchIdentitiesBody,
     UpdateIdentityBody,
@@ -645,25 +645,36 @@ pub async fn list_courier_messages(
 
     let page_size = paged_size(req);
     let page_token = query_opt(req, "page_token");
-    let status = courier_status(query_opt(req, "status").as_deref());
+    // Normalise the status filter to the canonical lower-case wire form via the
+    // typed enum (so an unknown value is dropped, not forwarded), then thread it
+    // to the fallback as a string. The recipient substring filter is forwarded
+    // verbatim (percent-encoded inside the fallback).
+    let status = courier_status(query_opt(req, "status").as_deref()).map(|s| s.to_string());
     let recipient = query_opt(req, "recipient");
 
-    let messages = courier_api::list_courier_messages(
-        &clients.kratos,
-        Some(page_size + 1),
+    // DRIFT FIX: the typed `courier_api::list_courier_messages` decodes each
+    // message into `models::Message`, whose `type` is `CourierMessageType` — an
+    // enum that, in ory-kratos-client 26.2.0, knows ONLY `email`/`phone`. Kratos
+    // v26.2.0 also emits `"type":"sms"`, so the typed path 502s with
+    // `unknown variant 'sms'` and drops the whole (valid) list. Fetch the raw JSON
+    // via the bounded reqwest-0.13 fallback (no secret to strip on a delivery
+    // log), which tolerates the `sms` type. See `fallback::list_courier_messages_raw`.
+    let http = fallback::fallback_client()?;
+    let (rows, next_token) = fallback::list_courier_messages_raw(
+        &http,
+        &clients_kratos_base(&clients),
+        page_size + 1,
         page_token.as_deref(),
-        status,
+        status.as_deref(),
         recipient.as_deref(),
     )
-    .await
-    .map_err(map_kratos_err)?;
+    .await?;
 
-    let rows: Vec<serde_json::Value> = messages
-        .into_iter()
-        .map(|m| serde_json::to_value(m))
-        .collect::<Result<_, _>>()
-        .map_err(|e| AppError::Internal(format!("serialize courier message: {e}")))?;
-
+    // Re-fold the raw rows through the SAME opaque-cursor envelope the typed path
+    // used (clamp to page_size, synthesise the +1-sentinel next cursor). The
+    // fallback's Link-header `next_token` is ignored in favour of the existing
+    // page-count cursor contract so the frontend behaviour is unchanged.
+    let _ = next_token;
     Ok(Json(list_envelope(rows, page_size, page_token.as_deref())))
 }
 
@@ -680,13 +691,14 @@ pub async fn get_courier_message(
     let clients = ory_clients(depot)?;
     let id = req.param::<String>("id").ok_or(AppError::NotFound)?;
 
-    let message = courier_api::get_courier_message(&clients.kratos, &id)
-        .await
-        .map_err(map_kratos_err)?;
+    // DRIFT FIX (same as the list handler): the typed `get_courier_message`
+    // decodes into `models::Message` and 502s on an `sms`-type message
+    // (CourierMessageType lacks `sms` in 26.2.0). Fetch the raw JSON via the
+    // bounded reqwest-0.13 fallback, which tolerates the lagging enum.
+    let http = fallback::fallback_client()?;
+    let message = fallback::get_courier_message_raw(&http, &clients_kratos_base(&clients), &id).await?;
 
-    serde_json::to_value(message)
-        .map(Json)
-        .map_err(|e| AppError::Internal(format!("serialize courier message: {e}")))
+    Ok(Json(message))
 }
 
 #[cfg(test)]

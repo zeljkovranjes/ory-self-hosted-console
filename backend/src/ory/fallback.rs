@@ -351,6 +351,123 @@ pub async fn list_o_auth2_clients_paged(
     Ok((rows, next_token))
 }
 
+/// List Kratos courier messages for ONE page as RAW JSON objects, plus the
+/// `page_token` cursor for the NEXT page (`None` on the last page).
+///
+/// This is a justified reqwest-0.13 fallback (a typed-crate-vs-running-image
+/// DRIFT workaround). The typed `courier_api::list_courier_messages` deserialises
+/// each message into `ory_kratos_client::models::Message`, whose `type` field is
+/// the `CourierMessageType` enum — and in `ory-kratos-client` 26.2.0 that enum
+/// defines ONLY `email` and `phone`. Kratos v26.2.0 ALSO emits `"type":"sms"` for
+/// SMS courier messages (e.g. login/recovery codes sent to a phone), so the typed
+/// path fails with `unknown variant 'sms'` and the whole list collapses to a 502
+/// decode error — even though the messages are perfectly valid. Returning the raw
+/// `serde_json::Value` rows sidesteps the lagging enum entirely (the courier list
+/// is a read-only delivery LOG with no secret to strip), so an `sms` message lists
+/// cleanly. This mirrors the existing identity/client fallbacks (raw `Value` rows
+/// + `Link`-header cursor) and the CLAUDE.md "reqwest fallback when a crate lags
+/// the image" guidance.
+///
+/// `base_url` is the FIXED internal Kratos Admin URL from `Config` (never user
+/// input — no SSRF surface). `status` / `recipient` are optional filters threaded
+/// through percent-encoded (user input is never trusted into the URL verbatim).
+/// On any non-2xx or transport/decode failure the shared [`AppError::Upstream`]
+/// (502) envelope is returned with NO upstream body/host leaked (BACK-07).
+pub async fn list_courier_messages_raw(
+    client: &reqwest::Client,
+    base_url: &str,
+    page_size: i64,
+    page_token: Option<&str>,
+    status: Option<&str>,
+    recipient: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, Option<String>), AppError> {
+    let url = build_courier_list_url(base_url, page_size, page_token, status, recipient);
+
+    let resp = client.get(url).send().await.map_err(map_fallback_err)?;
+    let http_status = resp.status();
+    if !http_status.is_success() {
+        return Err(map_fallback_status(http_status));
+    }
+
+    // Forward cursor from the Link header BEFORE consuming the body (same shape as
+    // the identity/client list endpoints).
+    let next_token = resp
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_next_page_token);
+
+    let body: serde_json::Value = resp.json().await.map_err(map_fallback_err)?;
+    let rows = body
+        .as_array()
+        .cloned()
+        .ok_or_else(|| AppError::Upstream("ory upstream returned a non-array list".into()))?;
+
+    Ok((rows, next_token))
+}
+
+/// Fetch ONE Kratos courier message's detail as RAW JSON.
+///
+/// Same drift workaround as [`list_courier_messages_raw`]: the typed
+/// `courier_api::get_courier_message` would fail to decode an `sms`-type message
+/// (the `CourierMessageType` enum lacks `sms` in `ory-kratos-client` 26.2.0). The
+/// raw `Value` passthrough returns the message verbatim (read-only, no secret to
+/// strip). `id` is a server-validated path segment; `base_url` is fixed config.
+pub async fn get_courier_message_raw(
+    client: &reqwest::Client,
+    base_url: &str,
+    id: &str,
+) -> Result<serde_json::Value, AppError> {
+    let url = format!(
+        "{}/admin/courier/messages/{}",
+        base_url.trim_end_matches('/'),
+        urlencode(id)
+    );
+    let resp = client.get(url).send().await.map_err(map_fallback_err)?;
+    let http_status = resp.status();
+    if !http_status.is_success() {
+        return Err(map_fallback_status(http_status));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(map_fallback_err)
+}
+
+/// Build the Kratos `GET /admin/courier/messages` URL with the page_size, an
+/// optional opaque keyset `page_token` cursor, and optional `status`/`recipient`
+/// filters. All optional values are percent-encoded; empty ones are omitted.
+/// Pure — no IO — so the param threading is unit-testable without a live Kratos.
+fn build_courier_list_url(
+    base_url: &str,
+    page_size: i64,
+    page_token: Option<&str>,
+    status: Option<&str>,
+    recipient: Option<&str>,
+) -> String {
+    let mut url = format!(
+        "{}/admin/courier/messages?page_size={}",
+        base_url.trim_end_matches('/'),
+        page_size
+    );
+    if let Some(tok) = page_token {
+        url.push_str("&page_token=");
+        url.push_str(&urlencode(tok));
+    }
+    if let Some(s) = status {
+        if !s.is_empty() {
+            url.push_str("&status=");
+            url.push_str(&urlencode(s));
+        }
+    }
+    if let Some(r) = recipient {
+        if !r.is_empty() {
+            url.push_str("&recipient=");
+            url.push_str(&urlencode(r));
+        }
+    }
+    url
+}
+
 /// Build the Hydra `GET /admin/clients` URL with the page_size and an optional
 /// opaque `page_token` cursor (Hydra's offset token). The token is percent-
 /// encoded (belt-and-suspenders; Hydra's offset alphabet is URL-safe). Pure — no

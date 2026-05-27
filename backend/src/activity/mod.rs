@@ -24,13 +24,14 @@
 //! routes: `/api/activity` (derived, always available) vs
 //! `/api/console/metrics/activity` (Prometheus-backed, observability-gated).
 
-use ory_kratos_client::apis::{courier_api, identity_api};
+use ory_kratos_client::apis::identity_api;
 use salvo::prelude::*;
 use serde::Serialize;
 
 use crate::error::AppError;
 use crate::ory::clients::OryClients;
 use crate::ory::error::map_kratos_err;
+use crate::ory::fallback;
 
 /// How many of each source (sessions / courier) to pull into the derived feed.
 const RECENT_PER_SOURCE: i64 = 25;
@@ -85,15 +86,25 @@ pub async fn get_activity(depot: &mut Depot) -> Result<Json<ActivityEnvelope>, A
     .map_err(map_kratos_err)?;
 
     // Recent sends: the most recent courier messages (read-only delivery log).
-    let messages = courier_api::list_courier_messages(
-        &clients.kratos,
-        Some(RECENT_PER_SOURCE),
+    //
+    // DRIFT FIX: the typed `courier_api::list_courier_messages` decodes into
+    // `models::Message`, whose `type` is the `CourierMessageType` enum — which in
+    // ory-kratos-client 26.2.0 knows ONLY `email`/`phone`. Kratos v26.2.0 also
+    // emits `"type":"sms"`, so the typed path 502s with `unknown variant 'sms'`
+    // and took the WHOLE derived-activity feed down with it. Use the raw
+    // reqwest-0.13 fallback (tolerant of the lagging enum) — the courier rows are
+    // a read-only delivery log with no secret to strip. See
+    // `fallback::list_courier_messages_raw`.
+    let http = fallback::fallback_client()?;
+    let (messages, _next) = fallback::list_courier_messages_raw(
+        &http,
+        &clients.kratos.base_path,
+        RECENT_PER_SOURCE,
         None,
         None,
         None,
     )
-    .await
-    .map_err(map_kratos_err)?;
+    .await?;
 
     let mut items: Vec<ActivityEntry> = Vec::with_capacity(sessions.len() + messages.len());
     for s in sessions {
@@ -104,9 +115,8 @@ pub async fn get_activity(depot: &mut Depot) -> Result<Json<ActivityEnvelope>, A
             detail,
         });
     }
-    for m in messages {
-        let detail = serde_json::to_value(m)
-            .map_err(|e| AppError::Internal(format!("serialize courier message: {e}")))?;
+    for detail in messages {
+        // The fallback already returns each message as raw JSON (`Value`).
         items.push(ActivityEntry {
             kind: "courier",
             detail,
