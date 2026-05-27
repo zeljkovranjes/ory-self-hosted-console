@@ -37,6 +37,12 @@ const MAX_RANGE_SECS: i64 = 604_800;
 const DEFAULT_STEP_SECS: i64 = 60;
 /// Minimum step (seconds) — clamps a tiny step that would explode the point count.
 const MIN_STEP_SECS: i64 = 15;
+/// Minimum look-back RANGE (seconds). WR-03: the range lower bound is a SEPARATE
+/// quantity from the step floor (`MIN_STEP_SECS`). Every Activity series uses a
+/// `[5m]` rate window, so a sub-5m range yields a single, mostly-empty point — the
+/// range floor must be at least the rate window. Mirrors the Loki route's
+/// dedicated `60`-second range floor discipline (`loki.rs`).
+const MIN_RANGE_SECS: i64 = 300;
 
 /// The closed set of Activity dashboard intents → the server-built PromQL.
 ///
@@ -125,7 +131,10 @@ pub async fn get_metrics_activity(
 
     // Numeric range/step — integer-validated + clamped. These are the ONLY
     // client-influenced values, and they never touch the PromQL string itself.
-    let range_secs = clamp_param(req.query::<String>("range"), DEFAULT_RANGE_SECS, MIN_STEP_SECS, MAX_RANGE_SECS)?;
+    // WR-03: the RANGE is floored by `MIN_RANGE_SECS` (>= the `[5m]` rate window),
+    // NOT by the unrelated step floor — a 20-second range no longer collapses a
+    // 5m-rate series into a single empty point. The STEP keeps its own floor.
+    let range_secs = clamp_param(req.query::<String>("range"), DEFAULT_RANGE_SECS, MIN_RANGE_SECS, MAX_RANGE_SECS)?;
     let step_secs = clamp_param(req.query::<String>("step"), DEFAULT_STEP_SECS, MIN_STEP_SECS, MAX_RANGE_SECS)?;
 
     // Probe FIRST (FLAG-04): a down profile is a CLEAN state, never a 502.
