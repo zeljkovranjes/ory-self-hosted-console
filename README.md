@@ -39,7 +39,7 @@ docker compose logs backend | grep -i bootstrap
 # 4. Open http://localhost:3000/setup, paste the token, create your admin
 ```
 
-Then log in at **http://localhost:3000**.
+Then log in to the **admin console** at **http://localhost:3000**. The end-user **Account Experience** (sign-in, registration, recovery, settings) is served separately at **http://localhost:3001**.
 
 > [!TIP]
 > Prefer guided setup over editing `.env` by hand? Use the [`ory-console init` builder](#️-cli-builder).
