@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use crate::config_model::{ConsoleConfig, ServiceMode, SERVICES};
+use crate::config_model::{ConsoleConfig, ObservabilityMode, ServiceMode, SERVICES};
 
 /// The default per-endpoint probe timeout. Short — a readiness endpoint that does
 /// not answer promptly is treated as not-ready.
@@ -174,6 +174,115 @@ pub async fn probe_service(
         status_or_error: statuses.join(" | "),
         hint: if all_ok { String::new() } else { build_hint(service, config) },
     })
+}
+
+/// The readiness URL(s) for the observability backing store given its mode.
+/// Returns `None` for `off` (nothing to reach). The THREE backends use their
+/// upstream-canonical readiness paths (VERIFIED against the backend's live Phase-16
+/// probe — `backend/src/observability/probe.rs` — which proves these against the
+/// running stack):
+///   * Prometheus `{url}/-/ready`   (200 once it can serve queries; `/-/healthy` is
+///                                   the liveness sibling — readiness is the right
+///                                   pre-boot gate)
+///   * Loki       `{url}/ready`     (200 once ingester+store are ready)
+///   * Grafana    `{url}/api/health`(200 `{"database":"ok",...}` when up)
+/// In `byo` mode the operator-supplied URLs are used; `in-stack` falls back to the
+/// compose-default internal base URLs (so an in-stack probe still hits a sane
+/// endpoint). The Grafana health endpoint is UNAUTHENTICATED, so the probe carries
+/// no secret (mirrors the Ory readiness probes).
+pub fn observability_readiness_urls(config: &ConsoleConfig) -> Option<Vec<(&'static str, String)>> {
+    let mode = config.observability_mode();
+    if mode == ObservabilityMode::Off {
+        return None;
+    }
+    let obs = config.observability.as_ref();
+    // The compose-default internal bases (mirror docker-compose.yml + .env.example).
+    let pick = |byo_val: Option<String>, default: &str| -> String {
+        match mode {
+            ObservabilityMode::Byo => byo_val.unwrap_or_else(|| default.to_string()),
+            _ => default.to_string(),
+        }
+    };
+    let prometheus = pick(
+        obs.and_then(|o| o.prometheus_url.clone()),
+        "http://prometheus:9090",
+    );
+    let loki = pick(obs.and_then(|o| o.loki_url.clone()), "http://loki:3100");
+    let grafana = pick(obs.and_then(|o| o.grafana_url.clone()), "http://grafana:3000");
+    Some(vec![
+        ("prometheus", join(&prometheus, "/-/ready")),
+        ("loki", join(&loki, "/ready")),
+        ("grafana", join(&grafana, "/api/health")),
+    ])
+}
+
+/// Probe the observability backing store (Prometheus/Loki/Grafana) when it is
+/// `in-stack` or `byo`. Returns `None` when `off`. A single logical `ProbeResult`
+/// whose `ok` is true ONLY if all three (present) endpoints answer 2xx — mirroring
+/// the keto multi-endpoint probe. Secret-free (the health endpoints are
+/// unauthenticated; the diagnostics carry only URLs + status).
+pub async fn probe_observability(
+    config: &ConsoleConfig,
+    timeout: Duration,
+) -> Option<ProbeResult> {
+    let urls = observability_readiness_urls(config)?;
+    let mode = config.observability_mode();
+    let client = match reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(ProbeResult {
+                service: "observability".to_string(),
+                url: urls.iter().map(|(_, u)| u.clone()).collect::<Vec<_>>().join("; "),
+                ok: false,
+                status_or_error: format!("could not build HTTP client: {e}"),
+                hint: observability_hint(mode),
+            });
+        }
+    };
+
+    let mut statuses: Vec<String> = Vec::new();
+    let mut all_ok = true;
+    for (name, url) in &urls {
+        match client.get(url).send().await {
+            Ok(resp) => {
+                let st = resp.status();
+                statuses.push(format!("{name} {url} -> {}", st.as_u16()));
+                if !st.is_success() {
+                    all_ok = false;
+                }
+            }
+            Err(e) => {
+                all_ok = false;
+                statuses.push(format!("{name} {url} -> transport error: {e}"));
+            }
+        }
+    }
+
+    Some(ProbeResult {
+        service: "observability".to_string(),
+        url: urls.iter().map(|(_, u)| u.clone()).collect::<Vec<_>>().join("; "),
+        ok: all_ok,
+        status_or_error: statuses.join(" | "),
+        hint: if all_ok { String::new() } else { observability_hint(mode) },
+    })
+}
+
+/// A mode-aware fix hint for the observability probe (secret-free).
+fn observability_hint(mode: ObservabilityMode) -> String {
+    match mode {
+        ObservabilityMode::Byo => "observability is `byo` — are the external \
+             Prometheus/Loki/Grafana URLs correct and reachable from the backend's \
+             network? (pass --skip-checks to proceed anyway)"
+            .to_string(),
+        _ => "observability is `in-stack` — are the bundled Prometheus/Loki/Grafana \
+             containers up and healthy yet? (they may still be starting; pass \
+             --skip-checks to proceed anyway)"
+            .to_string(),
+    }
 }
 
 /// Probe EVERY non-`off` service in the config, in the stable SERVICES order.
@@ -417,6 +526,92 @@ write_url = "{base}/write"
             .unwrap();
         assert!(!r.ok, "keto fails if EITHER endpoint fails: {r:?}");
         assert!(r.status_or_error.contains("503"), "write 503 surfaced: {r:?}");
+    }
+
+    #[test]
+    fn observability_off_is_skipped() {
+        let c = cfg(r#"
+[observability]
+mode = "off"
+"#);
+        assert!(observability_readiness_urls(&c).is_none(), "off → no probe");
+    }
+
+    #[test]
+    fn observability_byo_uses_operator_urls_with_canonical_paths() {
+        let c = cfg(r#"
+[observability]
+mode = "byo"
+prometheus_url = "https://prom.ext"
+loki_url = "https://loki.ext"
+grafana_url = "https://grafana.ext"
+"#);
+        let urls: std::collections::HashMap<_, _> =
+            observability_readiness_urls(&c).unwrap().into_iter().collect();
+        assert_eq!(urls.get("prometheus").map(String::as_str), Some("https://prom.ext/-/ready"));
+        assert_eq!(urls.get("loki").map(String::as_str), Some("https://loki.ext/ready"));
+        assert_eq!(urls.get("grafana").map(String::as_str), Some("https://grafana.ext/api/health"));
+    }
+
+    #[test]
+    fn observability_in_stack_uses_compose_default_bases() {
+        let c = cfg(r#"
+[observability]
+mode = "in-stack"
+"#);
+        let urls: std::collections::HashMap<_, _> =
+            observability_readiness_urls(&c).unwrap().into_iter().collect();
+        assert_eq!(urls.get("prometheus").map(String::as_str), Some("http://prometheus:9090/-/ready"));
+        assert_eq!(urls.get("loki").map(String::as_str), Some("http://loki:3100/ready"));
+        assert_eq!(urls.get("grafana").map(String::as_str), Some("http://grafana:3000/api/health"));
+    }
+
+    #[tokio::test]
+    async fn probe_observability_all_200_is_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let _p = server.mock("GET", "/-/ready").with_status(200).create_async().await;
+        let _l = server.mock("GET", "/ready").with_status(200).create_async().await;
+        let _g = server.mock("GET", "/api/health").with_status(200).with_body("{}").create_async().await;
+
+        let c = cfg(&format!(
+            r#"
+[observability]
+mode = "byo"
+prometheus_url = "{base}"
+loki_url = "{base}"
+grafana_url = "{base}"
+"#,
+            base = server.url()
+        ));
+        let r = probe_observability(&c, DEFAULT_PROBE_TIMEOUT).await.expect("byo → probed");
+        assert!(r.ok, "all 200 → ok: {r:?}");
+        assert!(r.hint.is_empty(), "no hint on success");
+    }
+
+    #[tokio::test]
+    async fn probe_observability_fails_if_one_endpoint_fails_with_byo_hint() {
+        let mut server = mockito::Server::new_async().await;
+        let _p = server.mock("GET", "/-/ready").with_status(200).create_async().await;
+        let _l = server.mock("GET", "/ready").with_status(200).create_async().await;
+        // Grafana not ready → the logical observability probe fails.
+        let _g = server.mock("GET", "/api/health").with_status(503).create_async().await;
+
+        let c = cfg(&format!(
+            r#"
+[observability]
+mode = "byo"
+prometheus_url = "{base}"
+loki_url = "{base}"
+grafana_url = "{base}"
+"#,
+            base = server.url()
+        ));
+        let r = probe_observability(&c, DEFAULT_PROBE_TIMEOUT).await.unwrap();
+        assert!(!r.ok, "one 503 fails the aggregate: {r:?}");
+        assert!(r.status_or_error.contains("503"), "503 surfaced: {r:?}");
+        assert!(r.hint.contains("byo"), "byo hint: {r:?}");
+        // Secret-free: only URLs + status.
+        assert!(!r.status_or_error.to_ascii_lowercase().contains("password"));
     }
 
     #[test]
