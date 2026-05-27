@@ -66,8 +66,18 @@ salvo = { version = "0.93.0", features = [
     "affix-state",
     "oapi",
 ] }
+# Shared DTOs the CLI and backend agree on (Phase 19). PURE serde types — pulling
+# this in adds NO new transitive deps to the backend graph (it depends only on
+# serde/serde_json, already in the tree), so the image-leanness invariant holds.
+console-core = { path = "../console-core" }
+
+# `signal` is backend-only (graceful shutdown), so tokio stays an explicit pin
+# rather than the workspace one (which omits `signal`); the resolved version is
+# unchanged.
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal"] }
-serde = { version = "1.0.228", features = ["derive"] }
+# serde matches the workspace pin exactly (1.0.228 + derive) — hoisted to
+# `.workspace = true` for version unification with console-core + the future cli.
+serde = { workspace = true }
 # WR-06: `preserve_order` makes serde_json::Value back an `IndexMap` (insertion
 # order) instead of a `BTreeMap` (alphabetical). Without it, the FIRST save of an
 # operator's hand-authored kratos.yml/hydra.yml rewrites the whole file in
@@ -98,7 +108,12 @@ argon2 = { version = "0.5.3", features = ["std"] }
 oauth2 = "5.0.0"
 # Explicit async HTTP client for oauth2 5.0 + GitHub user API; rustls (no system
 # OpenSSL). reqwest 0.13 renamed the rustls feature `rustls-tls` -> `rustls`.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# reqwest 0.13 matches the workspace pin exactly (default-features=false,
+# rustls+json) — hoisted to `.workspace = true` to share the rustls stack with
+# the future cli. NOTE: this is the 0.13 fallback client ONLY; the renamed
+# `reqwest_012` alias below is a DISTINCT 0.12 major the Ory crates need and is
+# deliberately NOT unified (RESEARCH Pitfall 1).
+reqwest = { workspace = true }
 # CSPRNG for bootstrap/session/CSRF tokens (OsRng); base64url encoding; SHA-256
 # (fast hash for the 256-bit session token — NOT Argon2, Pitfall 5); constant-time eq.
 rand = "0.10"
@@ -221,9 +236,8 @@ sqlx = { version = "0.9.0", features = [
     "time",
 ] }
 
-[profile.release]
-# Smaller, faster-to-ship release binary for the runtime image stage.
-opt-level = "s"
-lto = true
-codegen-units = 1
-strip = true
+# NOTE: the `[profile.release]` block (opt-level "s", lto, codegen-units 1,
+# strip) was MOVED to the workspace-root Cargo.toml in Phase 19. Cargo ignores a
+# `[profile.*]` block in a non-root workspace member (it warns), so the tuned
+# release profile now lives once at the root and applies to this bin unchanged —
+# the lean release image is byte-for-byte equivalent to pre-workspace.

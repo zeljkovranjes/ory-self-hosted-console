@@ -30,43 +30,70 @@ ARG TEST_PROBE=
 # (Pitfall 2). Set BEFORE any cargo build so both invocations honor it.
 ENV SQLX_OFFLINE=true
 
-# Pre-cache dependencies: copy the manifest AND the committed lockfile, create a
-# dummy source, and build so the dependency layer is reused when only src/ changes.
+# WORKSPACE LAYOUT (Phase 19): the repo root is now a Cargo workspace
+# (console-core + backend + cli). This Dockerfile's BUILD CONTEXT must therefore
+# be the REPO ROOT (not backend/), because a `--locked` build needs the workspace
+# root Cargo.toml + the single root Cargo.lock + the console-core crate the
+# backend depends on. The `cli` member is NOT copied — building `-p
+# ory-console-backend` never compiles it, so clap/the CLI never enter this image
+# (the leanness invariant; verified by `cargo tree -p ory-console-backend` having
+# no clap). Plan 04 updates docker-compose's backend `build.context`/`build.dockerfile`
+# to match (see the SUMMARY note).
+#
+# Pre-cache dependencies: copy the workspace manifests + the committed lockfile,
+# create dummy sources for EVERY workspace member cargo will resolve, and build
+# only `-p ory-console-backend` so the dependency layer is reused when only
+# backend/src changes.
 # --locked: resolve EXACTLY the versions pinned in Cargo.lock (CR-04). Without the
 # lockfile + --locked the build resolves transitive versions fresh from the
 # Cargo.toml ranges, defeating supply-chain reproducibility (INFRA-04).
-# The crate now has BOTH a lib and a bin target, so the dep-cache stub must
-# provide a placeholder for each (an empty lib.rs + a dummy main.rs) or cargo
-# fails target resolution before any dependency is built.
+# The backend crate has BOTH a lib and a bin target, and console-core is a lib —
+# the dep-cache stub must provide a placeholder source for each member cargo
+# parses (the root resolves ALL members even when building only the backend), or
+# cargo fails target resolution before any dependency is built.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src \
-    && echo '// dependency cache build' > src/lib.rs \
-    && echo 'fn main() { println!("dependency cache build"); }' > src/main.rs \
-    && cargo build --release --locked \
-    && rm -rf src
+COPY backend/Cargo.toml ./backend/Cargo.toml
+COPY console-core/Cargo.toml ./console-core/Cargo.toml
+COPY cli/Cargo.toml ./cli/Cargo.toml
+RUN mkdir -p backend/src console-core/src cli/src \
+    && echo '// dependency cache build' > backend/src/lib.rs \
+    && echo 'fn main() { println!("dependency cache build"); }' > backend/src/main.rs \
+    && echo '// dependency cache build' > console-core/src/lib.rs \
+    && echo 'fn main() {}' > cli/src/main.rs \
+    && cargo build --release --locked -p ory-console-backend \
+    && rm -rf backend/src console-core/src cli/src
 
 # Copy the committed sqlx offline metadata and the migrations BEFORE the real
 # build so the query macros resolve with no DB, and `sqlx::migrate!()` finds the
-# embedded migration source.
-COPY .sqlx ./.sqlx
-COPY migrations ./migrations
+# embedded migration source. These live UNDER backend/ in the workspace layout,
+# and `sqlx::migrate!()` / `include_str!` resolve relative to the backend crate's
+# CARGO_MANIFEST_DIR (=/app/backend), so they MUST land at /app/backend/.sqlx,
+# /app/backend/migrations and /app/backend/config.
+COPY backend/.sqlx ./backend/.sqlx
+COPY backend/migrations ./backend/migrations
 
 # Now copy real sources and build the actual binary (still --locked, offline).
-COPY src ./src
+# console-core is a build-time dependency of the backend, so its real source must
+# be present too.
+COPY console-core/src ./console-core/src
+COPY backend/src ./backend/src
 # Phase 4 (config-edit) embeds the four Ory service config schemas + the five
 # `ory://` sub-schemas at compile time via `include_str!("../../config/schemas/…")`
-# (resolves to /app/config/schemas/…). They MUST be present before the real
-# build or the lib fails to compile (os error 2: no such file). The dep-cache
-# stub above does not need them (it builds an empty lib.rs).
-COPY config ./config
-# Bust the cached dummy artifacts so BOTH the real lib and bin are recompiled
-# (the bin depends on the lib crate, so a stale stub lib.rs would break it).
+# (relative to backend/src/config_edit -> /app/backend/config/schemas/…). They
+# MUST be present before the real build or the lib fails to compile (os error 2:
+# no such file). The dep-cache stub above does not need them (empty lib.rs).
+COPY backend/config ./backend/config
+# Bust the cached dummy artifacts so BOTH the real backend lib and bin (and
+# console-core) are recompiled (the bin depends on the lib + console-core, so a
+# stale stub would break it).
 # WR-01: the shell-form `${TEST_PROBE:+--features test-probe}` expands to nothing
 # for a production build (no probe) and to `--features test-probe` when the
 # TEST_PROBE build-arg was set (the acceptance image). Done here in the RUN (sh -c)
 # because Dockerfile `ENV` does NOT support `${VAR:+...}` substitution.
-RUN touch src/lib.rs src/main.rs \
-    && cargo build --release --locked ${TEST_PROBE:+--features test-probe}
+# `-p ory-console-backend` keeps the image lean: only the backend bin + its
+# console-core dep compile; the cli member (and clap) are never built.
+RUN touch backend/src/lib.rs backend/src/main.rs console-core/src/lib.rs \
+    && cargo build --release --locked -p ory-console-backend ${TEST_PROBE:+--features test-probe}
 
 # ---- curl stage ----
 # The distroless runtime ships no curl. We vendor a single STATICALLY-LINKED
@@ -93,6 +120,9 @@ WORKDIR /app
 # Static curl lives at /bin/curl in the tarampampam image.
 COPY --from=curlbin /bin/curl /usr/local/bin/curl
 
+# Workspace builds emit artifacts to the WORKSPACE-ROOT target dir
+# (/app/target/release/), so the bin path is unchanged from the pre-workspace
+# single-crate layout — only its inputs (the workspace manifests) moved.
 COPY --from=builder /app/target/release/ory-console-backend /usr/local/bin/ory-console-backend
 
 # Documented default; overridable via env at runtime (Plan 04).
