@@ -147,14 +147,25 @@ pub async fn verify_api_key(pool: &PgPool, presented: &str) -> Result<Option<Uui
     }
 
     // WR-04: stamp last_used_at on a successful verify so the surfaced column is
-    // live rather than permanently NULL. Best-effort within the verify result —
-    // a write failure surfaces as the query error (the caller decides).
+    // live rather than permanently NULL.
+    //
+    // WR-03: this MUST be truly best-effort. The key has already verified
+    // (constant-time, non-revoked) above — authentication has SUCCEEDED. A
+    // transient failure of this benign telemetry UPDATE (pool exhaustion, a row
+    // lock, a brief connectivity blip) must NOT propagate via `?`, because the
+    // combined auth hoop maps any `Err(_)` to 401 — turning a valid operator key
+    // into an authentication failure (a correctness/availability defect, and
+    // asymmetric with the session path which has no secondary write). Log + ignore
+    // the stamp error; the verified key still authenticates.
     let id = matched.expect("matched is Some on this branch");
-    sqlx::query!(
+    if let Err(e) = sqlx::query!(
         "UPDATE console_api_keys SET last_used_at = now() WHERE id = $1",
         id
     )
     .execute(pool)
-    .await?;
+    .await
+    {
+        tracing::warn!(error = %e, "api-key verify: last_used_at stamp failed (auth still succeeds)");
+    }
     Ok(Some(id))
 }
