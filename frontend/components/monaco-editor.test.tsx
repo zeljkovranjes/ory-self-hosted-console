@@ -51,17 +51,39 @@ type EditorMockProps = {
   options?: { readOnly?: boolean };
   onChange?: (v: string | undefined) => void;
   beforeMount?: (monaco: unknown) => void;
+  onMount?: (editor: unknown, monaco: unknown) => void;
 };
 
 const setDiagnosticsOptions = vi.fn();
 
+// Mock the ory-opl grammar registration so we can assert beforeMount calls it
+// (the real registration is unit-tested in lib/opl-monarch.test.ts).
+const registerOplMock = vi.fn();
+vi.mock("@/lib/opl-monarch", () => ({
+  registerOpl: (monaco: unknown) => registerOplMock(monaco),
+  OPL_LANGUAGE_ID: "ory-opl",
+}));
+
+// A minimal monaco shim covering both the JSON-schema hook and registerOpl's
+// languages/editor API surface (registerOpl is mocked, but beforeMount still
+// receives this object).
+const monacoShim = {
+  languages: {
+    json: { jsonDefaults: { setDiagnosticsOptions } },
+    getLanguages: () => [],
+    register: vi.fn(),
+    setMonarchTokensProvider: vi.fn(),
+  },
+  editor: { defineTheme: vi.fn() },
+};
+
 vi.mock("@monaco-editor/react", () => ({
   Editor: (props: EditorMockProps) => {
-    // Exercise beforeMount with a minimal monaco shim so the JSON-schema hook
-    // path is covered when a schema is supplied.
-    props.beforeMount?.({
-      languages: { json: { jsonDefaults: { setDiagnosticsOptions } } },
-    });
+    // Exercise beforeMount with the monaco shim so the JSON-schema hook AND the
+    // registerOpl call are both driven on mount.
+    props.beforeMount?.(monacoShim);
+    // Drive onMount with the editor + monaco handles when supplied.
+    props.onMount?.({ id: "editor" }, monacoShim);
     return (
       <textarea
         data-testid="monaco-mock"
@@ -180,6 +202,59 @@ describe("MonacoEditor wrapper (FE-04)", () => {
     );
     await screen.findByTestId("monaco-mock");
     expect(setDiagnosticsOptions).not.toHaveBeenCalled();
+  });
+
+  it("threads the ory-opl language through to the editor", async () => {
+    render(
+      <MonacoEditor language="ory-opl" value="class X {}" onChange={() => {}} />,
+    );
+    const ed = await screen.findByTestId("monaco-mock");
+    expect(ed).toHaveAttribute("data-language", "ory-opl");
+  });
+
+  it("registers ory-opl via beforeMount on an ory-opl mount", async () => {
+    render(
+      <MonacoEditor language="ory-opl" value="class X {}" onChange={() => {}} />,
+    );
+    await screen.findByTestId("monaco-mock");
+    await waitFor(() => expect(registerOplMock).toHaveBeenCalled());
+  });
+
+  it("registers ory-opl via beforeMount even on a json mount", async () => {
+    render(<MonacoEditor language="json" value="{}" onChange={() => {}} />);
+    await screen.findByTestId("monaco-mock");
+    await waitFor(() => expect(registerOplMock).toHaveBeenCalled());
+  });
+
+  it("composes registerOpl with JSON-schema diagnostics on a json mount", async () => {
+    const schema = { type: "object" };
+    render(
+      <MonacoEditor
+        language="json"
+        value="{}"
+        onChange={() => {}}
+        jsonSchema={schema}
+      />,
+    );
+    await screen.findByTestId("monaco-mock");
+    // Both behaviors fire — neither suppresses the other.
+    await waitFor(() => expect(registerOplMock).toHaveBeenCalled());
+    expect(setDiagnosticsOptions).toHaveBeenCalled();
+  });
+
+  it("forwards onMount with the editor + monaco handles when supplied", async () => {
+    const onMount = vi.fn();
+    render(
+      <MonacoEditor
+        language="ory-opl"
+        value="class X {}"
+        onChange={() => {}}
+        onMount={onMount}
+      />,
+    );
+    await screen.findByTestId("monaco-mock");
+    await waitFor(() => expect(onMount).toHaveBeenCalled());
+    expect(onMount.mock.calls.at(-1)?.[0]).toEqual({ id: "editor" });
   });
 
   it("exposes an accessible label for the editor region", async () => {

@@ -24,11 +24,13 @@ import type {
   BeforeMount,
   EditorProps,
   OnChange,
+  OnMount,
 } from "@monaco-editor/react";
 
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { setupMonaco } from "@/lib/monaco-setup";
+import { registerOpl } from "@/lib/opl-monarch";
 
 // Dynamically import the heavy editor with SSR disabled. The loader function
 // also runs `setupMonaco()` so the local-bundle loader config is applied before
@@ -57,8 +59,16 @@ const Editor = dynamic(
  *  `html` is used by the Phase-10 email-template HTML body editor (BRAND-01).
  *  `css` is used by the Phase-15 AX theming editor (AX-02) for the CSS-variable
  *  override — Monaco's built-in css language (syntax highlighting only; no
- *  network schema fetch). */
-export type MonacoLanguage = "json" | "yaml" | "plaintext" | "html" | "css";
+ *  network schema fetch).
+ *  `ory-opl` is the custom Monarch language for the Ory Permission Language
+ *  (PERM-04) — registered in beforeMount from the same-origin local bundle. */
+export type MonacoLanguage =
+  | "json"
+  | "yaml"
+  | "plaintext"
+  | "html"
+  | "css"
+  | "ory-opl";
 
 export interface MonacoEditorProps {
   /** Editor language mode. OPL (P9) uses "plaintext" until a token provider lands. */
@@ -81,6 +91,13 @@ export interface MonacoEditorProps {
   ariaLabel?: string;
   /** Optional extra classes on the bordered container. */
   className?: string;
+  /**
+   * Optional handle invoked once the editor mounts, with the editor + monaco
+   * instances (the @monaco-editor/react `OnMount` signature). Callers use it to
+   * drive `editor.setModelMarkers` for live diagnostics (the OPL live-validate
+   * use case, Plan 18-02). When omitted the wrapper behaves exactly as before.
+   */
+  onMount?: OnMount;
 }
 
 /**
@@ -96,6 +113,7 @@ export function MonacoEditor({
   jsonSchema,
   ariaLabel,
   className,
+  onMount,
 }: MonacoEditorProps) {
   const { resolvedTheme } = useTheme();
   // Map the app theme onto Monaco's built-in themes. resolvedTheme accounts for
@@ -104,25 +122,33 @@ export function MonacoEditor({
 
   const labelId = useId();
 
-  // Wire JSON-Schema diagnostics before the editor mounts. Only meaningful for
-  // JSON; for yaml/plaintext we leave the JSON defaults untouched. A stable
-  // identity uri + fileMatch:["*"] applies the schema to the editor's model.
-  const beforeMount: BeforeMount | undefined = useMemo(() => {
-    if (!jsonSchema || language !== "json") return undefined;
+  // Before the editor mounts we ALWAYS register the `ory-opl` Monarch language
+  // (idempotent — harmless for non-OPL pages; the language id is global to the
+  // monaco instance), THEN — only for JSON with a schema — wire JSON-Schema
+  // diagnostics. The two behaviors compose; neither suppresses the other. A
+  // stable identity uri + fileMatch:["*"] applies the schema to the model.
+  const beforeMount: BeforeMount = useMemo(() => {
     return (monaco) => {
-      monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
-        validate: true,
-        // `enableSchemaRequest:false` keeps Monaco from fetching $ref'd schemas
-        // over the network — reinforces the no-egress invariant (T-05-11).
-        enableSchemaRequest: false,
-        schemas: [
-          {
-            uri: "inmemory://schema/console-json-schema.json",
-            fileMatch: ["*"],
-            schema: jsonSchema,
-          },
-        ],
-      });
+      // (1) Register the OPL grammar from the same-origin bundle (no CDN, no
+      //     new dependency). Idempotent, so safe on every mount.
+      registerOpl(monaco);
+
+      // (2) JSON-Schema diagnostics — unchanged; only meaningful for JSON.
+      if (jsonSchema && language === "json") {
+        monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
+          validate: true,
+          // `enableSchemaRequest:false` keeps Monaco from fetching $ref'd
+          // schemas over the network — reinforces no-egress (T-05-11).
+          enableSchemaRequest: false,
+          schemas: [
+            {
+              uri: "inmemory://schema/console-json-schema.json",
+              fileMatch: ["*"],
+              schema: jsonSchema,
+            },
+          ],
+        });
+      }
     };
   }, [jsonSchema, language]);
 
@@ -160,6 +186,7 @@ export function MonacoEditor({
           theme={monacoTheme}
           onChange={handleChange}
           beforeMount={beforeMount}
+          onMount={onMount}
           options={options}
           height="100%"
           width="100%"
