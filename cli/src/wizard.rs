@@ -27,16 +27,19 @@
 use std::io::{IsTerminal, Write};
 
 use crate::config_model::{
-    self, ConsoleConfig, PostgresConfig, PostgresMode, PostgresModeField, ServiceConfig,
-    ServiceMode, ServiceModeField, SERVICES,
+    self, ConsoleConfig, ObservabilityConfig, ObservabilityMode, ObservabilityModeField,
+    PostgresConfig, PostgresMode, PostgresModeField, ServiceConfig, ServiceMode, ServiceModeField,
+    SERVICES,
 };
 use crate::{bootstrap, emit, orchestrate, InitArgs, CliError};
 
-/// The advanced (opt-in, OFF-by-default) features the interactive path prompts
-/// for. The ON-by-default service/console features are not prompted — they follow
-/// the service selection + the locked defaults.
-const ADVANCED_FEATURES: [&str; 4] =
-    ["saml", "organizations", "observability", "event_streams"];
+/// The advanced (opt-in, OFF-by-default) FEATURE-flag toggles the interactive path
+/// prompts for. `observability` is NOT here — it has its own dedicated mode prompt
+/// (in-stack/byo/off) because byo also collects the three external URLs, and the
+/// feature flag is DERIVED from that mode (see `prompt_observability` +
+/// `ConsoleConfig::effective_features`). The ON-by-default service/console features
+/// are not prompted — they follow the service selection + the locked defaults.
+const ADVANCED_FEATURES: [&str; 3] = ["saml", "organizations", "event_streams"];
 
 /// Run the `init` builder wizard end-to-end.
 ///
@@ -125,6 +128,11 @@ fn build_interactive<R: std::io::BufRead>(reader: &mut R) -> Result<ConsoleConfi
     // external). Prompted AFTER the services so its place in the flow is stable.
     let postgres = prompt_postgres(reader)?;
 
+    // Observability — the OPTIONAL metrics+logs backing store (off/in-stack/byo).
+    // Prompted with the other backing stores (after postgres, before the feature
+    // toggles) since byo collects URLs much like a byo service.
+    let observability = prompt_observability(reader)?;
+
     // Advanced features — default OFF (locked CONTEXT default). The ON-by-default
     // set is not prompted; it follows from the service selection + the defaults.
     let mut features = config_model::Features::with_defaults();
@@ -136,6 +144,7 @@ fn build_interactive<R: std::io::BufRead>(reader: &mut R) -> Result<ConsoleConfi
     Ok(ConsoleConfig {
         services,
         postgres: Some(postgres),
+        observability: Some(observability),
         features: Some(features),
     })
 }
@@ -170,6 +179,59 @@ fn prompt_postgres<R: std::io::BufRead>(reader: &mut R) -> Result<PostgresConfig
              them via env / a --*-file / prompt at run time; for a BYO target they MUST match \
              the login roles you pre-provisioned on the external instance. They are never stored \
              in console.config.toml.)"
+        );
+    }
+    Ok(cfg)
+}
+
+/// Prompt for the observability backing store: `off` (the DEFAULT — opt-in,
+/// matches today's behavior), `in-stack` (the bundled Prometheus/Grafana/Loki/Alloy
+/// via the `observability` compose profile), or `byo` (point the backend at
+/// EXTERNAL Prometheus/Loki/Grafana — prompt the 3 URLs).
+///
+/// BYO-GRAFANA AUTH CAVEAT (documented precisely here + in the SUMMARY): the
+/// in-stack Grafana is provisioned for AUTH-PROXY header auth — the backend injects
+/// `X-WEBAUTH-USER` and Grafana trusts it ONLY from the backend's pinned static
+/// internal IP (`GF_AUTH_PROXY_WHITELIST=172.30.0.10`). An EXTERNAL Grafana will
+/// NOT honor that header (it is not configured for auth-proxy, and the source IP
+/// will not match), so the backend reverse-proxy still FORWARDS requests but the
+/// external Grafana enforces ITS OWN authentication (its login/session/SSO). This
+/// is the minimal correct behavior: nothing in the console silently bypasses an
+/// external Grafana's auth — the operator configures auth on their own Grafana.
+/// Prometheus/Loki (PromQL/LogQL queries) need only the URL — no auth caveat.
+fn prompt_observability<R: std::io::BufRead>(
+    reader: &mut R,
+) -> Result<ObservabilityConfig, CliError> {
+    let mode = loop {
+        let ans = prompt_line(
+            reader,
+            "Observability (Prometheus/Grafana/Loki) — off / in-stack / byo",
+            "off",
+        )?;
+        match ans.as_str() {
+            "off" => break ObservabilityMode::Off,
+            "in-stack" => break ObservabilityMode::InStack,
+            "byo" => break ObservabilityMode::Byo,
+            other => eprintln!("  `{other}` is not one of off/in-stack/byo — try again."),
+        }
+    };
+
+    let mut cfg = ObservabilityConfig {
+        mode: Some(ObservabilityModeField(mode)),
+        ..Default::default()
+    };
+
+    if mode == ObservabilityMode::Byo {
+        cfg.prometheus_url = opt(prompt_line(reader, "  Prometheus base URL", "")?);
+        cfg.loki_url = opt(prompt_line(reader, "  Loki base URL", "")?);
+        cfg.grafana_url = opt(prompt_line(reader, "  Grafana base URL", "")?);
+        // The byo-Grafana auth caveat (surfaced so the operator is not surprised the
+        // console does not auto-authenticate them into an external Grafana).
+        eprintln!(
+            "  (Prometheus/Loki need only the URL. EXTERNAL Grafana enforces its OWN \
+             auth — the console reverse-proxy forwards to it but does NOT inject the \
+             in-stack X-WEBAUTH-USER auth-proxy identity, which only the bundled Grafana \
+             trusts from the backend's pinned internal IP. Configure auth on your Grafana.)"
         );
     }
     Ok(cfg)
@@ -428,7 +490,8 @@ mod tests {
         //   oathkeeper = <Enter> → in-stack
         //   polis  = <Enter> → in-stack
         //   postgres = <Enter> → in-stack
-        //   advanced: saml=y, organizations=<Enter>(n), observability=n, event_streams=<Enter>(n)
+        //   observability = <Enter> → off (the locked default)
+        //   advanced: saml=y, organizations=<Enter>(n), event_streams=<Enter>(n)
         let script = "\n\
             byo\n\
             http://hydra.ext/admin\n\
@@ -437,9 +500,9 @@ mod tests {
             \n\
             \n\
             \n\
+            \n\
             y\n\
             \n\
-            n\n\
             \n";
         let mut reader = std::io::Cursor::new(script.as_bytes());
         let cfg = build_interactive(&mut reader).expect("interactive build");
@@ -462,10 +525,14 @@ mod tests {
             Some("http://hydra.ext")
         );
 
+        // Observability = off (Enter) → mode off + feature OFF.
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::Off, "Enter → observability off");
+
         // Advanced features: saml ON (operator chose y), the rest OFF.
         let feats = cfg.effective_features();
         assert_eq!(feats.0.get("saml"), Some(&true), "saml turned ON");
         assert_eq!(feats.0.get("organizations"), Some(&false));
+        // observability feature is DERIVED from the off mode.
         assert_eq!(feats.0.get("observability"), Some(&false));
         assert_eq!(feats.0.get("event_streams"), Some(&false));
         // ON-by-default service features remain ON.
@@ -487,7 +554,8 @@ mod tests {
     #[test]
     fn build_interactive_byo_postgres_produces_byo_config() {
         // All five services in-stack (Enter x5), then postgres = byo with host /
-        // port / sslmode, then the 4 advanced features default OFF (Enter x4).
+        // port / sslmode, then observability=off (Enter) + the 3 advanced features
+        // default OFF (Enter x3) → 4 trailing Enters.
         let script = "\n\
             \n\
             \n\
@@ -514,6 +582,82 @@ mod tests {
         assert!(!serialized.to_ascii_lowercase().contains("password"), "{serialized}");
         // byo postgres → svc-postgres dropped from the profiles.
         assert!(!cfg.to_compose_profiles().contains(&"svc-postgres".to_string()));
+    }
+
+    #[test]
+    fn build_interactive_byo_observability_collects_urls_and_feature_on() {
+        // 5 services in-stack (Enter x5), postgres in-stack (Enter), observability =
+        // byo with the 3 URLs, then 3 advanced features default OFF (Enter x3).
+        let script = "\n\
+            \n\
+            \n\
+            \n\
+            \n\
+            \n\
+            byo\n\
+            https://prom.ext\n\
+            https://loki.ext\n\
+            https://grafana.ext\n\
+            \n\
+            \n\
+            \n";
+        let mut reader = std::io::Cursor::new(script.as_bytes());
+        let cfg = build_interactive(&mut reader).expect("interactive build");
+
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::Byo, "byo observability");
+        let obs = cfg.observability.as_ref().expect("observability config set");
+        assert_eq!(obs.prometheus_url.as_deref(), Some("https://prom.ext"));
+        assert_eq!(obs.loki_url.as_deref(), Some("https://loki.ext"));
+        assert_eq!(obs.grafana_url.as_deref(), Some("https://grafana.ext"));
+
+        // byo → URLs emitted, feature ON, NO observability compose profile, no secret.
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert_eq!(map.get("PROMETHEUS_URL").map(String::as_str), Some("https://prom.ext"));
+        assert_eq!(map.get("GRAFANA_URL").map(String::as_str), Some("https://grafana.ext"));
+        assert_eq!(cfg.effective_features().0.get("observability"), Some(&true));
+        assert!(!cfg.to_compose_profiles().contains(&"observability".to_string()));
+        let serialized = config_model::to_toml_string(&cfg).unwrap();
+        assert!(!serialized.to_ascii_lowercase().contains("secret"), "{serialized}");
+        assert!(!serialized.to_ascii_lowercase().contains("password"), "{serialized}");
+    }
+
+    #[test]
+    fn build_interactive_in_stack_observability_adds_profile() {
+        // 5 services + postgres all in-stack (Enter x6), observability = in-stack,
+        // 3 advanced default OFF (Enter x3).
+        let script = "\n\
+            \n\
+            \n\
+            \n\
+            \n\
+            \n\
+            in-stack\n\
+            \n\
+            \n\
+            \n";
+        let mut reader = std::io::Cursor::new(script.as_bytes());
+        let cfg = build_interactive(&mut reader).expect("interactive build");
+
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::InStack);
+        // in-stack → the observability profile is appended (after svc-postgres + svc-*).
+        assert!(cfg.to_compose_profiles().contains(&"observability".to_string()));
+        // No URL override (uses the compose-default internal URLs); feature ON.
+        let map: std::collections::HashMap<_, _> = cfg.to_env_pairs().into_iter().collect();
+        assert!(!map.contains_key("PROMETHEUS_URL"), "in-stack → no URL override");
+        assert_eq!(cfg.effective_features().0.get("observability"), Some(&true));
+    }
+
+    #[test]
+    fn defaults_keep_observability_off() {
+        // The locked --defaults path keeps observability off (no prompt).
+        let args = InitArgs {
+            defaults: true,
+            ..Default::default()
+        };
+        let cfg = resolve_config(&args).expect("defaults resolve");
+        assert_eq!(cfg.observability_mode(), ObservabilityMode::Off);
+        assert!(!cfg.to_compose_profiles().contains(&"observability".to_string()));
+        assert_eq!(cfg.effective_features().0.get("observability"), Some(&false));
     }
 
     #[test]

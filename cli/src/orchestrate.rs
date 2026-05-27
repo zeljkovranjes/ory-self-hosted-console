@@ -31,7 +31,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::config_model::{ConsoleConfig, PostgresMode, ServiceMode, SERVICES};
+use crate::config_model::{ConsoleConfig, ObservabilityMode, PostgresMode, ServiceMode, SERVICES};
 use crate::db_probe::{self, DbCheckTarget, DEFAULT_DB_TIMEOUT};
 use crate::probe::{self, ProbeResult, DEFAULT_PROBE_TIMEOUT};
 use crate::{bootstrap, CliError, InitArgs};
@@ -88,6 +88,14 @@ async fn preboot_byo_probes(config: &ConsoleConfig, skip_checks: bool) -> Result
                 if let Some(r) = probe::probe_service(svc, config, DEFAULT_PROBE_TIMEOUT).await {
                     out.push(r);
                 }
+            }
+        }
+        // BYO observability is an EXTERNAL Prometheus/Loki/Grafana — reachable now
+        // (before any boot), so probe it here. In-stack observability comes up with
+        // the profile and is probed post-boot (mirrors the Ory in-stack-vs-byo split).
+        if config.observability_mode() == ObservabilityMode::Byo {
+            if let Some(r) = probe::probe_observability(config, DEFAULT_PROBE_TIMEOUT).await {
+                out.push(r);
             }
         }
         out
@@ -190,6 +198,17 @@ async fn host_path(
         eprintln!("post-boot connection checks (in-stack services):");
         report_probes(&in_stack);
         block_or_warn(&in_stack, args.skip_checks, "post-boot")?;
+    }
+
+    // POST-BOOT observability check (in-stack only): the bundled
+    // Prometheus/Loki/Grafana containers are up now (the `observability` profile),
+    // so verify their readiness. BYO observability was already checked pre-boot.
+    if config.observability_mode() == ObservabilityMode::InStack {
+        if let Some(r) = probe::probe_observability(config, DEFAULT_PROBE_TIMEOUT).await {
+            eprintln!("post-boot observability check (in-stack Prometheus/Loki/Grafana):");
+            report_probes(std::slice::from_ref(&r));
+            block_or_warn(std::slice::from_ref(&r), args.skip_checks, "post-boot")?;
+        }
     }
 
     // POST-BOOT DB check: the in-stack postgres container is up now → verify it
@@ -396,9 +415,11 @@ mod tests {
     fn advanced_to_apply_lists_only_advanced_keys() {
         let cfg = parse_config(
             r#"
+[observability]
+mode = "byo"
+prometheus_url = "https://p.ext"
 [features]
 saml = true
-observability = true
 organizations = false
 "#,
         )
@@ -406,6 +427,7 @@ organizations = false
         let adv = advanced_to_apply(&cfg);
         let map: std::collections::HashMap<_, _> = adv.into_iter().collect();
         assert_eq!(map.get("saml"), Some(&true));
+        // observability is DERIVED from the byo mode (not the [features] table).
         assert_eq!(map.get("observability"), Some(&true));
         assert_eq!(map.get("organizations"), Some(&false));
         assert_eq!(map.get("event_streams"), Some(&false), "default OFF");
