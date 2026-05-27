@@ -89,6 +89,15 @@ Then enable the **Observability** feature toggle (Project → Features). Grafana
 - Secrets (DB passwords, GitHub OAuth, SMTP/SMS, Polis keys) come from `.env` / secret files and are never logged or sent to the frontend.
 - Ory CLI compatibility: identity schemas, OAuth2 client shapes, and Keto relation tuples interoperate with the official `ory` CLI.
 
+### Email & SMS delivery (works out of the box)
+
+Account recovery (password reset), address verification, and one-time-code sign-in are wired end-to-end with **dev catchers** so the stack works immediately with no external accounts:
+
+- **Email → Mailpit.** Kratos's courier sends recovery/verification mail to a bundled [Mailpit](https://mailpit.axllent.org/) catcher. Read the captured messages (and their codes) at **http://localhost:8025**.
+- **SMS → sms-sink.** Kratos POSTs one-time SMS login codes to a tiny bundled HTTP catcher. View captured texts at **http://localhost:8026**. (Sign-in by SMS uses the optional `phone` trait on the identity schema; email keeps password sign-in.)
+
+**For production**, point Kratos at a real SMTP server and SMS gateway via the console's **Email/SMTP** and **SMS** pages (they rewrite the Kratos `courier` config and restart the service). The dev catchers are not encrypted and do not forward mail/SMS — don't rely on them in production.
+
 ## Operator CLI (optional)
 
 The console works fully without the CLI (via `/setup` + env). The CLI is a convenience that smooths first-run setup and day-2 ops. It is a separate, lean binary run through Compose:
