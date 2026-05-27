@@ -107,7 +107,6 @@ async fn edit_features_calls_put_route() {
 ///
 /// DB mtime is covered by the same construction once a DB target is in scope.
 #[tokio::test]
-#[ignore = "Wave 3: check command (Cmd::Check + `check config --config <PATH>`) not yet implemented"]
 async fn check_is_read_only_no_mtime_change() {
     use clap::Parser;
     use console_cli::{run, Cli};
@@ -161,7 +160,6 @@ async fn check_is_read_only_no_mtime_change() {
 /// (off today) so the LOCKED contract is documented inline AND the file compiles
 /// against today's surface; the test stays `#[ignore]`-gated regardless.
 #[tokio::test]
-#[ignore = "Wave 3: check status verdict (console_cli::check::overall_exit_code) not yet implemented"]
 async fn check_exit_code_reflects_health() {
     #[cfg(feature = "wave3")]
     {

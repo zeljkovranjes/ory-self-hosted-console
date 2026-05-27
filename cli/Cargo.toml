@@ -85,7 +85,13 @@ argon2 = { version = "0.5", optional = true }
 rand_core = { version = "0.6", features = ["std"], optional = true }
 
 [features]
-default = []
+# `wave3` is ON by default from Plan 20-03 onward: the forward-referenced
+# `check` symbols (`console_cli::check::overall_exit_code`) now EXIST, so the
+# Wave-0 `check_exit_code_reflects_health` assertion body compiles + runs as part
+# of the normal `cargo test -p ory-console-cli`. It pulls NO production code (the
+# gate only un-comments a test body). `wave1` stays available for the symmetric
+# Wave-1 contract.
+default = ["wave3"]
 # OFF by default — pulls in sqlx + argon2 for the offline DB-direct admin
 # create/reset-password path. The default CLI build carries neither (no-second-writer).
 offline-admin = ["dep:sqlx", "dep:argon2", "dep:rand_core"]

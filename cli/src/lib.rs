@@ -593,6 +593,12 @@ pub enum CliError {
     /// LOCKED exit code `2` (the `non_tty_never_hangs` contract). Carries no
     /// message of its own (the rendered help is the operator-facing output).
     Usage,
+    /// A read-only `check` verdict that found an UNHEALTHY result (a selected
+    /// service unreachable or config invalid; CLI-08b). The handler already
+    /// rendered the per-service table + the failing-verdict line; this carries the
+    /// non-zero process exit code `main` maps verbatim. It is NOT an internal
+    /// failure — it is the SCRIPTABLE health signal. Display is a terse fallback.
+    CheckFailed(i32),
 }
 
 impl std::fmt::Display for CliError {
@@ -609,6 +615,11 @@ impl std::fmt::Display for CliError {
             // The rendered long help (printed by `home_menu_or_usage`) IS the
             // operator output; this Display is a terse fallback only.
             CliError::Usage => write!(f, "no subcommand given (run with --help)"),
+            // The check handler already printed the per-service table + verdict;
+            // this Display is a terse fallback only.
+            CliError::CheckFailed(code) => {
+                write!(f, "check failed (exit {code}): one or more selected checks were unhealthy")
+            }
         }
     }
 }

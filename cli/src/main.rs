@@ -18,6 +18,12 @@ async fn main() {
             // the long help to stderr; the LOCKED exit code is 2 (never hang,
             // never 0). `non_tty_never_hangs` pins this.
             CliError::Usage => std::process::exit(2),
+            // A read-only `check` verdict (CLI-08b): the handler already rendered
+            // the per-service table + the failing-verdict line; `main` maps the
+            // health verdict to the process exit code VERBATIM (0 stays Ok; a
+            // non-zero code surfaces here). This is the SCRIPTABLE health signal,
+            // not an error — so we do NOT print an `error:` prefix.
+            CliError::CheckFailed(code) => std::process::exit(code),
             // The error Display is operator-safe and NEVER contains a secret value.
             other => {
                 eprintln!("error: {other}");
