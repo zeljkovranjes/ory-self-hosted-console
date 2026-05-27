@@ -152,6 +152,13 @@ services:
   postgres:
     image: postgres:17-alpine
     container_name: postgres
+    # CLI-builder BYO-Postgres (IUX-BYO-PG-02): the in-stack DB + its ./db/init
+    # mount only start when `svc-postgres` is active (the default COMPOSE_PROFILES
+    # includes it, so a plain `docker compose up` is unchanged). A bring-your-own
+    # build drops svc-postgres → this container never starts and the 8 DSNs point
+    # at ${POSTGRES_HOST}. The four `postgres:` depends_on edges carry
+    # `required: false` so `--wait` does not wedge on the absent dependency.
+    profiles: ["svc-postgres"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-ory}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
@@ -184,10 +191,11 @@ services:
     profiles: ["svc-kratos"]
     command: ["migrate", "sql", "-e", "--yes"]
     environment:
-      DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@postgres:5432/kratos?sslmode=disable
+      DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/kratos?sslmode=${POSTGRES_SSLMODE:-disable}
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
     restart: "no"
     networks: [internal]
 
@@ -197,10 +205,11 @@ services:
     profiles: ["svc-hydra"]
     command: ["migrate", "sql", "-e", "--yes"]
     environment:
-      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@postgres:5432/hydra?sslmode=disable
+      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/hydra?sslmode=${POSTGRES_SSLMODE:-disable}
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
     restart: "no"
     networks: [internal]
 
@@ -211,12 +220,13 @@ services:
     # Keto: `migrate up`, NO -e flag; DSN from the DSN env var.
     command: ["migrate", "up", "-c", "/etc/config/keto/keto.yml", "--yes"]
     environment:
-      DSN: postgres://keto:${KETO_DB_PASSWORD:?set KETO_DB_PASSWORD}@postgres:5432/keto?sslmode=disable
+      DSN: postgres://keto:${KETO_DB_PASSWORD:?set KETO_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/keto?sslmode=${POSTGRES_SSLMODE:-disable}
     volumes:
       - ./config/keto:/etc/config/keto:ro
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
     restart: "no"
     networks: [internal]
 
@@ -238,7 +248,7 @@ services:
     # messages persist to the courier queue but are never sent.
     command: ["serve", "--config", "/etc/config/kratos/kratos.yml", "--watch-courier"]
     environment:
-      DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@postgres:5432/kratos?sslmode=disable
+      DSN: postgres://kratos:${KRATOS_DB_PASSWORD:?set KRATOS_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/kratos?sslmode=${POSTGRES_SSLMODE:-disable}
     volumes:
       - ./config/kratos:/etc/config/kratos:ro
     depends_on:
@@ -378,7 +388,7 @@ services:
     # `urls.self.issuer` (editable on the OAuth2 General page), then drop --dev.
     command: ["serve", "all", "--dev", "--config", "/etc/config/hydra/hydra.yml"]
     environment:
-      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@postgres:5432/hydra?sslmode=disable
+      DSN: postgres://hydra:${HYDRA_DB_PASSWORD:?set HYDRA_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/hydra?sslmode=${POSTGRES_SSLMODE:-disable}
       SECRETS_SYSTEM: ${HYDRA_SECRETS_SYSTEM:?set HYDRA_SECRETS_SYSTEM (immutable after first migration)}
     volumes:
       - ./config/hydra:/etc/config/hydra:ro
@@ -403,7 +413,7 @@ services:
     profiles: ["svc-keto"]
     command: ["serve", "-c", "/etc/config/keto/keto.yml"]
     environment:
-      DSN: postgres://keto:${KETO_DB_PASSWORD:?set KETO_DB_PASSWORD}@postgres:5432/keto?sslmode=disable
+      DSN: postgres://keto:${KETO_DB_PASSWORD:?set KETO_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/keto?sslmode=${POSTGRES_SSLMODE:-disable}
     volumes:
       - ./config/keto:/etc/config/keto:ro
     depends_on:
@@ -650,7 +660,7 @@ services:
       POLIS_API_KEY: ${POLIS_API_KEY:?set POLIS_API_KEY}
       POLIS_EXTERNAL_URL: ${POLIS_EXTERNAL_URL:?set POLIS_EXTERNAL_URL}
       # Backend's own state DB (Phase 2 owns the schema).
-      DATABASE_URL: postgres://console:${CONSOLE_DB_PASSWORD:?set CONSOLE_DB_PASSWORD}@postgres:5432/console?sslmode=disable
+      DATABASE_URL: postgres://console:${CONSOLE_DB_PASSWORD:?set CONSOLE_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/console?sslmode=${POSTGRES_SSLMODE:-disable}
     volumes:
       # Read-WRITE config mount (the ONLY rw config mount) — Phase 4 edit subsystem.
       - ./config:/etc/config:rw
@@ -962,7 +972,7 @@ services:
     environment:
       DB_ENGINE: sql
       DB_TYPE: postgres
-      DB_URL: postgres://polis:${POLIS_DB_PASSWORD:?set POLIS_DB_PASSWORD}@postgres:5432/polis?sslmode=disable
+      DB_URL: postgres://polis:${POLIS_DB_PASSWORD:?set POLIS_DB_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/polis?sslmode=${POSTGRES_SSLMODE:-disable}
       # 32-byte base64; write-only (BACK-07), IMMUTABLE after first boot (Pitfall 5).
       DB_ENCRYPTION_KEY: ${POLIS_DB_ENCRYPTION_KEY:?set POLIS_DB_ENCRYPTION_KEY}
       # Admin-API auth (Authorization: Api-Key) — the backend is the sole client (Phase 14).
@@ -988,6 +998,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
     healthcheck:
       # Polis is a Node image (has a shell + global fetch); probe /api/health
       # (200 healthy, 5xx unhealthy) over loopback — same node-fetch shape as the
