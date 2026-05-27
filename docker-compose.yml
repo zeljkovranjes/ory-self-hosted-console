@@ -63,6 +63,16 @@ networks:
     # internal: true => Docker creates NO gateway to the host/internet. Combined
     # with publishing no ports, the Ory Admin APIs are unreachable from the host.
     internal: true
+    # WR-05 (Grafana auth-proxy spoof defense-in-depth): a FIXED subnet so the
+    # backend can hold a STATIC internal IP (172.30.0.10). Grafana's
+    # GF_AUTH_PROXY_WHITELIST is pinned to exactly that IP, so it honors the
+    # X-WEBAUTH-USER auth-proxy header ONLY from the backend — not from any other
+    # compromised peer on this shared network (Postgres/Ory/broker/Loki/etc.). The
+    # /24 is a private range outside Docker's default 172.17-31 pools to avoid
+    # collisions; adjust only if it clashes with an existing host network.
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
   edge:
     driver: bridge
   # ax-public (Phase 15, INFRA-05 / threat T-15-01): a DEDICATED internal segment
@@ -526,7 +536,15 @@ services:
       - "no-new-privileges:true"
     ports:
       - "${BACKEND_PORT:-8080}:8080"
-    networks: [internal, edge]
+    networks:
+      internal:
+        # WR-05: a STATIC internal IP so Grafana's GF_AUTH_PROXY_WHITELIST can pin
+        # the trusted X-WEBAUTH-USER source to EXACTLY the backend. Docker assigns
+        # dynamic IPs by default, which a whitelist cannot target — fixing it here
+        # is what lets the whitelist be authoritative (defense-in-depth: a
+        # compromised peer cannot forge the auth-proxy header from a different IP).
+        ipv4_address: 172.30.0.10
+      edge: {}
 
   # ===========================================================================
   # Frontend (Next.js skeleton). Edge-only; publishes 3000 to host.
@@ -832,6 +850,18 @@ services:
       GF_AUTH_PROXY_HEADER_PROPERTY: "username"
       GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # WR-05 (auth-proxy spoof defense-in-depth): Grafana honors the
+      # X-WEBAUTH-USER auth-proxy header ONLY when the request's SOURCE IP is in
+      # this whitelist — pinned to the backend's STATIC internal IP (172.30.0.10,
+      # see the `internal` network ipam + the backend's ipv4_address). Without
+      # this, ANY peer on the shared `internal` network (Postgres, the four Ory
+      # services, the restart broker, Loki/Prometheus/Alloy) could bypass the
+      # backend and POST grafana:3000 with a forged X-WEBAUTH-USER to auto-provision
+      # a Grafana admin (GF_AUTH_PROXY_AUTO_SIGN_UP). The whitelist accepts IPs/CIDRs
+      # only (not hostnames), which is why the backend is given a static IP. The
+      # backend proxy still strips client-supplied X-WEBAUTH-* headers (T-16-10);
+      # this closes the orthogonal "peer bypasses the backend entirely" threat.
+      GF_AUTH_PROXY_WHITELIST: "172.30.0.10"
       # No outbound analytics/update checks from an internal-only service (BACK-07).
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
