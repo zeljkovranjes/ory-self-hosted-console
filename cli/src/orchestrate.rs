@@ -31,9 +31,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::config_model::{ConsoleConfig, ServiceMode, SERVICES};
+use crate::config_model::{ConsoleConfig, PostgresMode, ServiceMode, SERVICES};
+use crate::db_probe::{self, DbCheckTarget, DEFAULT_DB_TIMEOUT};
 use crate::probe::{self, ProbeResult, DEFAULT_PROBE_TIMEOUT};
-use crate::{CliError, InitArgs};
+use crate::{bootstrap, CliError, InitArgs};
 
 /// True only when a Docker daemon is reachable from THIS process AND `--no-docker`
 /// was not passed. We require BOTH the `docker` binary on PATH and a successful
@@ -63,6 +64,12 @@ pub async fn orchestrate(
     // in this process (config-only path).
     preboot_byo_probes(config, args.skip_checks).await?;
 
+    // PRE-BOOT DB check: when postgres is BYO the external DB is reachable NOW
+    // (before any boot), so verify it with a REAL SELECT 1 and block-on-fail. For
+    // in-stack postgres the container isn't up yet — that check is deferred to the
+    // POST-BOOT step in host_path (mirrors the HTTP in-stack-vs-byo probe split).
+    preboot_db_check(config, args.skip_checks).await?;
+
     if docker_available(args) {
         host_path(config, args, api_url, api_key).await
     } else {
@@ -91,6 +98,64 @@ async fn preboot_byo_probes(config: &ConsoleConfig, skip_checks: bool) -> Result
     eprintln!("pre-boot connection checks (BYO/external services):");
     report_probes(&byo);
     block_or_warn(&byo, skip_checks, "pre-boot")
+}
+
+/// PRE-BOOT DB check (BYO postgres only): the external DB is reachable now, so run
+/// a REAL `SELECT 1` and block-on-fail. The superuser role (`POSTGRES_USER`, def
+/// `ory`) + `POSTGRES_PASSWORD` (via `read_secret` — env/`--*-file`/prompt, never
+/// argv) connect to the `postgres` default DB. In-stack postgres is skipped here
+/// (its container is not up yet). On `--skip-checks` a missing password is a soft
+/// skip (we cannot check without it) rather than a hard error.
+async fn preboot_db_check(config: &ConsoleConfig, skip_checks: bool) -> Result<(), CliError> {
+    if config.postgres_mode() != PostgresMode::Byo {
+        return Ok(());
+    }
+    run_db_check(config, skip_checks, "pre-boot").await
+}
+
+/// POST-BOOT DB check (in-stack postgres only): the bundled container is up now, so
+/// verify it with a REAL `SELECT 1` (same superuser path). BYO was already checked
+/// pre-boot. Honors `--skip-checks` identically.
+async fn postboot_db_check(config: &ConsoleConfig, skip_checks: bool) -> Result<(), CliError> {
+    if config.postgres_mode() != PostgresMode::InStack {
+        return Ok(());
+    }
+    run_db_check(config, skip_checks, "post-boot").await
+}
+
+/// Shared DB-check body: resolve the superuser target (+ password via read_secret),
+/// run `db_probe::check`, and feed the result through the SAME block_or_warn policy
+/// the HTTP probes use. A missing `POSTGRES_PASSWORD` is surfaced as a blocking
+/// failure unless `--skip-checks` (then a soft skip with a warning).
+async fn run_db_check(config: &ConsoleConfig, skip_checks: bool, phase: &str) -> Result<(), CliError> {
+    // POSTGRES_USER defaults to `ory` (mirrors compose). The password comes from
+    // read_secret — env/`--*-file`/prompt, NEVER argv. No `--*-file` flag exists on
+    // InitArgs (the clap guard holds); env/prompt are the ingress here.
+    let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "ory".to_string());
+    let password = match bootstrap::read_secret(None, "POSTGRES_PASSWORD", "POSTGRES_PASSWORD") {
+        Ok(p) => p,
+        Err(e) => {
+            if skip_checks {
+                eprintln!(
+                    "  WARNING: --skip-checks set — skipping the {phase} DB SELECT 1 check \
+                     (no POSTGRES_PASSWORD available: {e})."
+                );
+                return Ok(());
+            }
+            return Err(CliError::Io(format!(
+                "{phase} DB check needs POSTGRES_PASSWORD (set the env var or pass --skip-checks): {e}"
+            )));
+        }
+    };
+
+    // Connect as the superuser to the default `postgres` DB — a reachability +
+    // auth verify that does not depend on any per-service role existing yet.
+    let target = DbCheckTarget::from_config(config, &user, "postgres", password);
+    eprintln!("{phase} DB connection check (SELECT 1): {}", target.display());
+    let result = db_probe::check(&target, DEFAULT_DB_TIMEOUT).await;
+    let probe = db_probe::as_probe_result(&result, phase);
+    report_probes(std::slice::from_ref(&probe));
+    block_or_warn(std::slice::from_ref(&probe), skip_checks, phase)
 }
 
 /// HOST PATH: compose up + post-boot in-stack probes + feature apply + first-run admin.
@@ -126,6 +191,10 @@ async fn host_path(
         report_probes(&in_stack);
         block_or_warn(&in_stack, args.skip_checks, "post-boot")?;
     }
+
+    // POST-BOOT DB check: the in-stack postgres container is up now → verify it
+    // with a REAL SELECT 1 (BYO postgres was already checked pre-boot).
+    postboot_db_check(config, args.skip_checks).await?;
 
     // 3. APPLY the advanced feature set via the EXISTING ONLINE route. The Plan-A
     //    boot reconcile already seeds the service-domain flags from CONSOLE_SERVICE_*;

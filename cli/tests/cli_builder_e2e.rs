@@ -57,8 +57,8 @@ fn defaults_config_round_trips_to_byte_identical_env() {
     // The defaults emit all five in-stack svc-* profiles + all CONSOLE_SERVICE_*
     // in-stack, and NO secret value (secrets are generated separately by the wizard).
     assert!(
-        first.contains("COMPOSE_PROFILES=svc-kratos,svc-hydra,svc-keto,svc-oathkeeper,svc-polis"),
-        "defaults emit all five in-stack profiles:\n{first}"
+        first.contains("COMPOSE_PROFILES=svc-postgres,svc-kratos,svc-hydra,svc-keto,svc-oathkeeper,svc-polis"),
+        "defaults emit svc-postgres (bundled DB) + all five in-stack Ory profiles:\n{first}"
     );
     for svc in ["KRATOS", "HYDRA", "KETO", "OATHKEEPER", "POLIS"] {
         assert!(
@@ -100,11 +100,12 @@ mode = "in-stack"
     assert_eq!(
         profiles,
         vec![
+            "svc-postgres".to_string(),
             "svc-kratos".to_string(),
             "svc-oathkeeper".to_string(),
             "svc-polis".to_string()
         ],
-        "only in-stack services get a profile"
+        "svc-postgres (in-stack bundled DB) first, then only in-stack services"
     );
 
     // to_env_pairs carries the right modes + the BYO admin URL, no secret.
@@ -265,8 +266,8 @@ async fn wizard_defaults_no_docker_writes_artifacts_and_reapplies_idempotently()
     // The .env carries the all-in-stack seed + the generated required secrets.
     let env = std::fs::read_to_string(&env_file).expect(".env written");
     assert!(
-        env.contains("COMPOSE_PROFILES=svc-kratos,svc-hydra,svc-keto,svc-oathkeeper,svc-polis"),
-        "all five in-stack profiles seeded:\n{env}"
+        env.contains("COMPOSE_PROFILES=svc-postgres,svc-kratos,svc-hydra,svc-keto,svc-oathkeeper,svc-polis"),
+        "svc-postgres + all five in-stack profiles seeded:\n{env}"
     );
     for svc in ["KRATOS", "HYDRA", "KETO", "OATHKEEPER", "POLIS"] {
         assert!(
@@ -312,7 +313,7 @@ async fn wizard_defaults_no_docker_writes_artifacts_and_reapplies_idempotently()
     );
     // The CONSOLE_SERVICE_*/profiles seed is also unchanged.
     assert!(env_after.contains(
-        "COMPOSE_PROFILES=svc-kratos,svc-hydra,svc-keto,svc-oathkeeper,svc-polis"
+        "COMPOSE_PROFILES=svc-postgres,svc-kratos,svc-hydra,svc-keto,svc-oathkeeper,svc-polis"
     ));
 
     // The re-applied config.toml is byte-identical to the first (round-trip).

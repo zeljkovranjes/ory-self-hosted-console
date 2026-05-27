@@ -27,7 +27,8 @@
 use std::io::{IsTerminal, Write};
 
 use crate::config_model::{
-    self, ConsoleConfig, ServiceConfig, ServiceMode, ServiceModeField, SERVICES,
+    self, ConsoleConfig, PostgresConfig, PostgresMode, PostgresModeField, ServiceConfig,
+    ServiceMode, ServiceModeField, SERVICES,
 };
 use crate::{bootstrap, emit, orchestrate, InitArgs, CliError};
 
@@ -120,6 +121,10 @@ fn build_interactive<R: std::io::BufRead>(reader: &mut R) -> Result<ConsoleConfi
         services.set(svc, cfg);
     }
 
+    // Postgres — the always-required backing store (in-stack bundled DB, or BYO
+    // external). Prompted AFTER the services so its place in the flow is stable.
+    let postgres = prompt_postgres(reader)?;
+
     // Advanced features — default OFF (locked CONTEXT default). The ON-by-default
     // set is not prompted; it follows from the service selection + the defaults.
     let mut features = config_model::Features::with_defaults();
@@ -130,11 +135,44 @@ fn build_interactive<R: std::io::BufRead>(reader: &mut R) -> Result<ConsoleConfi
 
     Ok(ConsoleConfig {
         services,
-        // postgres mode is prompted + set in Task 4 (prompt_postgres); None here
-        // defaults to in-stack (the byte-identical bundled-DB default).
-        postgres: None,
+        postgres: Some(postgres),
         features: Some(features),
     })
+}
+
+/// Prompt for the Postgres backing store: `in-stack` (the bundled container, the
+/// default) or `byo` (external — prompt host/port/sslmode). The DB password is a
+/// SECRET (POSTGRES_PASSWORD + the per-service `*_DB_PASSWORD`) read via
+/// env/`--*-file`/prompt — NEVER prompted as a config value here / never argv.
+fn prompt_postgres<R: std::io::BufRead>(reader: &mut R) -> Result<PostgresConfig, CliError> {
+    let mode = loop {
+        let ans = prompt_line(reader, "Postgres — in-stack (bundled) / byo (external)", "in-stack")?;
+        match ans.as_str() {
+            "in-stack" => break PostgresMode::InStack,
+            "byo" => break PostgresMode::Byo,
+            other => eprintln!("  `{other}` is not one of in-stack/byo — try again."),
+        }
+    };
+
+    let mut cfg = PostgresConfig {
+        mode: Some(PostgresModeField(mode)),
+        ..Default::default()
+    };
+
+    if mode == PostgresMode::Byo {
+        cfg.host = opt(prompt_line(reader, "  postgres host", "")?);
+        cfg.port = opt(prompt_line(reader, "  postgres port", "5432")?);
+        // External Postgres usually mandates TLS → default sslmode=require.
+        cfg.sslmode = opt(prompt_line(reader, "  postgres sslmode", "require")?);
+        // The DB password(s) are SECRETS — never collected here / never argv.
+        eprintln!(
+            "  (POSTGRES_PASSWORD + the per-service *_DB_PASSWORD values are SECRETS — provide \
+             them via env / a --*-file / prompt at run time; for a BYO target they MUST match \
+             the login roles you pre-provisioned on the external instance. They are never stored \
+             in console.config.toml.)"
+        );
+    }
+    Ok(cfg)
 }
 
 /// Prompt for one service's mode (`in-stack | byo | off`), defaulting to in-stack.
@@ -389,12 +427,14 @@ mod tests {
         //   keto   = off
         //   oathkeeper = <Enter> → in-stack
         //   polis  = <Enter> → in-stack
+        //   postgres = <Enter> → in-stack
         //   advanced: saml=y, organizations=<Enter>(n), observability=n, event_streams=<Enter>(n)
         let script = "\n\
             byo\n\
             http://hydra.ext/admin\n\
             http://hydra.ext\n\
             off\n\
+            \n\
             \n\
             \n\
             y\n\
@@ -409,6 +449,8 @@ mod tests {
         assert_eq!(cfg.mode_of("keto"), ServiceMode::Off);
         assert_eq!(cfg.mode_of("oathkeeper"), ServiceMode::InStack);
         assert_eq!(cfg.mode_of("polis"), ServiceMode::InStack);
+        // postgres = <Enter> → in-stack (the bundled DB default).
+        assert_eq!(cfg.postgres_mode(), PostgresMode::InStack, "Enter → in-stack pg");
 
         // BYO URLs captured for hydra.
         assert_eq!(
@@ -429,15 +471,49 @@ mod tests {
         // ON-by-default service features remain ON.
         assert_eq!(feats.0.get("identities"), Some(&true));
 
-        // The assembled config maps to the right compose profiles (no hydra/keto).
+        // The assembled config maps to the right compose profiles: svc-postgres
+        // FIRST (in-stack pg) then the in-stack Ory svc-* (no hydra/keto).
         assert_eq!(
             cfg.to_compose_profiles(),
             vec![
+                "svc-postgres".to_string(),
                 "svc-kratos".to_string(),
                 "svc-oathkeeper".to_string(),
                 "svc-polis".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn build_interactive_byo_postgres_produces_byo_config() {
+        // All five services in-stack (Enter x5), then postgres = byo with host /
+        // port / sslmode, then the 4 advanced features default OFF (Enter x4).
+        let script = "\n\
+            \n\
+            \n\
+            \n\
+            \n\
+            byo\n\
+            db.external.example.com\n\
+            6543\n\
+            require\n\
+            \n\
+            \n\
+            \n\
+            \n";
+        let mut reader = std::io::Cursor::new(script.as_bytes());
+        let cfg = build_interactive(&mut reader).expect("interactive build");
+
+        assert_eq!(cfg.postgres_mode(), PostgresMode::Byo, "byo postgres selected");
+        let pg = cfg.postgres.as_ref().expect("postgres config set");
+        assert_eq!(pg.host.as_deref(), Some("db.external.example.com"));
+        assert_eq!(pg.port.as_deref(), Some("6543"));
+        assert_eq!(pg.sslmode.as_deref(), Some("require"));
+        // No password field exists on the model at all (T-BYO-02).
+        let serialized = config_model::to_toml_string(&cfg).unwrap();
+        assert!(!serialized.to_ascii_lowercase().contains("password"), "{serialized}");
+        // byo postgres → svc-postgres dropped from the profiles.
+        assert!(!cfg.to_compose_profiles().contains(&"svc-postgres".to_string()));
     }
 
     #[test]
