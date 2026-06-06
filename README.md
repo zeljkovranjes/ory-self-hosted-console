@@ -67,24 +67,6 @@ Then log in to the **admin console** at **http://localhost:3000**. The end-user 
 
 ## 🛠️ CLI builder
 
-`ory-console init` is a guided builder: choose your services, point at your own Ory instances, and pick features. In host mode it also brings the stack up and health-checks it end-to-end.
-
-```bash
-ory-console init                                # interactive wizard
-ory-console init --defaults                     # recommended defaults, no prompts
-ory-console init --config console.config.toml   # re-apply a saved build
-```
-
-Don't have the binary installed? Run it straight from source in this repo (host mode, Docker required):
-
-```bash
-cargo run -p ory-console-cli -- init            # build + run the wizard from source
-```
-
-- **Selective services** — Kratos, Hydra, Keto, Oathkeeper, and Polis are each `in-stack | bring-your-own | off`. Turning one **off** also disables its console features server-side. Postgres, backend, and frontend are always required.
-- **Bring-your-own** — point at an Ory service you already host; the wizard health-checks the connection and **blocks on failure** (`--skip-checks` to override).
-- **Reproducible** — writes a `console.config.toml` you can commit and re-apply. Secrets stay in `.env`, never the config file.
-
 <details>
 <summary>Day-2 commands (run in-container)</summary>
 
